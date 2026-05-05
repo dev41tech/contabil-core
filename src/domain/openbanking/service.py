@@ -1,0 +1,344 @@
+"""Serviço de Open Banking.
+
+Orquestra o ciclo completo:
+  1. Criação de connect_token (widget de autenticação do banco)
+  2. Salvamento da conexão após autenticação bem-sucedida
+  3. Sincronização de transações (manual ou futuramente agendada)
+
+Provedores suportados:
+  - Pluggy  : quando PLUGGY_CLIENT_ID e PLUGGY_CLIENT_SECRET estão configurados
+  - Mock    : modo de desenvolvimento sem credenciais externas
+
+Mapeamento Pluggy → nosso modelo:
+  item         → ConexaoBancaria
+  account      → AgenciaBancaria  (criada automaticamente na 1ª sync)
+  transaction  → Transacao        (dedup via hash_dedup)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+import uuid
+from datetime import UTC, date, datetime, timedelta
+from uuid import UUID
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.config import get_settings
+from src.core.errors import ConflictError, NotFoundError, ValidationError
+from src.db.models import AgenciaBancaria, ConexaoBancaria, Transacao
+from src.domain.openbanking.providers.base import IOpenBankingProvider
+from src.domain.openbanking.providers.mock import MockProvider
+from src.domain.openbanking.providers.pluggy import PluggyProvider
+from src.schemas.openbanking import (
+    ConnectTokenResponse,
+    ConexaoListResponse,
+    ConexaoResponse,
+    SalvarConexaoRequest,
+    SincronizarRequest,
+    SincronizarResponse,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+def _get_provider() -> tuple[IOpenBankingProvider, str]:
+    """Retorna (provedor, nome_provedor) com base na configuração."""
+    settings = get_settings()
+    if settings.pluggy_enabled:
+        return (
+            PluggyProvider(
+                settings.pluggy_client_id,  # type: ignore[arg-type]
+                settings.pluggy_client_secret.get_secret_value(),  # type: ignore[union-attr]
+            ),
+            "pluggy",
+        )
+    return MockProvider(), "mock"
+
+
+class OpenBankingService:
+    def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
+        self._db = db
+        self._empresa_id = empresa_id
+        self._provider, self._provedor_nome = _get_provider()
+
+    # ── connect token ─────────────────────────────────────────────────────────
+
+    async def criar_connect_token(
+        self, item_id: str | None = None
+    ) -> ConnectTokenResponse:
+        """Cria token para o widget de autenticação bancária."""
+        settings = get_settings()
+        token = await self._provider.criar_connect_token(item_id)
+        return ConnectTokenResponse(
+            access_token=token,
+            provedor=self._provedor_nome,
+            mock_mode=not settings.pluggy_enabled,
+        )
+
+    # ── salvar conexão ────────────────────────────────────────────────────────
+
+    async def salvar_conexao(self, data: SalvarConexaoRequest) -> ConexaoResponse:
+        """Persiste a conexão após o widget retornar o item_id."""
+        # Evita duplicatas (mesmo item_id por empresa)
+        existente = (
+            await self._db.execute(
+                select(ConexaoBancaria).where(
+                    ConexaoBancaria.empresa_id == self._empresa_id,
+                    ConexaoBancaria.item_id == data.item_id,
+                    ConexaoBancaria.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if existente:
+            raise ConflictError(
+                message="Esta conta já está conectada. Utilize 'Sincronizar' para atualizar."
+            )
+
+        # Obtém info da conta no provedor
+        try:
+            contas = await self._provider.obter_contas(data.item_id)
+            nome_inst = await self._provider.obter_nome_instituicao(data.item_id)
+        except Exception as exc:
+            raise ValidationError(
+                message=f"Não foi possível obter informações do banco: {exc}"
+            ) from exc
+
+        if not contas:
+            raise ValidationError(
+                message="Nenhuma conta corrente/poupança encontrada para este item."
+            )
+
+        conta = contas[0]  # usa a primeira conta não-crédito
+
+        conexao = ConexaoBancaria(
+            id=uuid.uuid4(),
+            empresa_id=self._empresa_id,
+            provedor=self._provedor_nome,
+            item_id=data.item_id,
+            account_id_externo=conta.account_id,
+            instituicao_nome=data.instituicao_nome or nome_inst,
+            instituicao_codigo=conta.instituicao_codigo,
+            banco_sigla=conta.banco_sigla,
+            agencia_numero=conta.agencia,
+            conta_numero=conta.numero,
+            status="ativa",
+        )
+        self._db.add(conexao)
+        await self._db.flush()
+
+        logger.info(
+            "openbanking.conexao_criada",
+            conexao_id=str(conexao.id),
+            empresa_id=str(self._empresa_id),
+            banco=conta.banco_sigla,
+            provedor=self._provedor_nome,
+        )
+        return _to_response(conexao)
+
+    # ── listar ────────────────────────────────────────────────────────────────
+
+    async def listar(self) -> ConexaoListResponse:
+        rows = (
+            await self._db.execute(
+                select(ConexaoBancaria)
+                .where(
+                    ConexaoBancaria.empresa_id == self._empresa_id,
+                    ConexaoBancaria.deleted_at.is_(None),
+                )
+                .order_by(ConexaoBancaria.instituicao_nome)
+            )
+        ).scalars().all()
+        items = [_to_response(c) for c in rows]
+        return ConexaoListResponse(items=items, total=len(items))
+
+    # ── sincronizar ───────────────────────────────────────────────────────────
+
+    async def sincronizar(
+        self, conexao_id: UUID, req: SincronizarRequest
+    ) -> SincronizarResponse:
+        conexao = await self._get_or_404(conexao_id)
+
+        data_fim = date.today()
+        data_inicio = data_fim - timedelta(days=req.dias)
+
+        # Garante que existe uma AgenciaBancaria vinculada
+        agencia = await self._garantir_agencia(conexao)
+
+        # Busca transações no provedor
+        try:
+            transacoes_externas = await self._provider.obter_transacoes(
+                conexao.account_id_externo or conexao.item_id,
+                data_inicio,
+                data_fim,
+            )
+        except Exception as exc:
+            conexao.status = "erro"
+            conexao.erro_msg = str(exc)[:500]
+            await self._db.flush()
+            raise ValidationError(
+                message=f"Erro ao buscar transações: {exc}"
+            ) from exc
+
+        importadas = 0
+        duplicadas = 0
+        erros = 0
+
+        for t in transacoes_externas:
+            # hash_dedup: sha256(empresa_id + id_externo)
+            hash_raw = f"{self._empresa_id}{conexao.item_id}{t.id_externo}"
+            hash_dedup = hashlib.sha256(hash_raw.encode()).hexdigest()
+
+            # Pula duplicatas
+            existe = (
+                await self._db.execute(
+                    select(Transacao).where(
+                        Transacao.empresa_id == self._empresa_id,
+                        Transacao.hash_dedup == hash_dedup,
+                    )
+                )
+            ).scalar_one_or_none()
+
+            if existe:
+                duplicadas += 1
+                continue
+
+            try:
+                transacao = Transacao(
+                    id=uuid.uuid4(),
+                    empresa_id=self._empresa_id,
+                    agencia_id=agencia.id,
+                    data=datetime.combine(t.data, datetime.min.time()).replace(tzinfo=UTC),
+                    valor=t.valor,
+                    historico=t.descricao[:500],
+                    dc=t.dc,
+                    status="pendente",
+                    hash_dedup=hash_dedup,
+                )
+                self._db.add(transacao)
+                importadas += 1
+            except Exception:
+                erros += 1
+
+        # Atualiza estado da conexão
+        now = datetime.now(UTC)
+        conexao.last_sync_at = now
+        conexao.next_sync_at = now + timedelta(hours=6)
+        conexao.status = "ativa"
+        conexao.erro_msg = None
+        conexao.total_transacoes_sync += importadas
+        await self._db.flush()
+
+        logger.info(
+            "openbanking.sincronizado",
+            conexao_id=str(conexao_id),
+            empresa_id=str(self._empresa_id),
+            importadas=importadas,
+            duplicadas=duplicadas,
+            erros=erros,
+        )
+        return SincronizarResponse(
+            conexao_id=conexao_id,
+            importadas=importadas,
+            duplicadas=duplicadas,
+            erros=erros,
+            periodo_inicio=str(data_inicio),
+            periodo_fim=str(data_fim),
+            status="concluido",
+        )
+
+    # ── reconectar ────────────────────────────────────────────────────────────
+
+    async def criar_reconnect_token(self, conexao_id: UUID) -> ConnectTokenResponse:
+        """Token para re-autenticar uma conexão expirada."""
+        conexao = await self._get_or_404(conexao_id)
+        settings = get_settings()
+        token = await self._provider.criar_connect_token(conexao.item_id)
+        return ConnectTokenResponse(
+            access_token=token,
+            provedor=self._provedor_nome,
+            mock_mode=not settings.pluggy_enabled,
+        )
+
+    # ── remover ───────────────────────────────────────────────────────────────
+
+    async def remover(self, conexao_id: UUID) -> None:
+        conexao = await self._get_or_404(conexao_id)
+        conexao.deleted_at = datetime.now(UTC)
+        await self._db.flush()
+        logger.info("openbanking.conexao_removida", conexao_id=str(conexao_id))
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    async def _get_or_404(self, conexao_id: UUID) -> ConexaoBancaria:
+        c = (
+            await self._db.execute(
+                select(ConexaoBancaria).where(
+                    ConexaoBancaria.id == conexao_id,
+                    ConexaoBancaria.empresa_id == self._empresa_id,
+                    ConexaoBancaria.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if not c:
+            raise NotFoundError(message="Conexão bancária não encontrada.")
+        return c
+
+    async def _garantir_agencia(self, conexao: ConexaoBancaria) -> AgenciaBancaria:
+        """Cria AgenciaBancaria se ainda não existe, e vincula à conexão."""
+        if conexao.agencia_id:
+            ag = (
+                await self._db.execute(
+                    select(AgenciaBancaria).where(AgenciaBancaria.id == conexao.agencia_id)
+                )
+            ).scalar_one_or_none()
+            if ag:
+                return ag
+
+        # Cria nova AgenciaBancaria automaticamente
+        agencia = AgenciaBancaria(
+            id=uuid.uuid4(),
+            empresa_id=self._empresa_id,
+            banco_sigla=conexao.banco_sigla,
+            agencia=conexao.agencia_numero or "0001",
+            numero=conexao.conta_numero or "000000",
+            digito=None,
+            ativa=True,
+        )
+        self._db.add(agencia)
+        await self._db.flush()
+
+        conexao.agencia_id = agencia.id
+        await self._db.flush()
+
+        logger.info(
+            "openbanking.agencia_criada",
+            agencia_id=str(agencia.id),
+            banco=conexao.banco_sigla,
+        )
+        return agencia
+
+
+# ── conversão ─────────────────────────────────────────────────────────────────
+
+def _to_response(c: ConexaoBancaria) -> ConexaoResponse:
+    return ConexaoResponse(
+        id=c.id,
+        empresa_id=c.empresa_id,
+        agencia_id=c.agencia_id,
+        provedor=c.provedor,
+        item_id=c.item_id,
+        instituicao_nome=c.instituicao_nome,
+        instituicao_codigo=c.instituicao_codigo,
+        banco_sigla=c.banco_sigla,
+        agencia_numero=c.agencia_numero,
+        conta_numero=c.conta_numero,
+        status=c.status,
+        last_sync_at=c.last_sync_at,
+        next_sync_at=c.next_sync_at,
+        total_transacoes_sync=c.total_transacoes_sync,
+        erro_msg=c.erro_msg,
+    )

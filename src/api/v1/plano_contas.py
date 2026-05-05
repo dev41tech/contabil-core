@@ -1,0 +1,220 @@
+"""Router de Plano de Contas — /api/v1/empresas/{empresa_id}/plano-contas"""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, File, UploadFile
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.db.session import get_db
+from src.domain.plano_contas.service import PlanoContaService
+from src.schemas.plano_contas import (
+    PlanoContaCreate,
+    PlanoContaListResponse,
+    PlanoContaResponse,
+    PlanoContaTreeResponse,
+    PlanoContaUpdate,
+)
+
+
+class ImportacaoLinhaErro(BaseModel):
+    linha: int
+    codigo: str | None = None
+    erro: str
+
+
+class ImportacaoPlanoResult(BaseModel):
+    importadas: int
+    duplicadas: int
+    erros: list[ImportacaoLinhaErro]
+
+router = APIRouter(
+    prefix="/empresas/{empresa_id}/plano-contas",
+    tags=["plano-contas"],
+)
+
+
+def _svc(empresa_id: UUID, db: AsyncSession) -> PlanoContaService:
+    return PlanoContaService(db=db, empresa_id=empresa_id)
+
+
+@router.get("", response_model=PlanoContaListResponse)
+async def listar_contas(
+    empresa_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaListResponse:
+    """Lista todas as contas em ordem por código."""
+    return await _svc(empresa_id, db).listar()
+
+
+@router.get("/arvore", response_model=PlanoContaTreeResponse)
+async def arvore_contas(
+    empresa_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaTreeResponse:
+    """Retorna o plano de contas em estrutura de árvore hierárquica."""
+    return await _svc(empresa_id, db).arvore()
+
+
+@router.get("/{conta_id}", response_model=PlanoContaResponse)
+async def obter_conta(
+    empresa_id: UUID,
+    conta_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaResponse:
+    return await _svc(empresa_id, db).obter(conta_id)
+
+
+@router.post(
+    "",
+    response_model=PlanoContaResponse,
+    status_code=201,
+    dependencies=[Depends(require_csrf)],
+)
+async def criar_conta(
+    empresa_id: UUID,
+    body: PlanoContaCreate,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaResponse:
+    """Cria uma conta contábil. Se pai_id informado, a conta é filha."""
+    return await _svc(empresa_id, db).criar(body)
+
+
+@router.patch(
+    "/{conta_id}",
+    response_model=PlanoContaResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def atualizar_conta(
+    empresa_id: UUID,
+    conta_id: UUID,
+    body: PlanoContaUpdate,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaResponse:
+    """Atualiza descrição e/ou tipo. O código é imutável após criação."""
+    return await _svc(empresa_id, db).atualizar(conta_id, body)
+
+
+@router.delete(
+    "/{conta_id}",
+    status_code=204,
+    dependencies=[Depends(require_csrf)],
+)
+async def remover_conta(
+    empresa_id: UUID,
+    conta_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Remove a conta (soft delete). Bloqueado se houver filhos ou regras referenciando."""
+    await _svc(empresa_id, db).remover(conta_id)
+
+
+@router.post(
+    "/importar",
+    response_model=ImportacaoPlanoResult,
+    status_code=200,
+    dependencies=[Depends(require_csrf)],
+)
+async def importar_plano_contas(
+    empresa_id: UUID,
+    arquivo: UploadFile = File(..., description="Arquivo XLSX ou CSV com colunas: codigo, descricao, tipo, tipo_sa"),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> ImportacaoPlanoResult:
+    """Importa contas em lote a partir de arquivo XLSX ou CSV.
+
+    Colunas esperadas: codigo, descricao, tipo, tipo_sa (opcional, padrão A)
+    """
+    conteudo = await arquivo.read()
+    nome = (arquivo.filename or "").lower()
+
+    rows = _parse_planilha(conteudo, nome)
+    svc = _svc(empresa_id, db)
+    return await svc.importar_lote(rows)
+
+
+def _parse_planilha(conteudo: bytes, nome: str) -> list[dict]:
+    """Parseia XLSX ou CSV e retorna lista de dicts com {linha, codigo, descricao, tipo, tipo_sa}."""
+    if nome.endswith(".xlsx") or nome.endswith(".xls"):
+        return _parse_xlsx(conteudo)
+    else:
+        return _parse_csv(conteudo)
+
+
+def _parse_xlsx(conteudo: bytes) -> list[dict]:
+    try:
+        import openpyxl
+        from io import BytesIO
+        wb = openpyxl.load_workbook(BytesIO(conteudo), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    except Exception as e:
+        from src.core.errors import ValidationError as AppValidationError
+        raise AppValidationError(message=f"Erro ao ler XLSX: {e}")
+
+    if not rows:
+        from src.core.errors import ValidationError as AppValidationError
+        raise AppValidationError(message="Planilha vazia.")
+
+    # Detecta cabeçalho
+    header = [str(c).strip().lower() if c else "" for c in rows[0]]
+    data_rows = rows[1:]
+    return _rows_to_dicts(header, data_rows, start_line=2)
+
+
+def _parse_csv(conteudo: bytes) -> list[dict]:
+    import csv
+    from io import StringIO
+    try:
+        text = conteudo.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = conteudo.decode("latin-1")
+
+    dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    reader = csv.reader(StringIO(text), dialect)
+    rows = list(reader)
+
+    if not rows:
+        from src.core.errors import ValidationError as AppValidationError
+        raise AppValidationError(message="CSV vazio.")
+
+    header = [c.strip().lower() for c in rows[0]]
+    data_rows = [[c for c in row] for row in rows[1:]]
+    return _rows_to_dicts(header, data_rows, start_line=2)
+
+
+def _rows_to_dicts(header: list[str], data_rows: list, start_line: int) -> list[dict]:
+    # Normaliza nomes de coluna (aceita variantes)
+    _alias = {
+        "classificacao": "codigo", "classificação": "codigo",
+        "code": "codigo", "cod": "codigo",
+        "description": "descricao", "descrição": "descricao", "nome": "descricao",
+        "type": "tipo",
+        "sa": "tipo_sa", "s/a": "tipo_sa",
+    }
+    normalized = [_alias.get(h, h) for h in header]
+
+    result = []
+    for i, row in enumerate(data_rows, start=start_line):
+        cells = [str(c).strip() if c is not None else "" for c in row]
+        d = {normalized[j]: cells[j] for j in range(min(len(normalized), len(cells)))}
+        # Preenche colunas ausentes
+        d.setdefault("codigo", "")
+        d.setdefault("descricao", "")
+        d.setdefault("tipo", "")
+        d.setdefault("tipo_sa", "A")
+        d["_linha"] = i
+        # Ignora linhas completamente vazias
+        if not d["codigo"] and not d["descricao"]:
+            continue
+        result.append(d)
+    return result

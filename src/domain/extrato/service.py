@@ -1,0 +1,275 @@
+"""Serviço de Extrato Bancário.
+
+Responsabilidades:
+- Importar arquivo OFX e persistir as transações.
+- Deduplicação por SHA-256 de (empresa_id + agencia_id + data + valor + historico + dc).
+- Listar transações com filtros (status, agência, data).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from uuid import UUID
+
+import structlog
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.errors import NotFoundError, ValidationError
+from src.db.models import AgenciaBancaria, Transacao
+from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx
+from src.schemas.extrato import (
+    ExtratoPendentesResponse,
+    ImportacaoResult,
+    TransacaoFiltro,
+    TransacaoResponse,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class ExtratoService:
+    def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
+        self._db = db
+        self._empresa_id = empresa_id
+
+    async def importar_ofx(self, conteudo: str, agencia_id: UUID) -> ImportacaoResult:
+        """Parseia OFX, deduplica e persiste as transações novas."""
+        agencia = await self._get_agencia_or_400(agencia_id)
+
+        try:
+            transacoes_ofx = parse_ofx(conteudo)
+        except OFXParseError as e:
+            raise ValidationError(message=f"Arquivo OFX inválido: {e}")
+
+        if not transacoes_ofx:
+            raise ValidationError(message="Nenhuma transação encontrada no arquivo OFX.")
+
+        importadas, duplicadas, erros = 0, 0, 0
+        novas: list[Transacao] = []
+
+        for t in transacoes_ofx:
+            try:
+                dc = "C" if t.valor >= 0 else "D"
+                hash_dedup = _calcular_hash(self._empresa_id, agencia_id, t)
+
+                # Checa duplicata
+                existing = await self._db.execute(
+                    select(Transacao).where(
+                        Transacao.empresa_id == self._empresa_id,
+                        Transacao.hash_dedup == hash_dedup,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    duplicadas += 1
+                    continue
+
+                transacao = Transacao(
+                    empresa_id=self._empresa_id,
+                    agencia_id=agencia_id,
+                    data=t.data,
+                    valor=abs(t.valor),
+                    historico=t.historico or t.tipo_ofx,
+                    dc=dc,
+                    hash_dedup=hash_dedup,
+                    status="pendente",
+                )
+                self._db.add(transacao)
+                novas.append(transacao)
+                importadas += 1
+            except Exception as exc:
+                logger.warning("extrato.transacao.erro", erro=str(exc))
+                erros += 1
+
+        await self._db.flush()
+
+        logger.info(
+            "extrato.importado",
+            empresa_id=str(self._empresa_id),
+            agencia_id=str(agencia_id),
+            total=len(transacoes_ofx),
+            importadas=importadas,
+            duplicadas=duplicadas,
+            erros=erros,
+        )
+
+        return ImportacaoResult(
+            agencia_id=agencia_id,
+            total_no_arquivo=len(transacoes_ofx),
+            importadas=importadas,
+            duplicadas=duplicadas,
+            erros=erros,
+            transacoes=[TransacaoResponse.model_validate(t) for t in novas],
+        )
+
+    async def importar_transacoes_raw(
+        self,
+        transacoes_raw: list,
+        agencia_id: UUID,
+    ) -> ImportacaoResult:
+        """Persiste transações já parseadas (ex.: vindas do PDF parser)."""
+        await self._get_agencia_or_400(agencia_id)
+
+        if not transacoes_raw:
+            from src.core.errors import ValidationError
+            raise ValidationError(message="Nenhuma transação encontrada no PDF.")
+
+        importadas, duplicadas, erros = 0, 0, 0
+        novas: list[Transacao] = []
+        # Guarda hashes já vistos neste lote para evitar colisão de UniqueConstraint
+        # quando o mesmo PDF tem transações legítimas mas com hash idêntico (ex.:
+        # múltiplos boletos do mesmo fornecedor, mesmo valor, mesma data).
+        hashes_do_lote: set[str] = set()
+
+        for t in transacoes_raw:
+            try:
+                dc = "C" if t.valor >= 0 else "D"
+                hash_dedup = _calcular_hash(self._empresa_id, agencia_id, t)
+
+                # 1. Duplicata dentro do lote atual
+                if hash_dedup in hashes_do_lote:
+                    duplicadas += 1
+                    continue
+
+                # 2. Duplicata já persistida no banco
+                existing = await self._db.execute(
+                    select(Transacao).where(
+                        Transacao.empresa_id == self._empresa_id,
+                        Transacao.hash_dedup == hash_dedup,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    duplicadas += 1
+                    continue
+
+                transacao = Transacao(
+                    empresa_id=self._empresa_id,
+                    agencia_id=agencia_id,
+                    data=t.data,
+                    valor=abs(t.valor),
+                    historico=t.historico or "EXTRATO PDF",
+                    dc=dc,
+                    hash_dedup=hash_dedup,
+                    status="pendente",
+                )
+                self._db.add(transacao)
+                novas.append(transacao)
+                hashes_do_lote.add(hash_dedup)
+                importadas += 1
+            except Exception as exc:
+                logger.warning("extrato.pdf.transacao.erro", erro=str(exc))
+                erros += 1
+
+        await self._db.flush()
+
+        return ImportacaoResult(
+            agencia_id=agencia_id,
+            total_no_arquivo=len(transacoes_raw),
+            importadas=importadas,
+            duplicadas=duplicadas,
+            erros=erros,
+            transacoes=[TransacaoResponse.model_validate(t) for t in novas],
+        )
+
+    async def listar(
+        self,
+        filtro: TransacaoFiltro,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> ExtratoPendentesResponse:
+        q = select(Transacao).where(Transacao.empresa_id == self._empresa_id)
+
+        if filtro.status:
+            q = q.where(Transacao.status == filtro.status)
+        if filtro.agencia_id:
+            q = q.where(Transacao.agencia_id == filtro.agencia_id)
+        if filtro.data_de:
+            q = q.where(Transacao.data >= filtro.data_de)
+        if filtro.data_ate:
+            q = q.where(Transacao.data <= filtro.data_ate)
+
+        count_q = select(func.count()).select_from(q.subquery())
+        total = (await self._db.execute(count_q)).scalar_one()
+
+        rows = (
+            await self._db.execute(
+                q.order_by(Transacao.data.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).scalars().all()
+
+        return ExtratoPendentesResponse(
+            items=[TransacaoResponse.model_validate(r) for r in rows],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+
+    async def obter(self, transacao_id: UUID) -> TransacaoResponse:
+        result = await self._db.execute(
+            select(Transacao).where(
+                Transacao.id == transacao_id,
+                Transacao.empresa_id == self._empresa_id,
+            )
+        )
+        t = result.scalar_one_or_none()
+        if not t:
+            raise NotFoundError(message="Transação não encontrada.")
+        return TransacaoResponse.model_validate(t)
+
+    async def _get_agencia_or_400(self, agencia_id: UUID) -> AgenciaBancaria:
+        result = await self._db.execute(
+            select(AgenciaBancaria).where(
+                AgenciaBancaria.id == agencia_id,
+                AgenciaBancaria.empresa_id == self._empresa_id,
+                AgenciaBancaria.deleted_at == None,
+            )
+        )
+        agencia = result.scalar_one_or_none()
+        if not agencia:
+            raise ValidationError(message="Agência bancária não encontrada nesta empresa.")
+        return agencia
+
+
+def _calcular_hash(empresa_id: UUID, agencia_id: UUID, t: TransacaoOFX) -> str:
+    """SHA-256 determinístico — base para deduplicação idempotente.
+
+    PDFs (fitid começa com 'PDF'):
+        Usa o fitid completo no hash.  O fitid já embute a posição da transação
+        no arquivo (idx) via MD5(data+historico+valor+idx), então duas transações
+        com mesma descrição e mesmo valor em datas iguais (ex: boletos do mesmo
+        fornecedor) terão fitids distintos → hashes distintos → sem colisão de
+        UniqueConstraint ao inserir o lote inteiro.
+
+        Deduplicação cross-import é garantida porque o pdfplumber e o OCR com
+        temperature=0 são determinísticos: mesmo PDF → mesma sequência de fitids.
+
+    OFX:
+        fitid vem do banco e é estável — usamos ele diretamente.
+    """
+    is_pdf = (t.fitid or "").startswith("PDF")
+
+    if is_pdf:
+        chave = json.dumps(
+            {
+                "empresa_id": str(empresa_id),
+                "agencia_id": str(agencia_id),
+                "fitid": t.fitid,          # já encoda data + historico + valor + idx
+            },
+            sort_keys=True,
+        )
+    else:
+        chave = json.dumps(
+            {
+                "empresa_id": str(empresa_id),
+                "agencia_id": str(agencia_id),
+                "data": t.data.isoformat(),
+                "valor": str(abs(t.valor)),
+                "historico": (t.historico or "").lower().strip(),
+                "fitid": t.fitid,
+            },
+            sort_keys=True,
+        )
+    return hashlib.sha256(chave.encode()).hexdigest()

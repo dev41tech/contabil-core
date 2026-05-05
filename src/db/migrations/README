@@ -1,0 +1,17 @@
+Migrações de banco gerenciadas pelo Alembic.
+
+Comandos:
+  # Criar nova migration
+  alembic revision --autogenerate -m "descricao"
+
+  # Aplicar migrações
+  alembic upgrade head
+
+  # Reverter última
+  alembic downgrade -1
+
+  # Ver histórico
+  alembic history
+
+  # Ver migration atual
+  alembic current
