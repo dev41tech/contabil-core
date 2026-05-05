@@ -3,33 +3,52 @@ set -e
 
 echo "=== Contabil Core — startup ==="
 
-# Aguarda o PostgreSQL ficar disponível
+# ── Aguarda o PostgreSQL ──────────────────────────────────────────────────────
+# Usa um script Python separado para evitar problemas de quoting + set -e no until
 echo "Aguardando banco de dados..."
-until python -c "
-import asyncio, sys
+
+RETRIES=30
+i=0
+while [ $i -lt $RETRIES ]; do
+  if python - <<'PYEOF'
+import asyncio, sys, os
+
 async def ping():
     try:
         import asyncpg
-        url = '${DATABASE_URL}'.replace('postgresql+asyncpg://', 'postgresql://')
+        raw = os.environ.get("DATABASE_URL", "")
+        # Normaliza URL: postgres:// ou postgresql:// → asyncpg nativo
+        url = (raw
+            .replace("postgresql+asyncpg://", "postgresql://")
+            .replace("postgres://", "postgresql://"))
         conn = await asyncpg.connect(url, timeout=5)
         await conn.close()
-        print('Banco disponível.')
     except Exception as e:
-        print(f'Banco indisponível: {e}', file=sys.stderr)
+        print(f"  DB não disponível: {e}", file=sys.stderr)
         sys.exit(1)
+
 asyncio.run(ping())
-"; do
-  echo "  Banco não disponível — aguardando 3s..."
+PYEOF
+  then
+    echo "Banco disponível."
+    break
+  fi
+  i=$((i + 1))
+  if [ $i -ge $RETRIES ]; then
+    echo "ERRO: banco não ficou disponível após $RETRIES tentativas." >&2
+    exit 1
+  fi
+  echo "  Tentativa $i/$RETRIES — aguardando 3s..."
   sleep 3
 done
 
-# Roda as migrations Alembic
+# ── Migrations Alembic ────────────────────────────────────────────────────────
 echo "Executando migrations..."
 alembic upgrade head
 echo "Migrations OK."
 
-# Inicia o servidor
-echo "Iniciando uvicorn..."
+# ── Inicia uvicorn ────────────────────────────────────────────────────────────
+echo "Iniciando uvicorn (workers=2)..."
 exec uvicorn main:app \
   --host 0.0.0.0 \
   --port 8000 \

@@ -14,10 +14,20 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from src.core.config import get_settings
 
 
+def _normalizar_url(url: str) -> str:
+    """Garante o driver correto na URL — aceita postgres://, postgresql:// e postgresql+asyncpg://."""
+    return (
+        url
+        .replace("postgres://", "postgresql+asyncpg://")
+        .replace("postgresql://", "postgresql+asyncpg://")
+        .replace("postgresql+asyncpg+asyncpg://", "postgresql+asyncpg://")
+    )
+
+
 def _build_engine():
     settings = get_settings()
     return create_async_engine(
-        str(settings.database_url),
+        _normalizar_url(str(settings.database_url)),
         pool_pre_ping=True,
         pool_size=10,
         max_overflow=20,
@@ -64,7 +74,7 @@ def get_sync_session_factory():
     if _sync_session_factory is None:
         settings = get_settings()
         # Troca o driver asyncpg → psycopg2 para uso síncrono
-        sync_url = str(settings.database_url).replace("+asyncpg", "+psycopg2")
+        sync_url = _normalizar_url(str(settings.database_url)).replace("+asyncpg", "+psycopg2")
         _sync_engine = create_engine(sync_url, pool_pre_ping=True, pool_size=5)
         _sync_session_factory = sessionmaker(bind=_sync_engine, autocommit=False, autoflush=False)
     return _sync_session_factory

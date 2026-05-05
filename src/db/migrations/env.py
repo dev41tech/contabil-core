@@ -16,8 +16,17 @@ from src.db.models import Base  # importa todos os models
 config = context.config
 settings = get_settings()
 
-# Override da URL de banco — usa a da configuração da app
-config.set_main_option("sqlalchemy.url", str(settings.database_url))
+# Override da URL de banco — normaliza para postgresql+asyncpg://
+# O EasyPanel (e Heroku, Railway, etc.) fornecem postgres:// ou postgresql://
+# SQLAlchemy 2.0 exige o driver explícito: postgresql+asyncpg://
+_raw_url = str(settings.database_url)
+_db_url = (
+    _raw_url
+    .replace("postgres://", "postgresql+asyncpg://")
+    .replace("postgresql://", "postgresql+asyncpg://")
+    .replace("postgresql+asyncpg+asyncpg://", "postgresql+asyncpg://")  # evita duplo replace
+)
+config.set_main_option("sqlalchemy.url", _db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
