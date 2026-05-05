@@ -53,5 +53,5 @@ exec uvicorn main:app \
   --host 0.0.0.0 \
   --port 8000 \
   --workers 2 \
-  --log-config null \
-  --no-access-log
+  --no-access-log \
+  --log-level info
