@@ -51,7 +51,7 @@ echo "Migrations OK."
 echo "Iniciando uvicorn (workers=2)..."
 exec uvicorn main:app \
   --host 0.0.0.0 \
-  --port 8000 \
+  --port 3012 \
   --workers 2 \
   --no-access-log \
   --log-level info
