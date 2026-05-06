@@ -44,6 +44,7 @@ dependencies = [
     # ── CONCILPRO — conciliação de fornecedores
     "psycopg2-binary>=2.9",    # sessão síncrona para background tasks pesados
     "python-Levenshtein>=0.23",
+    "openai>=1.30",             # GPT-4o-mini (texto) + GPT-4o Vision para parsing de PDF
 ]
 
 [project.optional-dependencies]
