@@ -38,17 +38,31 @@ Formato 3 — pagamento com histórico intercalado antes do lote:
   "09/05/2024 SISPAG BOLETO BANCO 341 7715 SISPAG BOLETO BANCO 341 552 4.150,00 SISPAG BOLETO BANCO 341 35.166,01C"
   → data=09/05/2024, lote=7715, historico="SISPAG BOLETO BANCO 341", conta_partida=552, valor_debito=4150.00, saldo_apos=35166.01, saldo_tipo=C
 
+Formato 4 — histórico repetido N vezes na mesma linha (artefato de PDF com layout multi-coluna):
+  "20/05/2024 VLR REF PGTO FGTS 04/2024 1167 VLR REF PGTO FGTS 04/2024 VLR REF PGTO FGTS 04/2024 VLR REF PGTO FGTS 04/2024 9 1.118,34 VLR REF PGTO FGTS 04/2024 4.095,27C"
+  → data=20/05/2024, lote=1167, historico="VLR REF PGTO FGTS 04/2024" (use apenas UMA ocorrência), conta_partida=9, valor_debito=1118.34, saldo_apos=4095.27, saldo_tipo=C
+  IDENTIFICAÇÃO: a mesma frase de texto aparece 3 ou mais vezes intercalada com números — é sempre o histórico repetido pelo layout do PDF.
+
+Formato 5 — histórico fragmentado em 2 linhas antes da data (histórico quebrado pela largura da coluna):
+  "VALOR REFERENTE FGTS S/FOLHA DE 5.154,41C"   ← 1ª parte do histórico + saldo (SEM data — ignore o valor numérico aqui)
+  "PAGAMENTO - 05/2024"                          ← 2ª parte do histórico (sem data, sem valor)
+  "31/05/2024 370 1.059,14"                      ← data + lote + valor REAL do lançamento
+  → data=31/05/2024, lote=370, historico="VALOR REFERENTE FGTS S/FOLHA DE PAGAMENTO - 05/2024", valor_credito=1059.14, saldo_apos=5154.41, saldo_tipo=C
+  IDENTIFICAÇÃO: linha sem data que termina com valor+C/D seguida de outra linha sem data e sem valor — ambas são o histórico. O valor real e a data sempre estão na linha que COMEÇA com DD/MM/YYYY.
+
 REGRAS:
 1. Valores em formato brasileiro (1.234,56) → retorne como float padrão (1234.56)
-2. Ignore linhas que são apenas o nome do fornecedor repetido (ruído do PDF)
-3. DÉBITO (valor_debito > 0) = pagamento: SISPAG, BOLETO, TED, PIX, PGTO, PAGAMENTO, BAIXA, TRANSF, DOC
-4. CRÉDITO (valor_credito > 0) = compra: NF, NOTA FISCAL, CT-E, COMPRA, CONFORME, SERVIÇO, AQUISIÇÃO
+2. Ignore linhas que são apenas o nome do fornecedor/empresa repetido (ruído do PDF)
+3. DÉBITO (valor_debito > 0) = pagamento: SISPAG, BOLETO, TED, PIX, PGTO, VLR REF PGTO, PAGAMENTO, BAIXA, TRANSF, DOC
+4. CRÉDITO (valor_credito > 0) = provisão/compra: NF, NOTA FISCAL, CT-E, COMPRA, CONFORME, SERVIÇO, AQUISIÇÃO, VALOR REFERENTE, FGTS A RECOLHER, SALDO DE IMPLANTAÇÃO, FÉRIAS, 13O SALÁRIO
 5. "SALDO ANTERIOR" → saldo_anterior + saldo_anterior_tipo
 6. "Total da conta: X Y" → X=total_debito, Y=total_credito. LEIA DIRETAMENTE — nunca calcule
 7. Saldo com sufixo C=credor, D=devedor
-8. No Formato 2: o valor na linha sem data é o SALDO após, não o valor do lançamento
+8. Nos Formatos 2 e 5: o valor numérico da linha SEM data é o saldo resultante (saldo_apos), NÃO o valor do lançamento
 9. Não invente valores; se incerto, use 0
 10. tipo_operacao: COMPRA | PAGAMENTO | DEVOLUCAO | DEBITO | CREDITO
+11. DEDUPLICAÇÃO: quando o mesmo texto aparece 3+ vezes na mesma linha, é histórico repetido — use-o uma única vez e limpo
+12. HISTÓRICO FRAGMENTADO: quando uma linha sem data parece continuação de texto da linha anterior (sem números independentes), concatene-as com espaço para formar o histórico completo
 
 Retorne APENAS JSON válido, sem comentários:
 {
@@ -60,7 +74,7 @@ Retorne APENAS JSON válido, sem comentários:
     {
       "data": "DD/MM/YYYY",
       "lote": "string",
-      "historico": "texto limpo sem repetições do nome do fornecedor",
+      "historico": "texto limpo sem repetições",
       "conta_partida": "número ou null",
       "valor_debito": 0.0,
       "valor_credito": 0.0,
@@ -92,20 +106,32 @@ Formato 2 — histórico ANTES da linha de data:
   "26/04/2024 7459 902 13.101,10"                     ← data + lote + CPC + valor real
   → data=26/04/2024, lote=7459, historico="COMPRA CONFORME NF NÚMERO 1263290 DE", conta_partida=902, valor_credito=13101.10
 
-Formato 3 — pagamento com histórico repetido:
+Formato 3 — pagamento com histórico repetido intercalado:
   "09/05/2024 SISPAG BOLETO BANCO 341 7715 SISPAG BOLETO BANCO 341 552 4.150,00 SISPAG BOLETO BANCO 341 35.166,01C"
   → data=09/05/2024, lote=7715, historico="SISPAG BOLETO BANCO 341", conta_partida=552, valor_debito=4150.00
 
+Formato 4 — histórico repetido N vezes na mesma linha (layout multi-coluna do PDF):
+  "20/05/2024 VLR REF PGTO FGTS 04/2024 1167 VLR REF PGTO FGTS 04/2024 VLR REF PGTO FGTS 04/2024 9 1.118,34 VLR REF PGTO FGTS 04/2024 4.095,27C"
+  → data=20/05/2024, lote=1167, historico="VLR REF PGTO FGTS 04/2024" (uma só vez), conta_partida=9, valor_debito=1118.34, saldo_apos=4095.27
+
+Formato 5 — histórico fragmentado em 2 linhas antes da data (coluna estreita):
+  "VALOR REFERENTE FGTS S/FOLHA DE 5.154,41C"   ← início do histórico + saldo (ignore o número)
+  "PAGAMENTO - 05/2024"                          ← fim do histórico
+  "31/05/2024 370 1.059,14"                      ← data + lote + valor REAL
+  → data=31/05/2024, lote=370, historico="VALOR REFERENTE FGTS S/FOLHA DE PAGAMENTO - 05/2024", valor_credito=1059.14, saldo_apos=5154.41
+
 REGRAS DE EXTRAÇÃO:
 1. Valores em formato brasileiro (1.234,56) → float padrão (1234.56)
-2. Ignore texto repetido do nome do fornecedor (ruído do PDF)
-3. DÉBITO = pagamento: SISPAG, BOLETO, TED, PIX, PGTO, PAGAMENTO, BAIXA, TRANSF, DOC
-4. CRÉDITO = compra: NF, NOTA FISCAL, CT-E, COMPRA, CONFORME, SERVIÇO, AQUISIÇÃO
+2. Ignore texto repetido do nome do fornecedor/empresa (ruído do PDF)
+3. DÉBITO = pagamento: SISPAG, BOLETO, TED, PIX, PGTO, VLR REF PGTO, PAGAMENTO, BAIXA, TRANSF, DOC
+4. CRÉDITO = provisão/compra: NF, NOTA FISCAL, CT-E, COMPRA, CONFORME, SERVIÇO, AQUISIÇÃO, VALOR REFERENTE, FGTS A RECOLHER, SALDO DE IMPLANTAÇÃO, FÉRIAS, 13O SALÁRIO
 5. "SALDO ANTERIOR" → saldo_anterior
 6. "Total da conta: X Y" → leia diretamente, nunca calcule
 7. Saldo com sufixo C=credor, D=devedor
 8. Se a imagem mostrar múltiplos fornecedores, extraia APENAS o fornecedor indicado no contexto
 9. tipo_operacao: COMPRA | PAGAMENTO | DEVOLUCAO | DEBITO | CREDITO
+10. DEDUPLICAÇÃO: quando o mesmo texto aparece 3+ vezes na mesma linha, é histórico repetido — use-o uma única vez
+11. HISTÓRICO FRAGMENTADO: linhas sem data que precedem a data real fazem parte do histórico — concatene-as
 
 REGRAS DE CONCILIAÇÃO:
 REGRA 1 — Casamento direto por NF: se pagamento mencionar NF → criterio="regra_1"

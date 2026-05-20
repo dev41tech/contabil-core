@@ -13,8 +13,66 @@ from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
+from collections import Counter
 
 logger = logging.getLogger(__name__)
+
+
+def _deduplicar_historico_linha(linha: str) -> str:
+    """
+    Remove repetições de substrings causadas pela extração de PDFs com layout multi-coluna.
+
+    Alguns sistemas geram PDFs onde o histórico aparece em múltiplas colunas que
+    colapsam numa só linha no pdfplumber:
+      "20/05/2024 VLR REF PGTO FGTS 04/2024 1167 VLR REF PGTO FGTS 04/2024 VLR REF PGTO FGTS 04/2024 9 1.118,34 VLR REF PGTO FGTS 04/2024 4.095,27C"
+      → "20/05/2024 VLR REF PGTO FGTS 04/2024 1167 9 1.118,34 4.095,27C"
+    """
+    palavras = linha.split()
+    if len(palavras) < 9:
+        return linha
+
+    # Tenta n-gramas de 3 a 7 palavras; escolhe o mais frequente com ≥3 ocorrências
+    melhor_frase: str = ""
+    melhor_contagem: int = 0
+
+    for n in range(7, 2, -1):
+        if n >= len(palavras):
+            continue
+        ngramas = [" ".join(palavras[i : i + n]) for i in range(len(palavras) - n + 1)]
+        contagens = Counter(ngramas)
+        frase, cnt = contagens.most_common(1)[0]
+        if cnt >= 3 and cnt > melhor_contagem:
+            melhor_frase = frase
+            melhor_contagem = cnt
+
+    if not melhor_frase:
+        return linha
+
+    # Mantém a PRIMEIRA ocorrência e remove as demais
+    padrao = re.compile(r"(?<!\w)" + re.escape(melhor_frase) + r"(?!\w)")
+    ocorrencias = [m.start() for m in padrao.finditer(linha)]
+    if len(ocorrencias) < 3:
+        return linha
+
+    # Apaga da segunda ocorrência em diante (de trás para frente para não mudar posições)
+    resultado = linha
+    for pos in reversed(ocorrencias[1:]):
+        resultado = resultado[:pos] + resultado[pos + len(melhor_frase):]
+
+    # Limpa espaços duplos gerados pela remoção
+    return re.sub(r" {2,}", " ", resultado).strip()
+
+
+def _preprocessar_bloco(bloco_texto: str) -> str:
+    """
+    Limpa o texto bruto de um bloco antes de enviar para a IA:
+    - Remove repetições de histórico por linha (Formato 4)
+    - Não altera linhas curtas nem linhas sem texto significativo
+    """
+    linhas_limpas = []
+    for linha in bloco_texto.split("\n"):
+        linhas_limpas.append(_deduplicar_historico_linha(linha))
+    return "\n".join(linhas_limpas)
 
 
 def calcular_hash_arquivo(arquivo_bytes: bytes) -> str:
@@ -574,7 +632,10 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
             return
 
         bloco_num[0] += 1
-        bloco_texto = '\n'.join(linhas_bloco)
+        bloco_texto_raw = '\n'.join(linhas_bloco)
+        bloco_texto = _preprocessar_bloco(bloco_texto_raw)
+        if bloco_texto != bloco_texto_raw:
+            print(f"   🧹 Pré-processamento removeu repetições de histórico.")
         print(f"\n[{bloco_num[0]}/{total_blocos}] Processando bloco ({len(linhas_bloco)} linhas)...")
 
         # ── Tentativa 1: IA com texto (GPT-4o-mini — rápido, barato ~5s/bloco) ──
