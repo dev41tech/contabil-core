@@ -46,3 +46,6 @@ Thumbs.db
 
 # Docker
 *.override.yml
+
+# Dumps de producao gerados por reprocessar_concilpro.py (dados de cliente)
+backup_concilpro/

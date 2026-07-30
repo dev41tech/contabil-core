@@ -2,27 +2,15 @@
 import sys, time
 import psycopg2
 
-PROD_URL = "postgres://postgres:b2ad156f04d4203f02f3@vps.41tech.cloud:3308/contabil_db"
+from prod_db import obter_url, parse_url, resumo_destino
+
 SQL_FILE = "migrate_prod.sql"
 BATCH_SIZE = 500   # inserts por transação
 
 
-def parse_url(url):
-    # postgres://user:pass@host:port/db
-    url = url.replace("postgres://", "")
-    userpass, rest = url.split("@", 1)
-    user, password = userpass.split(":", 1)
-    hostport, dbname = rest.split("/", 1)
-    if ":" in hostport:
-        host, port = hostport.split(":", 1)
-    else:
-        host, port = hostport, "5432"
-    return dict(host=host, port=int(port), dbname=dbname, user=user, password=password)
-
-
 def main():
-    print(f"Conectando em produção...")
-    params = parse_url(PROD_URL)
+    print(f"Conectando em {resumo_destino()}...")
+    params = parse_url(obter_url())
     conn = psycopg2.connect(**params, connect_timeout=15)
     conn.autocommit = False
     cur = conn.cursor()

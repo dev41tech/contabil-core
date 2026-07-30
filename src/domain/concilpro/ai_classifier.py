@@ -50,6 +50,22 @@ Formato 5 — histórico fragmentado em 2 linhas antes da data (histórico quebr
   → data=31/05/2024, lote=370, historico="VALOR REFERENTE FGTS S/FOLHA DE PAGAMENTO - 05/2024", valor_credito=1059.14, saldo_apos=5154.41, saldo_tipo=C
   IDENTIFICAÇÃO: linha sem data que termina com valor+C/D seguida de outra linha sem data e sem valor — ambas são o histórico. O valor real e a data sempre estão na linha que COMEÇA com DD/MM/YYYY.
 
+Formato 6 — COLUNAS ALINHADAS (o texto preserva o espaçamento original do PDF):
+  Quando a primeira linha do bloco é o header da tabela, a POSIÇÃO HORIZONTAL de cada
+  número diz a que coluna ele pertence. Conte os caracteres.
+
+     Data         Lote  Histórico                          Cta.C.Part.       Débito         Crédito         Saldo-Exercício
+  28/02/2026      11190 VALOR A RECOLHER DE IPI DO PERÍODO         425                      2.758,20        2.758,20C
+  28/02/2026      11192 VALOR A RECUPERAR DE IPI DO PERÍODO         29       2.758,20                            0,00
+
+  → 1ª: valor 2.758,20 alinhado sob "Crédito"  → valor_credito=2758.20, valor_debito=0, saldo_apos=2758.20, saldo_tipo=C
+  → 2ª: valor 2.758,20 alinhado sob "Débito"   → valor_debito=2758.20, valor_credito=0, saldo_apos=0.00
+
+  ATENÇÃO: nesse formato a coluna PREVALECE sobre as palavras-chave das regras 3 e 4.
+  "VALOR A RECUPERAR" alinhado na coluna Débito é DÉBITO, mesmo contendo "VALOR".
+  Um lançamento nunca tem valor_debito e valor_credito ambos zerados: se você leu um
+  número na linha, ele pertence a Débito ou a Crédito conforme a coluna.
+
 REGRAS:
 1. Valores em formato brasileiro (1.234,56) → retorne como float padrão (1234.56)
 2. Ignore linhas que são apenas o nome do fornecedor/empresa repetido (ruído do PDF)
@@ -63,6 +79,8 @@ REGRAS:
 10. tipo_operacao: COMPRA | PAGAMENTO | DEVOLUCAO | DEBITO | CREDITO
 11. DEDUPLICAÇÃO: quando o mesmo texto aparece 3+ vezes na mesma linha, é histórico repetido — use-o uma única vez e limpo
 12. HISTÓRICO FRAGMENTADO: quando uma linha sem data parece continuação de texto da linha anterior (sem números independentes), concatene-as com espaço para formar o histórico completo
+13. COLUNA MANDA: se o bloco começa com o header da tabela (Formato 6), use a posição horizontal do número para decidir entre valor_debito e valor_credito — as palavras-chave das regras 3 e 4 são apenas desempate quando não há header
+14. O total_debito informado em "Total da conta" deve fechar com a soma dos valor_debito dos lançamentos; se não fechar, reveja qual coluna cada número ocupa antes de responder
 
 Retorne APENAS JSON válido, sem comentários:
 {

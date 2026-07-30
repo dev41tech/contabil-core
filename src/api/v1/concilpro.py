@@ -113,6 +113,35 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
             total_debito  = total_debito_calc  if total_debito_calc  > 0 else total_debito_ia
             total_credito = total_credito_calc if total_credito_calc > 0 else total_credito_ia
 
+            # ── Guarda de divergência ───────────────────────────────────────
+            # A soma dos lançamentos parseados vence o total declarado no PDF
+            # (acima). Quando os dois discordam, ou quando algum lançamento foi
+            # fabricado por _recuperar_lancamentos_ocultos, os números não são
+            # confiáveis — marcar para revisão em vez de entregar silenciosamente.
+            TOL_DIVERGENCIA = Decimal("0.01")
+            divergencias: list[str] = []
+
+            if total_debito_ia > 0 and abs(total_debito_calc - total_debito_ia) > TOL_DIVERGENCIA:
+                divergencias.append(
+                    f"débito: PDF declara {total_debito_ia}, lançamentos somam {total_debito_calc}"
+                )
+            if total_credito_ia > 0 and abs(total_credito_calc - total_credito_ia) > TOL_DIVERGENCIA:
+                divergencias.append(
+                    f"crédito: PDF declara {total_credito_ia}, lançamentos somam {total_credito_calc}"
+                )
+
+            qtd_sinteticos = sum(1 for l in lancamentos_raw if l.get("sintetico"))
+            if qtd_sinteticos:
+                divergencias.append(f"{qtd_sinteticos} lançamento(s) fabricado(s) por recuperação de saldo")
+
+            if divergencias:
+                logger.warning(
+                    "⚠️ Divergência em '%s' (conta %s): %s",
+                    forn_data["nome_fornecedor"][:40],
+                    forn_data["codigo_conta"],
+                    "; ".join(divergencias),
+                )
+
             saldo_ant_tipo = (forn_data.get("saldo_anterior_tipo") or "")[:1]
 
             fornecedor = Fornecedor(
@@ -125,6 +154,8 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 total_debito        = total_debito,
                 total_credito       = total_credito,
                 saldo_final         = saldo_anterior + total_credito - total_debito,
+                divergencia_calculo = bool(divergencias),
+                mensagem_erro       = "; ".join(divergencias)[:2000] or None,
             )
             db.add(fornecedor)
             db.flush()
@@ -467,6 +498,7 @@ async def obter_fornecedor_detalhado(fornecedor_id: int, db: AsyncSession = Depe
             "valor_a_pagar":      float(fornecedor.valor_a_pagar or 0),
             "status_pagamento":   fornecedor.status_pagamento,
             "divergencia_calculo": fornecedor.divergencia_calculo,
+            "divergencia_motivo":  fornecedor.mensagem_erro,
         },
         "compras_pendentes": [
             {
