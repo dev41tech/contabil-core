@@ -961,6 +961,29 @@ def parsear_bloco_deterministico(linhas: List[str]) -> Optional[Dict]:
                 lancamentos[-1]["historico"] = f"{lancamentos[-1]['historico']} {sobra}".strip()
 
     if not lancamentos:
+        # Conta aberta no plano mas sem movimento no período: é resultado
+        # legítimo, não falha de leitura. Só aceita quando o PDF declara
+        # totais zerados E não há nenhuma linha de lançamento no bloco — se
+        # houver data e nada foi lido, aí sim é falha, e vai para a IA.
+        tem_linha_de_lancamento = any(
+            re.match(r"^\s*\d{2}/\d{2}/\d{4}", linha) for linha in linhas
+        )
+        if total_debito == 0 and total_credito == 0 and not tem_linha_de_lancamento:
+            saldo_ant = Decimal("0")
+            saldo_ant_tipo = ""
+            m_sa = _RE_SALDO_ANTERIOR.search(texto)
+            if m_sa:
+                saldo_ant = _decimal_br(m_sa.group(1))
+                saldo_ant_tipo = m_sa.group(2) or ""
+            print("   ⚪ Conta sem movimento no período — registrada com saldo zero.")
+            return {
+                "saldo_anterior": saldo_ant,
+                "saldo_anterior_tipo": saldo_ant_tipo,
+                "total_debito": Decimal("0"),
+                "total_credito": Decimal("0"),
+                "lancamentos": [],
+                "sem_movimento": True,
+            }
         return None
 
     soma_debito = sum(l["valor_debito"] for l in lancamentos)
@@ -1364,7 +1387,9 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
         # conta" impresso no PDF; caso contrário devolve None e segue para a IA.
         linhas_preprocessadas = bloco_texto.split('\n')
         dados_det = parsear_bloco_deterministico(linhas_preprocessadas)
-        if dados_det and _tem_valores(dados_det["lancamentos"]):
+        # conta sem movimento não tem valores, e ainda assim é resultado válido
+        if dados_det and (_tem_valores(dados_det["lancamentos"])
+                          or dados_det.get("sem_movimento")):
             fornecedor = _construir_fornecedor_deterministico(dados_det, linhas_preprocessadas)
             if fornecedor:
                 fornecedores.append(fornecedor)

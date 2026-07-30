@@ -196,7 +196,17 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 
         for forn in db.query(Fornecedor).filter(Fornecedor.arquivo_origem_id == arquivo.id).all():
             forn.valor_a_pagar = forn.total_credito - forn.total_debito
-            if abs(forn.valor_a_pagar) <= Decimal("0.01"):
+            sem_movimento = (
+                forn.total_credito == 0
+                and forn.total_debito == 0
+                and not forn.lancamentos
+            )
+            if sem_movimento:
+                # Conta aberta no plano sem movimento no período. Não é QUITADO:
+                # contá-la ali inflaria a métrica de quitados com contas que
+                # nunca tiveram lançamento.
+                forn.status_pagamento = "SEM_MOVIMENTO"
+            elif abs(forn.valor_a_pagar) <= Decimal("0.01"):
                 forn.status_pagamento = "QUITADO"
             elif forn.valor_a_pagar < 0:
                 forn.status_pagamento = "ADIANTADO"
@@ -420,6 +430,7 @@ async def obter_resumo(arquivo_id: int, db: AsyncSession = Depends(get_db)):
             "fornecedores_quitados":     sum(1 for f in fornecedores if f.status_pagamento == "QUITADO"),
             "fornecedores_em_aberto":    sum(1 for f in fornecedores if f.status_pagamento == "EM_ABERTO"),
             "fornecedores_adiantados":   sum(1 for f in fornecedores if f.status_pagamento == "ADIANTADO"),
+            "fornecedores_sem_movimento": sum(1 for f in fornecedores if f.status_pagamento == "SEM_MOVIMENTO"),
             "fornecedores_com_divergencia": sum(1 for f in fornecedores if f.divergencia_calculo),
             "valor_total_a_pagar":       float(sum(f.valor_a_pagar or 0 for f in fornecedores)),
         },

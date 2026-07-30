@@ -23,6 +23,7 @@ from src.domain.concilpro.parser import (
     _pontuar_extracao,
     _recuperar_lancamentos_ocultos,
     _valores_por_coluna,
+    parsear_bloco_deterministico,
 )
 
 LARGURA_CHAR = 3.0
@@ -401,6 +402,44 @@ class TestConsolidacaoEntrePaginas:
 
         assert len(consolidado[0]["lancamentos"]) == 1
         assert consolidado[0]["lancamentos"][0]["numero_nf"] == "365866"
+
+
+class TestContaSemMovimento:
+    _CONTA = "Conta:        1667 - 2.1.3.01.0002                       CASSOL MATERIAIS DE CONSTRUCAO LTDA"
+    _SALDO = "                      SALDO ANTERIOR                                                          0,00"
+    _TOTAL = ("                                                          Total da conta:"
+              "                      0,00                    0,00")
+
+    def test_conta_sem_lancamento_e_registrada(self):
+        """Conta aberta no plano sem movimento no período é resultado válido."""
+        dados = parsear_bloco_deterministico([_HEADER, self._CONTA, self._SALDO, self._TOTAL])
+
+        assert dados is not None, "conta sem movimento não pode ser descartada"
+        assert dados["sem_movimento"] is True
+        assert dados["lancamentos"] == []
+        assert dados["total_debito"] == Decimal("0")
+        assert dados["total_credito"] == Decimal("0")
+
+    def test_bloco_com_data_mas_sem_leitura_nao_vira_sem_movimento(self):
+        """
+        Se há linha de lançamento e nada foi lido, é falha de leitura — precisa
+        cair na IA, não ser silenciada como conta vazia.
+        """
+        linha_nao_lida = "15/03/2025 19957 VLR REF PGTO MOTOR PEPE 1741 236,70    0,00"
+        dados = parsear_bloco_deterministico(
+            [_HEADER, self._CONTA, linha_nao_lida, self._TOTAL]
+        )
+
+        assert dados is None
+
+    def test_saldo_anterior_e_preservado(self):
+        saldo = ("                      SALDO ANTERIOR"
+                 "                                                        1.234,56C")
+        dados = parsear_bloco_deterministico([_HEADER, self._CONTA, saldo, self._TOTAL])
+
+        assert dados["sem_movimento"] is True
+        assert dados["saldo_anterior"] == Decimal("1234.56")
+        assert dados["saldo_anterior_tipo"] == "C"
 
 
 class TestRecuperacaoOculta:
