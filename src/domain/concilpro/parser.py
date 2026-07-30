@@ -251,6 +251,9 @@ def _construir_runs(chars: List[Dict]) -> List[Dict]:
     } for run in runs]
 
 
+_RE_SO_NUMERO = re.compile(r"[\d.,]+[CD]?")
+
+
 def _runs_sobrepostos(a: Dict, b: Dict) -> bool:
     """Diz se dois runs ocupam faixas horizontais que se cruzam."""
     return a["x0"] < b["x1"] and b["x0"] < a["x1"]
@@ -307,13 +310,26 @@ def _montar_linhas_de_runs(runs: List[Dict], largura_char: float = 3.7) -> List[
                 mantidos.append(min(copias, key=lambda c: (_colisoes(c), c["x0"])))
                 continue
 
-            # Exatamente 2 cópias: se não se sobrepõem, são colunas legítimas
-            # com o mesmo valor (ex: "Total da conta: 40.679,43 40.679,43").
+            # Exatamente 2 cópias: se não se sobrepõem, normalmente são colunas
+            # legítimas com o mesmo valor ("Total da conta: 40.679,43 40.679,43").
             a, b = sorted(copias, key=lambda r: r["x0"])
             if _runs_sobrepostos(a, b):
                 mantidos.append(min((a, b), key=lambda c: (_colisoes(c), c["x0"])))
-            else:
-                mantidos.extend((a, b))
+                continue
+
+            # Exceção: as colunas de valor contêm números. Uma cópia de TEXTO
+            # pousada sobre um número é artefato de renderização — e mantê-la
+            # empurra o valor para fora da sua coluna, que é justamente o sinal
+            # que distingue Débito de Crédito.
+            numericos = [r for r in grupo if _RE_SO_NUMERO.fullmatch(r["texto"])]
+            if not _RE_SO_NUMERO.fullmatch(texto):
+                sobre_numero = [c for c in (a, b)
+                                if any(_runs_sobrepostos(c, n) for n in numericos)]
+                if sobre_numero and len(sobre_numero) < 2:
+                    mantidos.append(a if sobre_numero[0] is b else b)
+                    continue
+
+            mantidos.extend((a, b))
 
         mantidos.sort(key=lambda r: r["x0"])
 
@@ -380,37 +396,64 @@ def _pontuar_extracao(texto: str) -> Tuple[int, int]:
     return lancamentos, corrompidos
 
 
-def _escolher_melhor_extracao(pagina) -> str:
+_ESTRATEGIAS = ("layout", "palavras", "chars")
+
+
+def _extrair_candidatos(pagina) -> Dict[str, str]:
+    """Roda as três estratégias de extração sobre a página."""
+    return {
+        "layout": pagina.extract_text(layout=True) or "",
+        "palavras": _extrair_pagina_por_palavras(pagina),
+        "chars": _extrair_pagina_por_chars(pagina),
+    }
+
+
+def _escolher_estrategia(paginas_candidatas: List[Dict[str, str]]) -> str:
     """
-    Escolhe entre as estratégias de extração pela qualidade de domínio:
-    mais linhas de lançamento reconhecíveis e menos tokens corrompidos.
+    Escolhe UMA estratégia para o documento inteiro, somando a qualidade de
+    todas as páginas.
 
-    Em empate preserva o comportamento histórico (layout → palavras), para
-    manter estáveis os PDFs que já eram extraídos corretamente.
+    A escolha não pode ser por página: cada estratégia produz uma grade
+    horizontal própria, e o header da tabela — que define onde ficam as colunas
+    Débito e Crédito — é localizado uma vez para o documento. Misturar
+    estratégias faz as colunas do header não valerem para as páginas extraídas
+    de outro jeito, e os valores caem fora de qualquer coluna.
+
+    Comprimento não serve de critério: o entrelaçamento duplica texto e infla o
+    tamanho, então a extração pior venceria.
     """
-    candidatos = [
-        ("layout", pagina.extract_text(layout=True) or ""),
-        ("palavras", _extrair_pagina_por_palavras(pagina)),
-        ("chars", _extrair_pagina_por_chars(pagina)),
-    ]
+    melhor_nome, melhor_lanc, melhor_corrompidos = "", -1, 0
 
-    melhor_nome, melhor_texto = "", ""
-    melhor_lanc, melhor_corrompidos = -1, 0
-
-    for nome, texto in candidatos:
-        if not texto:
+    for nome in _ESTRATEGIAS:
+        textos = [p.get(nome) or "" for p in paginas_candidatas]
+        if not any(textos):
             continue
-        lancamentos, corrompidos = _pontuar_extracao(texto)
+        lancamentos = corrompidos = 0
+        for texto in textos:
+            l, c = _pontuar_extracao(texto)
+            lancamentos += l
+            corrompidos += c
         # só troca com ganho estrito: mais lançamentos, ou empate com menos ruído
         if (lancamentos > melhor_lanc
                 or (lancamentos == melhor_lanc and corrompidos < melhor_corrompidos)):
-            melhor_nome, melhor_texto = nome, texto
-            melhor_lanc, melhor_corrompidos = lancamentos, corrompidos
+            melhor_nome, melhor_lanc, melhor_corrompidos = nome, lancamentos, corrompidos
 
-    if melhor_nome == "chars":
-        print(f"   🔩 Linha reconstruída por chars ({melhor_lanc} lançamentos)")
+    if melhor_nome:
+        print(
+            f"   📏 Estratégia de extração: {melhor_nome} "
+            f"({melhor_lanc} lançamentos, {melhor_corrompidos} tokens corrompidos)"
+        )
+    return melhor_nome or "layout"
 
-    return melhor_texto or (pagina.extract_text() or "")
+
+def _extrair_paginas(pdf) -> List[str]:
+    """Extrai todas as páginas do PDF com uma estratégia única e coerente."""
+    candidatas = [_extrair_candidatos(pagina) for pagina in pdf.pages]
+    estrategia = _escolher_estrategia(candidatas)
+    return [
+        c.get(estrategia) or c.get("layout") or ""
+        for c in candidatas
+    ]
 
 
 def extrair_texto_pdf(arquivo_bytes: bytes) -> str:
@@ -424,8 +467,7 @@ def extrair_texto_pdf(arquivo_bytes: bytes) -> str:
             total_paginas = len(pdf.pages)
             print(f"📄 PDF detectado: {total_paginas} páginas")
 
-            for i, pagina in enumerate(pdf.pages, 1):
-                texto = _escolher_melhor_extracao(pagina)
+            for texto in _extrair_paginas(pdf):
                 if texto:
                     texto_completo.append(texto)
 
@@ -1251,8 +1293,8 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
         with pdfplumber.open(BytesIO(arquivo_bytes)) as pdf:
             total_paginas = len(pdf.pages)
             print(f"📄 PDF detectado: {total_paginas} páginas")
-            for i, pagina in enumerate(pdf.pages):
-                paginas_dados.append((_escolher_melhor_extracao(pagina), i))
+            for i, texto in enumerate(_extrair_paginas(pdf)):
+                paginas_dados.append((texto, i))
                 if (i + 1) % 10 == 0:
                     print(f"   Processadas {i+1}/{total_paginas} páginas...")
             print(f"✅ Extração concluída: {len(paginas_dados)} páginas com texto")

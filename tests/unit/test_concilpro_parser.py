@@ -18,8 +18,7 @@ from src.domain.concilpro.parser import (
     _construir_runs,
     _corrigir_colunas_por_posicao,
     consolidar_fornecedores_duplicados,
-    _escolher_melhor_extracao,
-    _extrair_pagina_por_chars,
+    _escolher_estrategia,
     _montar_linhas_de_runs,
     _pontuar_extracao,
     _recuperar_lancamentos_ocultos,
@@ -176,54 +175,50 @@ class TestPontuarExtracao:
         assert _pontuar_extracao(texto)[1] == 0
 
 
-class _PaginaFake:
-    """Stub de página do pdfplumber para testar a escolha de estratégia."""
-
-    def __init__(self, texto_layout: str, texto_words: str, chars: list[dict]):
-        self._layout = texto_layout
-        self._words = texto_words
-        self.chars = chars
-
-    def extract_text(self, layout: bool = False) -> str:
-        return self._layout
-
-    def extract_words(self, **kwargs) -> list[dict]:
-        # reaproveita os chars como "palavras" — suficiente para o stub
-        return [dict(w, text=w["text"]) for w in self.chars] if self._words else []
-
-
-class TestEscolherMelhorExtracao:
+class TestEscolherEstrategia:
     def test_prefere_chars_quando_layout_esta_corrompido(self):
         """O caso real: layout tem mais texto, mas menos lançamentos legíveis."""
-        chars: list[dict] = []
-        for x0 in (0.7, 40.0, 80.0):
-            chars += _mk_chars("VALOR A RECUPERAR", x0, 112.18)
-        chars += _mk_chars("28/02/2026", 0.0, 113.14)
-        chars += _mk_chars("11192", 58.7, 113.14)
-
-        # layout corrompido e mais longo — o critério antigo (comprimento) o elegeria
         layout_corrompido = (
             "2V8A/L0O2R/2 A02 R6ECUPERA1R1 1D9E2 IVPIA LDOOR P AE RRÍEOCDUOPERAR "
             "VDAEL OIPRI AD OR EPCEURPÍOERDAOR DE IPI DO PERÍODO"
         )
-        pagina = _PaginaFake(layout_corrompido, "", chars)
+        pagina = {
+            "layout": layout_corrompido,
+            "palavras": "",
+            "chars": "28/02/2026      11192 VALOR A RECUPERAR",
+        }
 
-        escolhido = _escolher_melhor_extracao(pagina)
-
-        assert escolhido == _extrair_pagina_por_chars(pagina)
-        assert "28/02/2026" in escolhido
-        assert _pontuar_extracao(escolhido)[1] == 0
+        assert _escolher_estrategia([pagina]) == "chars"
         assert _pontuar_extracao(layout_corrompido)[1] > 0, (
             "o layout de referência precisa estar corrompido para o teste valer"
         )
 
     def test_mantem_layout_quando_ja_esta_limpo(self):
         """Empate preserva o comportamento histórico (sem regressão)."""
-        chars = _mk_chars("28/02/2026 11190 COMPRA", 0.0, 50.0)
-        layout_limpo = "28/02/2026 11190 COMPRA"
-        pagina = _PaginaFake(layout_limpo, "", chars)
+        limpo = "28/02/2026 11190 COMPRA"
+        pagina = {"layout": limpo, "palavras": limpo, "chars": limpo}
 
-        assert _escolher_melhor_extracao(pagina) == layout_limpo
+        assert _escolher_estrategia([pagina]) == "layout"
+
+    def test_escolha_e_unica_para_o_documento(self):
+        """
+        Estratégias diferentes geram grades horizontais diferentes. Como o
+        header que define as colunas é achado uma vez, misturar faria os
+        valores caírem fora de qualquer coluna.
+        """
+        pagina_limpa = {
+            "layout": "28/02/2026 11190 COMPRA 100,00",
+            "palavras": "",
+            "chars": "28/02/2026 11190 COMPRA 100,00",
+        }
+        pagina_corrompida = {
+            "layout": "2V8A/L0O2R/2 A02 R6ECUPERA1R1 1D9E2 IVPIA LDOOR",
+            "palavras": "",
+            "chars": "31/03/2026      15606 VLR REF TRANSFERENCIA",
+        }
+
+        # o documento inteiro adota chars por causa da página ruim
+        assert _escolher_estrategia([pagina_limpa, pagina_corrompida]) == "chars"
 
 
 # Bloco real do Razão.pdf (AXEL / IPI A RECOLHER) com o alinhamento preservado.
