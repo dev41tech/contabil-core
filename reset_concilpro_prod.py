@@ -1,17 +1,8 @@
 """Reseta arquivos CONCLUIDO com 0 fornecedores para permitir reprocessamento."""
-import psycopg2
+from prod_db import conectar_producao, resumo_destino
 
-PROD_URL = "postgres://postgres:b2ad156f04d4203f02f3@vps.41tech.cloud:3308/contabil_db"
-
-def parse_url(url):
-    url = url.replace("postgres://", "")
-    userpass, rest = url.split("@", 1)
-    user, password = userpass.split(":", 1)
-    hostport, dbname = rest.split("/", 1)
-    host, port = (hostport.split(":", 1) if ":" in hostport else (hostport, "5432"))
-    return dict(host=host, port=int(port), dbname=dbname, user=user, password=password)
-
-conn = psycopg2.connect(**parse_url(PROD_URL), connect_timeout=15)
+print(f"Conectando em {resumo_destino()}\n")
+conn = conectar_producao()
 cur = conn.cursor()
 
 # Lista arquivos com problema

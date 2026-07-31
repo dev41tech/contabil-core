@@ -624,7 +624,7 @@ class CpFornecedor(Base):
     total_credito       = _Col(_Num(15, 2), default=0)
     saldo_final         = _Col(_Num(15, 2), default=0)
     saldo_final_tipo    = _Col(_Str(1))
-    status_pagamento    = _Col(_Str(20))   # QUITADO | EM_ABERTO | ADIANTADO
+    status_pagamento    = _Col(_Str(20))   # QUITADO | EM_ABERTO | ADIANTADO | SEM_MOVIMENTO
     valor_a_pagar       = _Col(_Num(15, 2), default=0)
     qtd_nfs_pendentes   = _Col(_Int, default=0)
     qtd_nfs_parciais    = _Col(_Int, default=0)
