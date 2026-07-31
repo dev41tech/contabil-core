@@ -483,16 +483,17 @@ def extrair_texto_pdf(arquivo_bytes: bytes) -> str:
 
 
 def detectar_formato_arquivo(arquivo_bytes: bytes) -> str:
-    """Detecta se o arquivo é PDF ou ZIP."""
+    """Detecta se o arquivo é PDF, XLSX ou ZIP."""
+    from src.domain.concilpro.planilha import e_planilha
+
     if arquivo_bytes[:4] == b'%PDF':
         return 'PDF'
-    elif arquivo_bytes[:2] == b'PK':
+    # XLSX também começa com 'PK' — é um ZIP. Testar a planilha antes.
+    if e_planilha(arquivo_bytes):
+        return 'XLSX'
+    if arquivo_bytes[:2] == b'PK' or zipfile.is_zipfile(BytesIO(arquivo_bytes)):
         return 'ZIP'
-    else:
-        if zipfile.is_zipfile(BytesIO(arquivo_bytes)):
-            return 'ZIP'
-        else:
-            return 'PDF'
+    return 'PDF'
 
 
 def _deduplicar_lancamentos(lancamentos: List[Dict]) -> Tuple[List[Dict], int]:
@@ -1303,10 +1304,16 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
     formato = detectar_formato_arquivo(arquivo_bytes)
     print(f"🔍 Formato detectado: {formato}")
 
+    if formato == 'XLSX':
+        # Planilha declara o que o PDF obriga a inferir: célula tipada, coluna
+        # nomeada e sem paginação. Caminho determinístico, sem IA.
+        from src.domain.concilpro.planilha import parsear_planilha_razao
+        return parsear_planilha_razao(arquivo_bytes)
+
     if formato != 'PDF':
         raise ValueError(
-            f"Formato '{formato}' não suportado nesta versão. "
-            "Este parser funciona apenas com arquivos PDF."
+            f"Formato '{formato}' não suportado. "
+            "Envie o Razão em PDF ou em planilha XLSX."
         )
 
     print("📖 Extraindo texto do PDF...")
