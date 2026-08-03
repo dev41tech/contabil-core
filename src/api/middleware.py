@@ -1,7 +1,8 @@
 """Middlewares globais da aplicação.
 
 1. RequestContextMiddleware — injeta trace_id, user_id, company_id no contexto de logs
-2. ErrorHandlerMiddleware — converte exceções não tratadas em JSON estruturado
+2. LimiteUploadMiddleware — corta requests acima do limite antes de tocar no corpo
+3. ErrorHandlerMiddleware — converte exceções não tratadas em JSON estruturado
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from src.core.context import set_request_context
-from src.core.errors import AppError
+from src.core.errors import AppError, PayloadTooLargeError
 
 logger = structlog.get_logger(__name__)
 
@@ -45,6 +46,40 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         )
 
         return response
+
+
+class LimiteUploadMiddleware(BaseHTTPMiddleware):
+    """Recusa requests cujo `Content-Length` passa do limite configurado.
+
+    É a primeira barreira: barra o request antes de o FastAPI montar o
+    `UploadFile` e antes de qualquer parser carregar bytes em memória. Não cobre
+    quem omite o header (`Transfer-Encoding: chunked`) — para esse caso a
+    contagem real acontece em `ler_upload_limitado`.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        super().__init__(app)
+        self._max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        declarado = request.headers.get("content-length")
+        if declarado and declarado.isdigit() and int(declarado) > self._max_bytes:
+            logger.warning(
+                "upload.rejeitado",
+                path=request.url.path,
+                content_length=int(declarado),
+                limite=self._max_bytes,
+            )
+            return _error_response(
+                PayloadTooLargeError(
+                    message=(
+                        f"Arquivo maior que o limite de "
+                        f"{self._max_bytes // (1024 * 1024)} MB."
+                    ),
+                    details={"limite_bytes": self._max_bytes, "recebido_bytes": int(declarado)},
+                )
+            )
+        return await call_next(request)
 
 
 def _error_response(error: AppError) -> JSONResponse:

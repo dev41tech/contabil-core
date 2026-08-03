@@ -73,7 +73,7 @@ async def client(db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
 
 @pytest_asyncio.fixture
 async def tenant(db: AsyncSession) -> Tenant:
-    t = Tenant(nome="41 Contábil", cnpj="41.000.000/0001-00")
+    t = Tenant(nome="41 Contábil", cnpj="41.000.000/0001-79")
     db.add(t)
     await db.flush()
     return t
@@ -98,7 +98,7 @@ async def empresa(db: AsyncSession, tenant: Tenant) -> Empresa:
     e = Empresa(
         tenant_id=tenant.id,
         razao_social="DECATEC LTDA",
-        cnpj="12.345.678/0001-90",
+        cnpj="12.345.678/0001-95",
         regime_tributario="simples_nacional",
     )
     db.add(e)

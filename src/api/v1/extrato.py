@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.uploads import ler_upload_limitado
 from src.db.session import get_db
 from src.domain.extrato.service import ExtratoService
 from src.schemas.extrato import (
@@ -41,7 +42,7 @@ async def importar_extrato(
     db: AsyncSession = Depends(get_db),
 ) -> ImportacaoResult:
     """Importa um arquivo OFX ou PDF e persiste as transações novas (deduplicação automática)."""
-    conteudo_bytes = await arquivo.read()
+    conteudo_bytes = await ler_upload_limitado(arquivo)
     nome = (arquivo.filename or "").lower()
     svc = _svc(empresa_id, db)
 

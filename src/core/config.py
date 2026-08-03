@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ App
     app_name: str = "contabil-core"
     app_version: str = "0.1.0"
+    # SHA do commit que gerou a imagem — injetado como build arg no Dockerfile.
+    # app_version não muda entre deploys, então é isso que responde "meu deploy subiu?".
+    git_commit: str = "unknown"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
 
@@ -73,6 +76,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ Rate limit
     rate_limit_per_ip: int = 100        # req/min
     rate_limit_per_tenant: int = 1000   # req/min
+
+    # ------------------------------------------------------------------ Upload
+    # Todos os parsers (Razão em PDF/XLSX, OFX, CSV) carregam o arquivo inteiro
+    # em memória, então o limite é o que separa um upload grande de um OOM.
+    # Manter abaixo do `client_max_body_size` do nginx do contabil-front (50M),
+    # para que a recusa venha daqui com JSON tipado, não do nginx em HTML.
+    max_upload_mb: int = 25
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
 
     # ------------------------------------------------------------------ Cookie
     cookie_domain: str | None = None    # None = mesmo domínio

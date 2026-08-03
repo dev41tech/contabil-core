@@ -203,8 +203,8 @@ def _extrair_pagina_por_palavras(pagina) -> str:
 #   top=113.137 → "28/02/2026" "11192" "29" "2.758,20" "0,00"
 #   resultado   → "2V8A/L0O2R/2 A02 R6ECUPERA1R1 1D9E2 IVPIA LDOOR..."
 #
-# A IA descarta a linha e `_recuperar_lancamentos_ocultos` fabrica uma entrada
-# genérica no lugar — perdendo lote, contrapartida e histórico reais.
+# A IA descartava a linha e o lançamento se perdia inteiro — lote, contrapartida
+# e histórico reais.
 #
 # Cada campo, porém, é contíguo no content stream. Reagrupando os chars em
 # "runs" (sequências contíguas na mesma baseline) o entrelaçamento desaparece.
@@ -1068,127 +1068,6 @@ def _construir_fornecedor_deterministico(dados: Dict, linhas: List[str]) -> Opti
     }
 
 
-def _recuperar_lancamentos_ocultos(
-    lancamentos: List[Dict],
-    linhas_bloco: List[str],
-    total_debito_declarado: Decimal = Decimal("0"),
-    total_credito_declarado: Decimal = Decimal("0"),
-) -> List[Dict]:
-    """
-    Detecta lançamentos ocultos analisando saltos de saldo entre entradas consecutivas.
-
-    Só atua quando há de fato algo faltando: se os totais declarados em
-    "Total da conta" já fecham com a soma dos lançamentos parseados, nada está
-    oculto e fabricar entradas aqui só produziria valores falsos. Essa guarda
-    importa porque os lançamentos são reordenados por data na consolidação —
-    em contas cujo saldo oscila (tributos, FGTS), a reordenação quebra a cadeia
-    de saldos e a análise de gap enxerga lacunas que não existem.
-    """
-    TOLERANCIA = Decimal("0.05")
-    texto_bloco = "\n".join(linhas_bloco).upper()
-
-    if total_debito_declarado > 0 or total_credito_declarado > 0:
-        soma_debito = sum(Decimal(str(l.get("valor_debito") or 0)) for l in lancamentos)
-        soma_credito = sum(Decimal(str(l.get("valor_credito") or 0)) for l in lancamentos)
-        debito_fecha = abs(soma_debito - total_debito_declarado) <= TOLERANCIA
-        credito_fecha = abs(soma_credito - total_credito_declarado) <= TOLERANCIA
-        if debito_fecha and credito_fecha:
-            print("   ✅ Totais declarados fecham com os lançamentos — sem recuperação.")
-            return lancamentos
-
-    nfs_atribuidas = {l.get("numero_nf") for l in lancamentos if l.get("numero_nf")}
-    _seen: set = set()
-    nfs_unicas: List[str] = []
-    for nf in re.findall(r'N[ÚU]MERO\s+(\d{6,7})', texto_bloco):
-        if nf not in _seen:
-            _seen.add(nf)
-            nfs_unicas.append(nf)
-    nfs_livres = [nf for nf in nfs_unicas if nf not in nfs_atribuidas]
-    nf_ptr = 0
-
-    resultado: List[Dict] = []
-
-    for i, lanc in enumerate(lancamentos):
-        resultado.append(lanc)
-
-        if i + 1 >= len(lancamentos):
-            break
-
-        prox = lancamentos[i + 1]
-
-        saldo_atual = Decimal(str(lanc.get("saldo_apos_lancamento") or 0))
-        saldo_prox  = Decimal(str(prox.get("saldo_apos_lancamento") or 0))
-        vc_prox     = Decimal(str(prox.get("valor_credito") or 0))
-        vd_prox     = Decimal(str(prox.get("valor_debito") or 0))
-
-        if saldo_atual == 0 or saldo_prox == 0:
-            continue
-
-        gap = saldo_prox - saldo_atual - vc_prox + vd_prox
-
-        if abs(gap) < TOLERANCIA:
-            continue
-
-        data_sint = lanc.get("data_lancamento") or prox.get("data_lancamento")
-
-        if gap > 0:
-            numero_nf = nfs_livres[nf_ptr] if nf_ptr < len(nfs_livres) else None
-            nf_ptr += 1
-            if numero_nf:
-                nfs_atribuidas.add(numero_nf)
-            sintetico = {
-                "data_lancamento": data_sint,
-                "lote": "",
-                "historico": f"COMPRA NF {numero_nf} (RECUPERADO)" if numero_nf else "COMPRA (RECUPERADO)",
-                "conta_partida": None,
-                "valor_debito": Decimal("0"),
-                "valor_credito": gap,
-                "saldo_apos_lancamento": saldo_atual + gap,
-                "saldo_tipo": "C",
-                "tipo_operacao": "COMPRA",
-                "numero_nf": numero_nf,
-                "cnpj_historico": None,
-                "classificacao_incerta": False,
-                "classificado_por_ia": True,
-                "sintetico": True,
-            }
-            print(f"🔧 Recuperado: COMPRA NF={numero_nf or '?'} R$ {float(gap):.2f}")
-        else:
-            valor_pag = abs(gap)
-            if "SISPAG" in texto_bloco:
-                hist = "SISPAG (RECUPERADO)"
-            elif "BOLETO" in texto_bloco:
-                hist = "BOLETO (RECUPERADO)"
-            else:
-                hist = "PAGAMENTO (RECUPERADO)"
-            sintetico = {
-                "data_lancamento": data_sint,
-                "lote": "",
-                "historico": hist,
-                "conta_partida": None,
-                "valor_debito": valor_pag,
-                "valor_credito": Decimal("0"),
-                "saldo_apos_lancamento": saldo_atual - valor_pag,
-                "saldo_tipo": "C",
-                "tipo_operacao": "PAGAMENTO",
-                "numero_nf": None,
-                "cnpj_historico": None,
-                "classificacao_incerta": False,
-                "classificado_por_ia": True,
-                "sintetico": True,
-            }
-            print(f"🔧 Recuperado: PAGAMENTO R$ {float(valor_pag):.2f}")
-
-        resultado.append(sintetico)
-
-    recuperados = len(resultado) - len(lancamentos)
-    if recuperados > 0:
-        print(f"🔧 Total: {recuperados} lançamentos ocultos recuperados por análise de saldo")
-        print(f"   ⚠️ Lançamentos fabricados — fornecedor será marcado com divergência.")
-
-    return resultado
-
-
 def _parece_nome_fornecedor(linha: str) -> bool:
     """Heurística: linha limpa de nome de fornecedor."""
     linha = linha.strip()
@@ -1231,12 +1110,9 @@ def _construir_fornecedor_de_ia(dados_ia: dict, linhas: List[str]) -> Optional[D
 
     lancamentos = _corrigir_colunas_por_posicao(lancamentos, linhas)
 
-    lancamentos = _recuperar_lancamentos_ocultos(
-        lancamentos,
-        linhas,
-        total_debito_declarado=_ia_decimal(dados_ia.get("total_debito")),
-        total_credito_declarado=_ia_decimal(dados_ia.get("total_credito")),
-    )
+    # Aqui existia _recuperar_lancamentos_ocultos, que sintetizava lançamentos por
+    # análise de salto de saldo quando os totais declarados não fechavam. Removida
+    # em 2026-08-03 — ver DECISIONS.md, ADR-013.
 
     conciliacao_ia = dados_ia.get("conciliacao") or []
     resumo_ia      = dados_ia.get("resumo") or {}

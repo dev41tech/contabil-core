@@ -10,6 +10,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db.functions import mes_ano
 from src.db.models import AgenciaBancaria, Comprovante, NotaFiscal, RegistroContabil, Transacao
 from src.schemas.stats import AgenciaStats, MesStats, ResumoStats, StatsResponse
 
@@ -124,7 +125,7 @@ class StatsService:
         t_rows = (
             await self._db.execute(
                 select(
-                    func.to_char(Transacao.data, "YYYY-MM").label("mes"),
+                    mes_ano(Transacao.data).label("mes"),
                     func.count().label("total"),
                 ).where(
                     Transacao.empresa_id == self._empresa_id,
@@ -136,7 +137,7 @@ class StatsService:
         r_rows = (
             await self._db.execute(
                 select(
-                    func.to_char(RegistroContabil.data_lancamento, "YYYY-MM").label("mes"),
+                    mes_ano(RegistroContabil.data_lancamento).label("mes"),
                     func.count().label("total"),
                 ).where(
                     RegistroContabil.empresa_id == self._empresa_id,
@@ -149,7 +150,7 @@ class StatsService:
         c_rows = (
             await self._db.execute(
                 select(
-                    func.to_char(Comprovante.data_pagamento, "YYYY-MM").label("mes"),
+                    mes_ano(Comprovante.data_pagamento).label("mes"),
                     func.count().label("total"),
                 ).where(
                     Comprovante.empresa_id == self._empresa_id,
@@ -163,7 +164,7 @@ class StatsService:
         n_rows = (
             await self._db.execute(
                 select(
-                    func.to_char(NotaFiscal.data_emissao, "YYYY-MM").label("mes"),
+                    mes_ano(NotaFiscal.data_emissao).label("mes"),
                     func.count().label("total"),
                 ).where(
                     NotaFiscal.empresa_id == self._empresa_id,

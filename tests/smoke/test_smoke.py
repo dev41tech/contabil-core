@@ -16,12 +16,62 @@ SMOKE_BASE_URL = os.getenv("SMOKE_BASE_URL", "")
 
 @pytest.mark.asyncio
 async def test_health_check(client: AsyncClient):
-    """A aplicação sobe e responde no health check."""
+    """A aplicação sobe, responde no health check e confirma que enxerga o banco."""
     r = await client.get("/api/health")
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
+    assert body["database"] == "ok"
     assert "version" in body
+    assert "commit" in body
+
+
+@pytest.mark.asyncio
+async def test_health_check_503_quando_banco_fora(client: AsyncClient, monkeypatch):
+    """Banco indisponível precisa virar 503 — não um 200 que engana o painel."""
+    from src.api import app as app_module
+
+    async def _falha(_db):
+        return "error"
+
+    monkeypatch.setattr(app_module, "_checar_banco", _falha)
+
+    r = await client.get("/api/health")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "degraded"
+    assert body["database"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_health_live_nao_depende_do_banco(client: AsyncClient, monkeypatch):
+    """Liveness responde 200 mesmo com o banco fora — é o alvo do HEALTHCHECK do Docker."""
+    from src.api import app as app_module
+
+    async def _falha(_db):
+        return "error"
+
+    monkeypatch.setattr(app_module, "_checar_banco", _falha)
+
+    r = await client.get("/api/health/live")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_checar_banco_devolve_error_sem_derrubar(db):
+    """_checar_banco engole a falha e devolve 'error' em vez de propagar."""
+    from src.api.app import _checar_banco
+
+    class _SessaoQuebrada:
+        async def execute(self, *_a, **_kw):
+            raise RuntimeError("connection refused")
+
+        async def rollback(self):
+            pass
+
+    assert await _checar_banco(_SessaoQuebrada()) == "error"
+    assert await _checar_banco(db) == "ok"
 
 
 @pytest.mark.asyncio

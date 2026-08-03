@@ -22,6 +22,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import require_auth, require_csrf
+from src.api.uploads import ler_upload_limitado
+from src.core.errors import AppError
 from src.db.models import (
     CpArquivo as ArquivoImportado,
     CpFornecedor as Fornecedor,
@@ -128,9 +130,9 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 
             # ── Guarda de divergência ───────────────────────────────────────
             # A soma dos lançamentos parseados vence o total declarado no arquivo
-            # (acima). Quando os dois discordam, ou quando algum lançamento foi
-            # fabricado por _recuperar_lancamentos_ocultos, os números não são
-            # confiáveis — marcar para revisão em vez de entregar silenciosamente.
+            # (acima). Quando os dois discordam, os números não são confiáveis —
+            # marcar para revisão em vez de entregar silenciosamente. A mensagem
+            # informa o quanto falta, que é o que orienta a conferência manual.
             TOL_DIVERGENCIA = Decimal("0.01")
             divergencias: list[str] = []
 
@@ -142,10 +144,6 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 divergencias.append(
                     f"crédito: PDF declara {total_credito_ia}, lançamentos somam {total_credito_calc}"
                 )
-
-            qtd_sinteticos = sum(1 for l in lancamentos_raw if l.get("sintetico"))
-            if qtd_sinteticos:
-                divergencias.append(f"{qtd_sinteticos} lançamento(s) fabricado(s) por recuperação de saldo")
 
             if divergencias:
                 logger.warning(
@@ -268,7 +266,7 @@ async def upload_arquivo(
     from src.domain.concilpro.parser import calcular_hash_arquivo
 
     try:
-        conteudo = await file.read()
+        conteudo = await ler_upload_limitado(file)
         hash_arquivo = calcular_hash_arquivo(conteudo)
 
         # ── Verifica duplicata ──────────────────────────────────────────────────
@@ -372,7 +370,9 @@ async def upload_arquivo(
             "message": "Arquivo recebido. Processamento em andamento — consulte o status para acompanhar.",
         }
 
-    except HTTPException:
+    except (HTTPException, AppError):
+        # AppError já carrega o status certo (413 no upload acima do limite) —
+        # sem esta linha o `except Exception` abaixo o mascararia como 500.
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

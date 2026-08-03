@@ -5,6 +5,12 @@ Estratégias de match (em ordem de prioridade):
   2. substring  — historico da regra é substring do historico da transação
   3. prefixo    — historico da transação começa com o historico da regra
 
+Desempate entre regras candidatas:
+  Nas estratégias `substring` e `prefixo` mais de uma regra pode casar. Vence a
+  mais específica — o histórico mais longo — e, em caso de empate, o menor `id`.
+  A ordem vem do `ORDER BY` em `_carregar_regras`, não da ordem que o banco
+  devolveu, para que o mesmo extrato produza sempre a mesma classificação.
+
 Ao encontrar match:
   - Cria RegistroContabil vinculado à transação.
   - Atualiza status da transação para "processada".
@@ -27,7 +33,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import structlog
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Comprovante, NeoDecisao, NotaFiscal, Regra, RegistroContabil, Transacao
@@ -299,19 +305,41 @@ class NeoEngine:
     # ── Queries ───────────────────────────────────────────────────────────────
 
     async def _carregar_regras(self, agencia_id: UUID | None) -> list[Regra]:
-        q = select(Regra).where(
-            Regra.empresa_id == self._empresa_id,
-            Regra.ativa == True,
-            Regra.tipo == "automatica",
+        """Carrega as regras já na ordem em que o matching deve considerá-las.
+
+        A ordem é parte do resultado: nas estratégias `substring` e `prefixo` a
+        primeira regra que casar vence. Sem `ORDER BY`, a ordem é a que o Postgres
+        devolveu — e a mesma transação pode cair em contas diferentes entre
+        execuções. Ordenamos pela regra mais específica (histórico mais longo) e
+        desempatamos por `id` para o resultado ser sempre o mesmo.
+        """
+        q = (
+            select(Regra)
+            .where(
+                Regra.empresa_id == self._empresa_id,
+                Regra.ativa == True,
+                Regra.tipo == "automatica",
+            )
+            .order_by(func.length(Regra.historico).desc(), Regra.id.asc())
         )
         if agencia_id:
             q = q.where(Regra.agencia_id == agencia_id)
         return (await self._db.execute(q)).scalars().all()
 
     async def _carregar_pendentes(self, agencia_id: UUID | None) -> list[Transacao]:
-        q = select(Transacao).where(
-            Transacao.empresa_id == self._empresa_id,
-            Transacao.status == "pendente",
+        """Carrega as transações pendentes em ordem estável.
+
+        Importa mesmo sem empate de regra: a auto-associação de comprovantes e
+        notas fiscais consome candidatos do pool, então quem é processado antes
+        fica com o comprovante disputado.
+        """
+        q = (
+            select(Transacao)
+            .where(
+                Transacao.empresa_id == self._empresa_id,
+                Transacao.status == "pendente",
+            )
+            .order_by(Transacao.data.asc(), Transacao.id.asc())
         )
         if agencia_id:
             q = q.where(Transacao.agencia_id == agencia_id)

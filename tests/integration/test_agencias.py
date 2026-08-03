@@ -327,7 +327,7 @@ async def test_agencia_nao_visivel_em_outra_empresa(
     empresa2 = EmpresaModel(
         tenant_id=tenant.id,
         razao_social="Outra Empresa LTDA",
-        cnpj="99.888.777/0001-55",
+        cnpj="99.888.777/0001-00",
         regime_tributario="lucro_real",
     )
     db.add(empresa2)
