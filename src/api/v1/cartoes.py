@@ -5,6 +5,8 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, UploadFile, File
+
+from src.api.uploads import ler_upload_limitado
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -165,7 +167,7 @@ async def importar_csv(
     svc: CartaoService = Depends(_svc),
 ) -> ImportCSVResponse:
     """Importa lançamentos via CSV. Colunas: data_compra, descricao, valor."""
-    conteudo = await arquivo.read()
+    conteudo = await ler_upload_limitado(arquivo)
     return await svc.importar_csv(cartao_id, fatura_id, conteudo)
 
 

@@ -31,6 +31,11 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copia código da aplicação
 COPY . .
 
+# SHA do commit desta imagem — exposto em GET /api/health e /api/health/live.
+# Build: docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) .
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 # Entrypoint com permissão de execução
 RUN chmod +x entrypoint.sh
 
@@ -40,7 +45,9 @@ USER appuser
 
 EXPOSE 3012
 
+# Liveness, não readiness: /api/health devolve 503 quando o banco está fora e
+# não deve fazer o Docker matar um container que está saudável.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:3012/api/health')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:3012/api/health/live')"
 
 ENTRYPOINT ["./entrypoint.sh"]

@@ -349,7 +349,7 @@ async def test_conta_de_outra_empresa_nao_visivel(
     empresa2 = EmpresaModel(
         tenant_id=tenant.id,
         razao_social="Empresa 2 LTDA",
-        cnpj="77.666.555/0001-44",
+        cnpj="77.666.555/0001-00",
         regime_tributario="lucro_real",
     )
     db.add(empresa2)

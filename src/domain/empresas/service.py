@@ -8,9 +8,17 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.cnpj import valido as cnpj_valido
 from src.core.errors import ConflictError, EmpresaNaoEncontradaError
 from src.db.models import Empresa
-from src.schemas.empresas import EmpresaCreate, EmpresaListResponse, EmpresaResponse, EmpresaUpdate
+from src.schemas.empresas import (
+    CnpjInvalidoListResponse,
+    EmpresaCnpjInvalidoResponse,
+    EmpresaCreate,
+    EmpresaListResponse,
+    EmpresaResponse,
+    EmpresaUpdate,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -43,6 +51,33 @@ class EmpresaService:
             total=total,
             page=page,
             page_size=page_size,
+        )
+
+    async def listar_cnpj_invalidos(self) -> CnpjInvalidoListResponse:
+        """Empresas cujo CNPJ cadastrado não passa na validação de dígito verificador.
+
+        O cadastro só passou a validar DV depois da migração, então as empresas
+        importadas pelo `scripts/import_mrcont.py` carregam CNPJ sintético gerado a
+        partir do índice da pasta. Para elas a exportação de notas volta vazia e
+        silenciosa — esta listagem é o que torna o problema visível.
+
+        Filtra em Python porque o dígito verificador não é expressável em SQL; o
+        cadastro tem dezenas de empresas por escritório, não milhões.
+        """
+        rows = (
+            await self._db.execute(
+                select(Empresa)
+                .where(Empresa.tenant_id == self._tenant_id, Empresa.deleted_at == None)
+                .order_by(Empresa.razao_social)
+            )
+        ).scalars().all()
+
+        invalidas = [e for e in rows if not cnpj_valido(e.cnpj)]
+
+        return CnpjInvalidoListResponse(
+            items=[EmpresaCnpjInvalidoResponse.model_validate(e) for e in invalidas],
+            total=len(invalidas),
+            total_empresas=len(rows),
         )
 
     async def obter(self, empresa_id: UUID) -> EmpresaResponse:

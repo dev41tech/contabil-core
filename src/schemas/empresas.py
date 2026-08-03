@@ -6,6 +6,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from src.core.cnpj import formatar as formatar_cnpj
+from src.core.cnpj import somente_digitos, valido as cnpj_valido
+
 
 REGIME_CHOICES = ("simples_nacional", "lucro_presumido", "lucro_real")
 
@@ -18,10 +21,15 @@ class EmpresaCreate(BaseModel):
     @field_validator("cnpj", mode="before")
     @classmethod
     def normaliza_cnpj(cls, v: str) -> str:
-        digits = "".join(c for c in v if c.isdigit())
+        digits = somente_digitos(v)
         if len(digits) != 14:
             raise ValueError("CNPJ deve ter 14 dígitos.")
-        return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+        # Comprimento não basta: a exportação fiscal casa o CNPJ da empresa com o
+        # emitente da nota, e um CNPJ inexistente nunca casa — a exportação volta
+        # vazia sem erro. Ver src/core/cnpj.py.
+        if not cnpj_valido(digits):
+            raise ValueError("CNPJ inválido — dígitos verificadores não conferem.")
+        return formatar_cnpj(digits)
 
     @field_validator("regime_tributario")
     @classmethod
@@ -58,3 +66,24 @@ class EmpresaListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class EmpresaCnpjInvalidoResponse(BaseModel):
+    """Uma empresa cujo CNPJ cadastrado não passa na validação de dígito verificador."""
+
+    id: UUID
+    razao_social: str
+    cnpj: str
+
+    model_config = {"from_attributes": True}
+
+
+class CnpjInvalidoListResponse(BaseModel):
+    items: list[EmpresaCnpjInvalidoResponse]
+    total: int
+    total_empresas: int
+    aviso: str = (
+        "A exportação de notas fiscais destas empresas não funciona: o filtro compara "
+        "o CNPJ cadastrado com o emitente/destinatário da nota e um CNPJ inexistente "
+        "nunca casa."
+    )

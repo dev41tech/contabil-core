@@ -21,7 +21,6 @@ from src.domain.concilpro.parser import (
     _escolher_estrategia,
     _montar_linhas_de_runs,
     _pontuar_extracao,
-    _recuperar_lancamentos_ocultos,
     _valores_por_coluna,
     parsear_bloco_deterministico,
 )
@@ -442,21 +441,54 @@ class TestContaSemMovimento:
         assert dados["saldo_anterior_tipo"] == "C"
 
 
-class TestRecuperacaoOculta:
-    def test_nao_fabrica_quando_totais_fecham(self):
-        """Se o PDF declara totais que batem, nada está oculto."""
-        lancamentos = [
-            _lanc("28/02/2026", "11190", credito="2758.20"),
-            _lanc("28/02/2026", "11192", debito="2758.20"),
-        ]
-        lancamentos[0]["saldo_apos_lancamento"] = Decimal("2758.20")
-        lancamentos[1]["saldo_apos_lancamento"] = Decimal("0")
+class TestNaoFabricaLancamento:
+    """O parser não inventa lançamento para fechar total que não fecha.
 
-        resultado = _recuperar_lancamentos_ocultos(
-            lancamentos, [_HEADER],
-            total_debito_declarado=Decimal("2758.20"),
-            total_credito_declarado=Decimal("2758.20"),
+    Existia `_recuperar_lancamentos_ocultos`, que sintetizava entradas por análise
+    de salto de saldo quando os totais declarados não batiam. Removida em
+    2026-08-03 (ADR-013): um lançamento fabricado entra no banco indistinguível de
+    um real. Quando falta movimento, o certo é o total ficar incompleto e a
+    divergência ser sinalizada — não preencher o buraco com um valor inventado.
+    """
+
+    _CONTA = "Conta:        1667 - 2.1.3.01.0002                       FORNECEDOR TESTE LTDA"
+    # Colunas alinhadas ao _HEADER: crédito termina na 128, saldo na 152.
+    _LANC = (
+        "   28/02/2026 11190   COMPRA CONFORME NF NUMERO 123456"
+        "                                                                  1.000,00"
+        "               1.000,00C"
+    )
+
+    @staticmethod
+    def _total(credito: str) -> str:
+        return ("                                                          Total da conta:"
+                f"                      0,00                {credito}")
+
+    def test_funcao_de_recuperacao_nao_existe_mais(self):
+        """Guarda contra reintrodução: o problema era a existência da função."""
+        import src.domain.concilpro.parser as parser
+
+        assert not hasattr(parser, "_recuperar_lancamentos_ocultos")
+
+    def test_lancamento_lido_nao_vem_marcado_como_sintetico(self):
+        dados = parsear_bloco_deterministico(
+            [_HEADER, self._CONTA, self._LANC, self._total("1.000,00")]
         )
 
-        assert len(resultado) == 2
-        assert not any(l.get("sintetico") for l in resultado)
+        assert dados is not None
+        assert len(dados["lancamentos"]) == 1
+        assert not any(l.get("sintetico") for l in dados["lancamentos"])
+
+    def test_total_que_nao_fecha_defere_em_vez_de_completar(self):
+        """
+        O PDF declara 3.000,00 de crédito e só 1.000,00 sobreviveu à extração.
+
+        O determinístico devolve None e deixa o bloco para a IA, em vez de inventar
+        os 2.000,00 que faltam. É esse "não sei" explícito que a recuperação por
+        salto de saldo atropelava.
+        """
+        dados = parsear_bloco_deterministico(
+            [_HEADER, self._CONTA, self._LANC, self._total("3.000,00")]
+        )
+
+        assert dados is None

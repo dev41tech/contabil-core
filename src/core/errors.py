@@ -66,6 +66,13 @@ class ForbiddenError(DomainError):
     http_status: int = 403
 
 
+@dataclass
+class PayloadTooLargeError(DomainError):
+    message: str = "Arquivo maior que o limite permitido."
+    code: str = "PAYLOAD_TOO_LARGE"
+    http_status: int = 413
+
+
 # ─────────────────────────────────────────────────────────────── Auth
 
 

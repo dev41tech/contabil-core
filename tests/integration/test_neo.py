@@ -133,6 +133,64 @@ async def test_neo_processa_substring(client, db, tenant, usuario, empresa):
 
 
 @pytest.mark.asyncio
+async def test_neo_desempata_pela_regra_mais_especifica(client, db, tenant, usuario, empresa):
+    """Com duas regras candidatas, vence a mais específica — não a que o banco devolveu primeiro.
+
+    "BOLETO" e "BOLETO ENERGIA" casam ambas por substring com
+    "BOLETO ENERGIA ELETRICA". A regra curta é criada primeiro de propósito: sem
+    ORDER BY o Postgres tende a devolver na ordem de inserção e a genérica venceria,
+    jogando a transação numa conta contábil diferente.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_generica = await _setup_base(client, db, empresa, csrf)
+
+    conta_especifica = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.1", descricao="Energia Elétrica", tipo="despesa"
+    )
+    db.add(conta_especifica)
+    await db.flush()
+
+    generica = await _criar_regra(
+        client, empresa, agencia_id, conta_generica, "BOLETO", "D", csrf
+    )
+    especifica = await _criar_regra(
+        client, empresa, agencia_id, str(conta_especifica.id), "BOLETO ENERGIA", "D", csrf
+    )
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    decisoes = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=associada")
+    ).json()["items"]
+    boleto = [d for d in decisoes if d["transacao_descricao"] == "BOLETO ENERGIA ELETRICA"]
+    assert len(boleto) == 1
+
+    assert boleto[0]["estrategia"] == "substring"
+    assert boleto[0]["regra_id"] == especifica["id"], "a regra genérica venceu a específica"
+    assert boleto[0]["regra_id"] != generica["id"]
+
+
+@pytest.mark.asyncio
+async def test_neo_carrega_regras_em_ordem_estavel(client, db, tenant, usuario, empresa):
+    """As regras chegam ao matching ordenadas da mais longa para a mais curta."""
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+
+    for historico in ("BOL", "BOLETO ENERGIA", "BOLETO"):
+        await _criar_regra(client, empresa, agencia_id, conta_id, historico, "D", csrf)
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    regras = await engine._carregar_regras(None)
+
+    tamanhos = [len(r.historico) for r in regras]
+    assert tamanhos == sorted(tamanhos, reverse=True)
+    assert [r.historico for r in regras][:3] == ["BOLETO ENERGIA", "BOLETO", "BOL"]
+
+
+@pytest.mark.asyncio
 async def test_neo_sem_regra_registra(client, db, tenant, usuario, empresa):
     """Transações sem regra devem ter resultado=sem_regra nas decisões."""
     csrf = await _login(client, tenant, usuario)

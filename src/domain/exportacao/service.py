@@ -22,6 +22,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.cnpj import valido as cnpj_valido
 from src.core.errors import ValidationError
 from src.db.models import (
     Comprovante,
@@ -189,6 +190,28 @@ class ExportacaoService:
             )
         ).scalar_one()
         cnpj_empresa = _sanitize_cnpj(empresa_row.cnpj)
+
+        # O filtro abaixo é uma comparação de CNPJ. Se o CNPJ da empresa não é um
+        # CNPJ real — 72 das 77 empresas migradas entraram com placeholder gerado
+        # pelo scripts/import_mrcont.py — ele nunca casa com nenhum emitente e a
+        # exportação volta vazia, sem erro. Falhar aqui é o que torna isso visível.
+        if not cnpj_valido(empresa_row.cnpj):
+            logger.warning(
+                "exportacao.cnpj_empresa_invalido",
+                empresa_id=str(self._empresa_id),
+                cnpj=empresa_row.cnpj,
+                tipo=tipo,
+            )
+            raise ValidationError(
+                message=(
+                    f"A empresa '{empresa_row.razao_social}' está cadastrada com o CNPJ "
+                    f"{empresa_row.cnpj}, que não é um CNPJ válido. A exportação de notas "
+                    "identifica as notas da empresa comparando esse CNPJ com o emitente e o "
+                    "destinatário, então o resultado sairia vazio. Corrija o CNPJ no cadastro "
+                    "da empresa e exporte novamente."
+                ),
+                details={"empresa_id": str(self._empresa_id), "cnpj": empresa_row.cnpj},
+            )
 
         tipo_nota = "nfe" if tipo.startswith("nfe") else "nfse"
 

@@ -21,6 +21,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import require_auth, require_csrf
+from src.api.uploads import ler_upload_limitado
+from src.core.errors import AppError
 from src.db.models import (
     CpArquivo as ArquivoImportado,
     CpFornecedor as Fornecedor,
@@ -32,7 +35,19 @@ from src.db.session import SyncSessionLocal, get_db
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/concilpro", tags=["concilpro"])
+# Autenticação no ROUTER, não rota a rota: assim é fail-closed — rota nova nasce
+# protegida em vez de depender de alguém lembrar de anotá-la. Até 2026-08-03 as
+# 9 rotas deste módulo estavam abertas na internet, incluindo o export em Excel
+# com nome, CNPJ e saldo de todos os fornecedores.
+#
+# `require_auth` (e não `get_company_context`) porque as tabelas cp_* ainda não
+# têm empresa_id — sem esse vínculo não há como filtrar por empresa. Assim que
+# o escopo por tenant existir, isto vira get_company_context.
+router = APIRouter(
+    prefix="/concilpro",
+    tags=["concilpro"],
+    dependencies=[Depends(require_auth)],
+)
 
 # ============================================================================
 # UTILITÁRIOS
@@ -115,9 +130,9 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 
             # ── Guarda de divergência ───────────────────────────────────────
             # A soma dos lançamentos parseados vence o total declarado no arquivo
-            # (acima). Quando os dois discordam, ou quando algum lançamento foi
-            # fabricado por _recuperar_lancamentos_ocultos, os números não são
-            # confiáveis — marcar para revisão em vez de entregar silenciosamente.
+            # (acima). Quando os dois discordam, os números não são confiáveis —
+            # marcar para revisão em vez de entregar silenciosamente. A mensagem
+            # informa o quanto falta, que é o que orienta a conferência manual.
             TOL_DIVERGENCIA = Decimal("0.01")
             divergencias: list[str] = []
 
@@ -129,10 +144,6 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 divergencias.append(
                     f"crédito: PDF declara {total_credito_ia}, lançamentos somam {total_credito_calc}"
                 )
-
-            qtd_sinteticos = sum(1 for l in lancamentos_raw if l.get("sintetico"))
-            if qtd_sinteticos:
-                divergencias.append(f"{qtd_sinteticos} lançamento(s) fabricado(s) por recuperação de saldo")
 
             if divergencias:
                 logger.warning(
@@ -237,7 +248,7 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 # UPLOAD E PROCESSAMENTO
 # ============================================================================
 
-@router.post("/upload")
+@router.post("/upload", dependencies=[Depends(require_csrf)])
 async def upload_arquivo(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -255,7 +266,7 @@ async def upload_arquivo(
     from src.domain.concilpro.parser import calcular_hash_arquivo
 
     try:
-        conteudo = await file.read()
+        conteudo = await ler_upload_limitado(file)
         hash_arquivo = calcular_hash_arquivo(conteudo)
 
         # ── Verifica duplicata ──────────────────────────────────────────────────
@@ -359,7 +370,9 @@ async def upload_arquivo(
             "message": "Arquivo recebido. Processamento em andamento — consulte o status para acompanhar.",
         }
 
-    except HTTPException:
+    except (HTTPException, AppError):
+        # AppError já carrega o status certo (413 no upload acima do limite) —
+        # sem esta linha o `except Exception` abaixo o mascararia como 500.
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

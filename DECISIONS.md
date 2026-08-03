@@ -212,3 +212,67 @@
 - Período de manutenção dupla enquanto flags coexistem
 
 **Quando revisar:** Ao desligar o JHipster — remover toda lógica de feature flag.
+
+---
+
+## ADR-011: Limite de Upload em Duas Barreiras
+
+**Status:** Ativo
+**Decisão:** `LimiteUploadMiddleware` recusa requests cujo `Content-Length` passa de `MAX_UPLOAD_MB` (padrão 25 MB), e `ler_upload_limitado()` conta os bytes efetivamente lidos. Todo endpoint de upload usa o helper em vez de `await arquivo.read()`.
+
+**Contexto:** Nenhum dos 5 endpoints de upload (ConcilPro, extrato, notas, plano de contas, cartões) tinha limite, e todos os parsers carregam o arquivo inteiro em memória. Um único PDF grande derruba o worker — são 2 workers no uvicorn.
+
+**Por quê esta decisão:**
+- O middleware corta antes de o FastAPI montar o `UploadFile` — nenhum byte do corpo entra em memória
+- O `Content-Length` é opcional: `Transfer-Encoding: chunked` não declara tamanho e passaria direto pelo middleware, daí a segunda contagem
+- Um único ponto de configuração (`MAX_UPLOAD_MB`) em vez de limite por endpoint
+
+**Trade-offs:**
+- O mesmo limite serve o Razão anual em PDF e um CSV de fatura — dimensionado pelo maior
+- O nginx do `contabil-front` já tem `client_max_body_size 50M` — deliberadamente mais frouxo, para que quem recuse seja a aplicação e o cliente receba o JSON tipado em vez do 413 em HTML do nginx. Subir `MAX_UPLOAD_MB` acima de 50 sem mexer no nginx inverte isso silenciosamente
+- `ler_upload_limitado` levanta `AppError`, então handler que faça `except Exception` mascara o 413 como 500 (foi o caso do ConcilPro)
+
+**Quando revisar:** Se os parsers passarem a processar em streaming — aí o limite pode subir bastante.
+
+---
+
+## ADR-012: Liveness e Readiness Separados
+
+**Status:** Ativo
+**Decisão:** `GET /api/health` executa `SELECT 1` com timeout de 2s e devolve 503 se o banco não responder. `GET /api/health/live` responde 200 sem tocar no banco e é o alvo do `HEALTHCHECK` do Docker. Ambos expõem `commit` (SHA injetado como build arg).
+
+**Contexto:** O health check devolvia `{"status":"ok"}` estático. Não distinguia "container de pé" de "container sem banco" — exatamente a dúvida que apareceu ao validar o deploy de 31/07. E `version` vem do `APP_VERSION`, que não muda entre deploys, então não respondia "meu deploy subiu?".
+
+**Por quê esta decisão:**
+- Readiness com banco é o que o painel precisa para saber se a instância atende request
+- Apontar o `HEALTHCHECK` do Docker para o readiness faria uma indisponibilidade momentânea do Postgres matar um container saudável — o problema estaria no banco, e reiniciar a aplicação não resolve
+- O SHA do commit transforma "qual versão está no ar?" num `curl`
+
+**Trade-offs:**
+- Dois endpoints para manter
+- Quem monitorar só o `/live` não percebe perda de banco — o alerta tem que apontar para `/api/health`
+- O build precisa passar `--build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`; sem isso o campo fica `unknown` (degrada, não quebra)
+
+**Quando revisar:** Se entrarem outras dependências críticas (Redis, OpenAI) que mereçam entrar no readiness.
+
+---
+
+## ADR-013: O ConcilPro Não Fabrica Lançamento para Fechar Total
+
+**Status:** Ativo
+**Decisão:** Removida a função `_recuperar_lancamentos_ocultos` do parser. Quando os totais declarados no Razão não fecham com a soma dos lançamentos extraídos, o resultado fica incompleto e a divergência é sinalizada — nenhum lançamento é sintetizado para tapar o buraco.
+
+**Contexto:** A função analisava saltos de saldo entre lançamentos consecutivos e criava entradas com histórico `"(RECUPERADO)"` para o valor faltante. Foi a origem do falso positivo de R$ 24.029,28 a pagar numa conta zerada (arquivo `id=5`).
+
+**Por quê esta decisão:**
+- O lançamento fabricado **não era distinguível no banco**. Não existe coluna `sintetico` em `cp_lancamento` — o único traço era o sufixo no texto livre do histórico, e `classificado_por_ia` ficava `True`, o que é falso: a entrada vinha de aritmética, não do modelo
+- Uma vez persistido, ele entrava na conciliação FIFO como se fosse nota real (`valor_saldo = valor_credito` para COMPRA) e saía na exportação em Excel
+- A sinalização de divergência **não dependia dela**: a comparação entre total declarado e soma dos lançamentos é independente, e a mensagem já informa exatamente quanto falta
+- Só era alcançada pelo caminho da IA. O parser determinístico cobre 96% dos blocos do `Razão 2025.pdf` e a planilha XLSX fecha 208/208 sem IA — a fatia onde ela agia já era estreita e continua encolhendo
+- O determinístico, quando os totais não fecham, devolve `None` e defere para a IA. Esse "não sei" explícito é o comportamento certo, e era o que a recuperação atropelava
+
+**Trade-offs:**
+- Fornecedor cujo bloco caiu na IA e cujos totais não fecham passa a ter `total_debito`/`total_credito` incompletos, em vez de completos-porém-inventados. Ambos estão errados; o incompleto é honestamente errado e vem marcado com `divergencia_calculo`
+- Perde-se a tentativa de reconstruir número de NF a partir do texto do bloco. Na prática ela chutava: pegava NFs não atribuídas em ordem de aparição e casava com o gap mais próximo
+
+**Quando revisar:** Se aparecer um formato de Razão em que a extração perca lançamentos de forma sistemática e a planilha XLSX não seja alternativa. Mesmo aí, o caminho é corrigir a extração — como foi feito no Formato 6 — não sintetizar dado contábil.

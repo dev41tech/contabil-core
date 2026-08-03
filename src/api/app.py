@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware import (
     AppError,
+    LimiteUploadMiddleware,
     RequestContextMiddleware,
     app_error_handler,
     unhandled_error_handler,
@@ -17,8 +21,31 @@ from src.api.middleware import (
 from src.api.v1 import router as v1_router
 from src.core.config import get_settings
 from src.core.logging import configure_logging
+from src.db.session import get_db
 
 _startup_logger = structlog.get_logger("startup")
+_health_logger = structlog.get_logger("health")
+
+# Curto de propósito: o health check é chamado a cada 30s pelo orquestrador e
+# não pode ficar pendurado num banco que parou de responder.
+_HEALTH_DB_TIMEOUT_S = 2.0
+
+
+async def _checar_banco(db: AsyncSession) -> str:
+    """Retorna "ok" se o banco respondeu ao SELECT 1 dentro do timeout, senão "error"."""
+    try:
+        async with asyncio.timeout(_HEALTH_DB_TIMEOUT_S):
+            await db.execute(text("SELECT 1"))
+        return "ok"
+    except Exception as exc:
+        _health_logger.warning("health.banco_indisponivel", erro=str(exc))
+        # Sem o rollback a sessão volta quebrada para o get_db, que tentaria
+        # commitar e transformaria o 503 num 500.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return "error"
 
 
 def _reset_stuck_processando() -> None:
@@ -90,6 +117,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(LimiteUploadMiddleware, max_bytes=settings.max_upload_bytes)
 
     # ── Handlers de erro
     app.add_exception_handler(AppError, app_error_handler)
@@ -99,7 +127,35 @@ def create_app() -> FastAPI:
     app.include_router(v1_router)
 
     @app.get("/api/health", tags=["infra"])
-    async def health() -> dict:
-        return {"status": "ok", "version": settings.app_version}
+    async def health(response: Response, db: AsyncSession = Depends(get_db)) -> dict:
+        """Readiness — 200 só quando a aplicação consegue falar com o banco.
+
+        Um `{"status":"ok"}` estático não distinguia "container de pé" de
+        "container sem banco". Devolve 503 quando o `SELECT 1` falha ou demora
+        mais que `_HEALTH_DB_TIMEOUT_S`, para o painel não dar verde a um
+        container que não atende request nenhum.
+        """
+        banco = await _checar_banco(db)
+        if banco != "ok":
+            response.status_code = 503
+        return {
+            "status": "ok" if banco == "ok" else "degraded",
+            "version": settings.app_version,
+            "commit": settings.git_commit,
+            "database": banco,
+        }
+
+    @app.get("/api/health/live", tags=["infra"])
+    async def health_live() -> dict:
+        """Liveness — só diz que o processo responde. Não toca no banco.
+
+        É o alvo do HEALTHCHECK do Docker: uma indisponibilidade momentânea do
+        Postgres deve aparecer no `/api/health`, não derrubar o container.
+        """
+        return {
+            "status": "ok",
+            "version": settings.app_version,
+            "commit": settings.git_commit,
+        }
 
     return app

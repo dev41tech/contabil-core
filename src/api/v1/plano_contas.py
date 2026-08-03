@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.uploads import ler_upload_limitado
 from src.db.session import get_db
 from src.domain.plano_contas.service import PlanoContaService
 from src.schemas.plano_contas import (
@@ -134,7 +135,7 @@ async def importar_plano_contas(
 
     Colunas esperadas: codigo, descricao, tipo, tipo_sa (opcional, padrão A)
     """
-    conteudo = await arquivo.read()
+    conteudo = await ler_upload_limitado(arquivo)
     nome = (arquivo.filename or "").lower()
 
     rows = _parse_planilha(conteudo, nome)

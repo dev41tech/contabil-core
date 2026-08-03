@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.uploads import ler_upload_limitado
 from src.db.session import get_db
 from src.domain.notas.service import NotaService
 from src.schemas.notas import (
@@ -126,7 +127,7 @@ async def importar_xml_nota(
     db: AsyncSession = Depends(get_db),
 ) -> ImportXmlResponse:
     """Importa NF-e ou NFS-e de um arquivo XML ou ZIP contendo múltiplos XMLs."""
-    conteudo = await arquivo.read()
+    conteudo = await ler_upload_limitado(arquivo)
     nome = arquivo.filename or ""
 
     if nome.lower().endswith(".zip"):
