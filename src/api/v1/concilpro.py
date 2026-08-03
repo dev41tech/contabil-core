@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import require_auth, require_csrf
 from src.db.models import (
     CpArquivo as ArquivoImportado,
     CpFornecedor as Fornecedor,
@@ -32,7 +33,19 @@ from src.db.session import SyncSessionLocal, get_db
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/concilpro", tags=["concilpro"])
+# Autenticação no ROUTER, não rota a rota: assim é fail-closed — rota nova nasce
+# protegida em vez de depender de alguém lembrar de anotá-la. Até 2026-08-03 as
+# 9 rotas deste módulo estavam abertas na internet, incluindo o export em Excel
+# com nome, CNPJ e saldo de todos os fornecedores.
+#
+# `require_auth` (e não `get_company_context`) porque as tabelas cp_* ainda não
+# têm empresa_id — sem esse vínculo não há como filtrar por empresa. Assim que
+# o escopo por tenant existir, isto vira get_company_context.
+router = APIRouter(
+    prefix="/concilpro",
+    tags=["concilpro"],
+    dependencies=[Depends(require_auth)],
+)
 
 # ============================================================================
 # UTILITÁRIOS
@@ -237,7 +250,7 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 # UPLOAD E PROCESSAMENTO
 # ============================================================================
 
-@router.post("/upload")
+@router.post("/upload", dependencies=[Depends(require_csrf)])
 async def upload_arquivo(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
