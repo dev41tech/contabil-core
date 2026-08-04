@@ -49,3 +49,7 @@ Thumbs.db
 
 # Dumps de producao gerados por reprocessar_concilpro.py (dados de cliente)
 backup_concilpro/
+
+# Saída dos scripts de manutenção — carrega razão social e CNPJ de clientes
+cnpjs_para_conferencia.xlsx
+cnpjs_para_conferencia.csv
