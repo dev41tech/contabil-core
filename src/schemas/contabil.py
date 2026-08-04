@@ -41,12 +41,19 @@ class ExportJobCreate(BaseModel):
     tipo: str = Field(
         default="lancamentos",
         description=(
-            "lancamentos | nfe_entrada | nfe_saida | "
+            "lancamentos | extrato | nfe_entrada | nfe_saida | "
             "nfse_tomado | nfse_prestado | conferencia"
         ),
     )
     data_de: datetime | None = None
     data_ate: datetime | None = None
+
+    # Filtros usados apenas pelo tipo `extrato`, para o arquivo sair com as
+    # mesmas linhas que a tela mostra. Ignorados nos demais tipos.
+    agencia_id: UUID | None = None
+    status: str | None = Field(
+        default=None, description="extrato: pendente | processada | erro"
+    )
 
 
 class ExportJobResponse(BaseModel):
