@@ -2,6 +2,7 @@
 
 Gera arquivos CSV ou XLSX de:
   - lancamentos          : registros contábeis (existente)
+  - extrato              : transações bancárias importadas, com os filtros da tela
   - nfe_entrada          : NF-e onde empresa é destinatária
   - nfe_saida            : NF-e onde empresa é emitente
   - nfse_tomado          : NFS-e tomado (empresa é destinatária)
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.cnpj import valido as cnpj_valido
 from src.core.errors import ValidationError
 from src.db.models import (
+    AgenciaBancaria,
     Comprovante,
     Empresa,
     ExportJob,
@@ -55,8 +57,12 @@ _COLUNAS_CONFERENCIA = [
     "favorecido_comprovante", "valor_pago_comprovante", "status_conciliacao",
 ]
 
+_COLUNAS_EXTRATO = [
+    "data", "agencia", "historico", "dc", "valor", "status",
+]
+
 _VALID_TIPOS = {
-    "lancamentos", "nfe_entrada", "nfe_saida",
+    "lancamentos", "extrato", "nfe_entrada", "nfe_saida",
     "nfse_tomado", "nfse_prestado", "conferencia",
 }
 
@@ -84,6 +90,9 @@ class ExportacaoService:
 
         if tipo == "lancamentos":
             rows, conteudo = await self._exportar_lancamentos(data, fmt)
+            total = len(rows)
+        elif tipo == "extrato":
+            rows, conteudo = await self._exportar_extrato(data, fmt)
             total = len(rows)
         elif tipo in ("nfe_entrada", "nfe_saida", "nfse_tomado", "nfse_prestado"):
             rows, conteudo = await self._exportar_notas(tipo, data, fmt)
@@ -177,6 +186,64 @@ class ExportacaoService:
                 str(r.transacao_id) if r.transacao_id else "",
             ])
         return self._save_workbook(wb)
+
+    # ── extrato bancário ──────────────────────────────────────────────────────
+
+    async def _exportar_extrato(
+        self, data: ExportJobCreate, fmt: str
+    ) -> tuple[list, bytes]:
+        """Transações bancárias importadas, com os mesmos filtros da tela.
+
+        Espelha `ExtratoService.listar`: agência, status e período. O arquivo
+        precisa bater linha a linha com o que o usuário está vendo — se divergir,
+        vira conferência manual em cima de um relatório em que ninguém confia.
+        A paginação da tela não se aplica: o relatório traz o período inteiro.
+        """
+        q = select(Transacao).where(
+            Transacao.empresa_id == self._empresa_id,
+            Transacao.deleted_at.is_(None),
+        )
+        if data.agencia_id:
+            q = q.where(Transacao.agencia_id == data.agencia_id)
+        if data.status:
+            q = q.where(Transacao.status == data.status)
+        if data.data_de:
+            q = q.where(Transacao.data >= data.data_de)
+        if data.data_ate:
+            q = q.where(Transacao.data <= data.data_ate)
+
+        transacoes = (
+            await self._db.execute(q.order_by(Transacao.data, Transacao.id))
+        ).scalars().all()
+
+        # Resolve o nome da agência em lote: a alternativa é uma query por linha.
+        agencias: dict = {}
+        ag_ids = {t.agencia_id for t in transacoes if t.agencia_id}
+        if ag_ids:
+            ag_rows = (
+                await self._db.execute(
+                    select(AgenciaBancaria).where(AgenciaBancaria.id.in_(ag_ids))
+                )
+            ).scalars().all()
+            agencias = {a.id: a.descricao for a in ag_rows}
+
+        linhas = [
+            {
+                "data": t.data.strftime("%d/%m/%Y"),
+                "agencia": agencias.get(t.agencia_id, ""),
+                "historico": t.historico,
+                "dc": t.dc,
+                "valor": float(t.valor),
+                "status": t.status,
+            }
+            for t in transacoes
+        ]
+
+        if fmt == "csv":
+            conteudo = self._dicts_to_csv(linhas, _COLUNAS_EXTRATO)
+        else:
+            conteudo = self._dicts_to_xlsx(linhas, _COLUNAS_EXTRATO, "Extrato Bancário")
+        return transacoes, conteudo
 
     # ── notas fiscais (NF-e / NFS-e) ─────────────────────────────────────────
 

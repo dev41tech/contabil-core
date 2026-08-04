@@ -44,7 +44,10 @@ async def gerar_exportacao(
     job_response, conteudo = await svc.exportar(body)
 
     fmt = job_response.formato
-    filename = f"registros_{empresa_id}_{fmt}.{_EXTENSIONS[fmt]}"
+    # O tipo entra no nome porque o mesmo endpoint serve extrato, notas e
+    # conferência — sem isso todos baixam como "registros_...".
+    tipo = body.tipo or "registros"
+    filename = f"{tipo}_{empresa_id}.{_EXTENSIONS[fmt]}"
 
     return Response(
         content=conteudo,
