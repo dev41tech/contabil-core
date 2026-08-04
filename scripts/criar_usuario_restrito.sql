@@ -9,21 +9,38 @@
 -- particular, o mesmo papel alcança o banco `fiscargo`, do Frota-Link, que vive
 -- no mesmo cluster — comprometer o contabil-core hoje é comprometer os dois.
 --
+-- O TAMANHO DO PROBLEMA (medido em produção, 2026-08-04)
+-- A credencial do contabil-core é superusuário e o cluster hospeda 11 bancos.
+-- Ela conecta e lê TODOS: n8n (73 tabelas), frota (101), hub_41tech (47),
+-- evogo_auth (18), fiscargo (8), conbank, evogo_users, portfolio_db e mais.
+-- Um vazamento do DATABASE_URL do contabil-core hoje é um vazamento de todos
+-- os projetos do cluster.
+--
 -- O QUE ISTO RESOLVE (verificado num banco descartável, PostgreSQL 16)
 --   ✅ Perde CREATE ROLE / ALTER ROLE e a leitura de `pg_shadow`
 --   ✅ Perde `COPY ... FROM PROGRAM`, que é execução de comando no host
 --   ✅ Perde CREATE DATABASE e `DROP DATABASE`
 --   ✅ Perde o bypass automático de permissão que superusuário tem
+--   ✅ **Perde a leitura dos outros bancos do cluster.** A conexão ainda abre —
+--      o Postgres concede `CONNECT` a `PUBLIC` por padrão — mas o papel não
+--      enxerga nada: `permission denied for table`, e o `information_schema`
+--      volta vazio. Privilégio de tabela não é concedido a `PUBLIC`.
+--      Testado: papel não-superusuário num banco vizinho não lê uma linha.
 --
 -- O QUE ISTO **NÃO** RESOLVE
---   ❌ Sozinho, NÃO isola o `fiscargo`. Ver a PARTE 2 no fim do arquivo — é um
---      passo separado, que mexe no banco do Frota-Link e por isso não roda aqui.
+--   ❌ A conexão em si aos outros bancos continua possível (sem leitura de
+--      dado). Fechá-la é a PARTE 2, que mexe em banco de OUTRO projeto e por
+--      isso não roda aqui. É higiene, não a barreira principal.
 --   ❌ O papel continua dono das tabelas do `contabil_db` e pode alterá-las ou
 --      apagá-las. Isso é consequência de `entrypoint.sh` rodar
 --      `alembic upgrade head` no startup com a MESMA credencial da API.
 --      Ver "Variante mais restritiva" no fim do arquivo.
 --   ❌ A porta 3308 continua aberta. Restringir por firewall é passo separado
 --      e continua no backlog.
+--
+-- ⚠️ Ressalva: a conclusão acima vale se os outros bancos não tiverem concedido
+-- privilégio a `PUBLIC` explicitamente (`GRANT ... TO PUBLIC`). Não verifiquei
+-- isso nos bancos dos outros projetos — está fora do escopo do contabil-core.
 --
 -- COMO RODAR
 --   1. Escolha uma senha forte e substitua TROQUE_ESTA_SENHA abaixo.
@@ -174,40 +191,54 @@ ORDER BY datname;
 \echo 'e acompanhar o "Executando migrations..." nos logs do container.'
 
 -- =============================================================================
--- PARTE 2 — ISOLAR O `fiscargo` (NÃO roda automaticamente: leia antes)
+-- PARTE 2 — FECHAR A CONEXÃO AOS OUTROS BANCOS
 --
--- Criar o papel restrito, sozinho, NÃO impede que ele se conecte aos outros
--- bancos do cluster. Verificado na prática: `contabil_app` recém-criado conectou
--- num segundo banco sem nenhum privilégio explícito.
+-- ⏸️ ADIADA por decisão de escopo em 2026-08-04: por ora mexemos só no
+-- contabil-core. Mexer aqui significa mexer em banco de outro projeto.
 --
--- A razão é que o PostgreSQL concede `CONNECT` a `PUBLIC` em todo banco novo, e
--- `PUBLIC` inclui qualquer papel com login. O `REVOKE ... FROM PUBLIC` da PARTE 1
--- vale só para o `contabil_db` — o `fiscargo` continua aberto até alguém revogar
--- lá também.
+-- Deixada documentada porque o dia em que alguém for fechar o cluster, esta é a
+-- receita — e a ordem dos comandos é o que separa "fechou" de "derrubou o
+-- serviço do vizinho".
+--
+-- IMPORTANTE, para dimensionar: isto é **higiene, não a barreira principal**.
+-- Criar o papel restrito (PARTE 1) já impede a LEITURA dos outros bancos. O que
+-- sobra sem a PARTE 2 é a conexão poder ser aberta — sem enxergar nada dentro.
+--
+-- O PostgreSQL concede `CONNECT` a `PUBLIC` em todo banco novo, e `PUBLIC`
+-- inclui qualquer papel com login. O `REVOKE ... FROM PUBLIC` da PARTE 1 vale só
+-- para o `contabil_db`; os demais continuam aceitando conexão até alguém
+-- revogar em cada um.
 --
 -- Confira o estado atual (coluna vazia = aberto para todo mundo):
 --
 --   SELECT datname, datacl FROM pg_database WHERE datistemplate = false;
 --
--- ⚠️ Os comandos abaixo mexem no banco do Frota-Link. Rodar o REVOKE sem o GRANT
--- correspondente TIRA O FROTA-LINK DO AR. Faça na ordem, e confirme antes qual
--- papel o serviço dele usa de fato:
+-- ⚠️ Os comandos abaixo mexem em banco de OUTRO projeto. Rodar o REVOKE sem o
+-- GRANT correspondente TIRA O SERVIÇO DAQUELE PROJETO DO AR. Faça na ordem, e
+-- confirme antes qual papel cada serviço usa de fato — com o serviço no ar,
+-- senão a consulta volta vazia e você conclui que ninguém usa:
 --
---   SELECT DISTINCT usename FROM pg_stat_activity WHERE datname = 'fiscargo';
+--   SELECT datname, usename, count(*)
+--   FROM pg_stat_activity WHERE datname IS NOT NULL
+--   GROUP BY 1, 2 ORDER BY 1;
 --
--- Depois, conectado ao banco `postgres` como superusuário:
+-- Depois, conectado ao banco `postgres` como superusuário, banco a banco:
 --
 --   -- 1º garante quem PRECISA entrar
---   GRANT CONNECT ON DATABASE fiscargo TO <papel_do_frota_link>;
+--   GRANT CONNECT ON DATABASE <banco> TO <papel_do_servico>;
 --   -- 2º só então fecha para o resto
---   REVOKE CONNECT ON DATABASE fiscargo FROM PUBLIC;
+--   REVOKE CONNECT ON DATABASE <banco> FROM PUBLIC;
 --
--- TESTE DE ISOLAMENTO (depois de aplicar, como contabil_app):
+-- Bancos no cluster em 2026-08-04, fora o contabil_db: conbank, evogo_auth,
+-- evogo_users, fiscargo, frota, hub_41tech, n8n, portfolio_db, portfolionathan.
+-- Os que mais pesam são `n8n` (guarda credencial de toda integração) e
+-- `evogo_auth` (base de autenticação de outro produto).
 --
---   psql "postgres://contabil_app:SENHA@vps.41tech.cloud:3308/fiscargo"
+-- TESTE (depois de aplicar, como contabil_app):
 --
--- Esperado: FATAL: permission denied for database "fiscargo".
--- Enquanto conectar, comprometer o contabil-core é comprometer o Frota-Link.
+--   psql "postgres://contabil_app:SENHA@vps.41tech.cloud:3308/<banco>"
+--
+-- Esperado: FATAL: permission denied for database "<banco>".
 -- =============================================================================
 
 -- =============================================================================
