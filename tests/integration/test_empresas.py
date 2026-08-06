@@ -133,6 +133,33 @@ async def test_criar_empresa_cnpj_duplicado(
 
 
 @pytest.mark.asyncio
+async def test_erro_de_cnpj_duplicado_nomeia_a_empresa_existente(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Quem esbarra no duplicado precisa saber QUAL empresa já tem aquele CNPJ.
+
+    O caso real é a mesma empresa já cadastrada com outra grafia da razão social
+    — repetir só o CNPJ que a pessoa acabou de digitar não ajuda a perceber isso.
+    """
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        "/api/v1/empresas",
+        json={
+            "razao_social": "DECATEC COMERCIO E SERVICOS LTDA",  # mesma empresa, nome completo
+            "cnpj": empresa.cnpj,
+            "regime_tributario": "simples_nacional",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 409
+
+    body = r.json()
+    assert empresa.razao_social in body["message"], "a mensagem precisa nomear a empresa existente"
+    assert body["details"]["empresa_id"] == str(empresa.id)
+    assert body["details"]["razao_social"] == empresa.razao_social
+
+
+@pytest.mark.asyncio
 async def test_obter_empresa_existente(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
