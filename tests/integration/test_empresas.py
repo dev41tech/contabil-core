@@ -42,6 +42,55 @@ async def test_listar_empresas_autenticado(
 
 
 @pytest.mark.asyncio
+async def test_listar_empresas_pagina_alem_do_default_nao_perde_nenhuma(
+    client: AsyncClient, db, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Regressão: o seletor global de empresa buscava sem `page_size`, caía no
+    default de 50 e as empresas além da 50ª (ordem alfabética) simplesmente não
+    apareciam em nenhuma tela — nem erro, nem indício de que faltava algo.
+
+    Cria empresas suficientes para passar da primeira página e confirma que
+    dá para acessar todas paginando, e que `total` diz a verdade sobre quantas
+    existem — é o dado que o front precisa para saber que tem mais para buscar.
+    """
+    for i in range(60):
+        db.add(
+            Empresa(
+                tenant_id=tenant.id,
+                razao_social=f"EMPRESA TESTE PAGINACAO {i:03d} LTDA",
+                cnpj=f"00.000.{i:03d}/0001-00",
+                regime_tributario="simples_nacional",
+            )
+        )
+    await db.flush()
+
+    await _login(client, tenant, usuario)
+
+    r = await client.get("/api/v1/empresas")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] >= 61  # as 60 criadas + a fixture `empresa`
+    assert len(body["items"]) == 50, "default de page_size não deveria mudar"
+
+    r2 = await client.get("/api/v1/empresas", params={"page": 2, "page_size": 50})
+    pagina_dois = r2.json()["items"]
+    assert len(pagina_dois) >= 11, "o resto das empresas precisa estar acessível na página seguinte"
+
+    ids_pagina_um = {e["id"] for e in body["items"]}
+    ids_pagina_dois = {e["id"] for e in pagina_dois}
+    assert not (ids_pagina_um & ids_pagina_dois), "páginas não podem se sobrepor"
+
+
+@pytest.mark.asyncio
+async def test_listar_empresas_page_size_acima_do_limite_rejeita(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    await _login(client, tenant, usuario)
+    r = await client.get("/api/v1/empresas", params={"page_size": 500})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_listar_cnpj_invalidos(
     client: AsyncClient, db, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
