@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, require_auth, require_csrf
@@ -27,8 +27,14 @@ def _svc(ctx: AuthContext, db: AsyncSession) -> EmpresaService:
 
 @router.get("", response_model=EmpresaListResponse)
 async def listar_empresas(
-    page: int = 1,
-    page_size: int = 50,
+    page: int = Query(default=1, ge=1),
+    # Sem `le`, um escritório com muitas empresas cadastradas ficava sujeito a
+    # "faltam empresas na lista" sempre que um cliente do front esquecesse de
+    # paginar — foi exatamente o que aconteceu: o seletor global buscava sem
+    # page_size, caía no default de 50 e as empresas seguintes ao 50º lugar
+    # (em ordem alfabética) nunca apareciam em nenhuma tela. O limite aqui só
+    # deixa o contrato explícito; a correção real é o front paginar de verdade.
+    page_size: int = Query(default=50, ge=1, le=200),
     ctx: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
 ) -> EmpresaListResponse:
