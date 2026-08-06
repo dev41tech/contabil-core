@@ -93,8 +93,24 @@ class EmpresaService:
                 Empresa.deleted_at == None,
             )
         )
-        if existing.scalar_one_or_none():
-            raise ConflictError(message=f"Já existe uma empresa com CNPJ {data.cnpj} neste escritório.")
+        duplicada = existing.scalar_one_or_none()
+        if duplicada:
+            # A mensagem nomeia a empresa existente de propósito. Repetir só o
+            # CNPJ que o usuário acabou de digitar não informa nada: o caso comum
+            # é a mesma empresa já cadastrada com outra grafia da razão social, e
+            # sem o nome não dá para perceber isso na tela.
+            raise ConflictError(
+                message=(
+                    f"O CNPJ {data.cnpj} já está cadastrado para "
+                    f"\"{duplicada.razao_social}\". Se for a mesma empresa, edite "
+                    f"o cadastro dela em vez de criar uma nova."
+                ),
+                details={
+                    "empresa_id": str(duplicada.id),
+                    "razao_social": duplicada.razao_social,
+                    "cnpj": duplicada.cnpj,
+                },
+            )
 
         empresa = Empresa(
             tenant_id=self._tenant_id,
