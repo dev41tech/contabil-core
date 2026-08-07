@@ -28,13 +28,13 @@ async def _login(client, tenant, usuario) -> str:
 
 
 @pytest.mark.asyncio
-async def test_upload_acima_do_limite_retorna_413(client, tenant, usuario):
+async def test_upload_acima_do_limite_retorna_413(client, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     limite = get_settings().max_upload_bytes
     gordo = b"x" * (limite + 1)
 
     r = await client.post(
-        "/api/v1/concilpro/upload",
+        f"/api/v1/empresas/{empresa.id}/concilpro/upload",
         files={"file": ("razao.pdf", io.BytesIO(gordo), "application/pdf")},
         headers={"X-CSRF-Token": csrf},
     )
@@ -46,12 +46,12 @@ async def test_upload_acima_do_limite_retorna_413(client, tenant, usuario):
 
 
 @pytest.mark.asyncio
-async def test_upload_dentro_do_limite_passa_pelo_middleware(client, tenant, usuario):
+async def test_upload_dentro_do_limite_passa_pelo_middleware(client, tenant, usuario, empresa):
     """Arquivo pequeno não é barrado — o erro que vier é do parser, não do limite."""
     csrf = await _login(client, tenant, usuario)
 
     r = await client.post(
-        "/api/v1/concilpro/upload",
+        f"/api/v1/empresas/{empresa.id}/concilpro/upload",
         files={"file": ("razao.pdf", io.BytesIO(b"conteudo pequeno"), "application/pdf")},
         headers={"X-CSRF-Token": csrf},
     )

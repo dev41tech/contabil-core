@@ -593,8 +593,9 @@ class CpArquivo(Base):
     __tablename__ = "cp_arquivo"
 
     id              = _Col(_Int, primary_key=True, index=True)
+    empresa_id      = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     nome_arquivo    = _Col(_Str(255), nullable=False)
-    hash_arquivo    = _Col(_Str(64), unique=True, nullable=False)
+    hash_arquivo    = _Col(_Str(64), nullable=False)
     empresa         = _Col(_Str(255))
     cnpj_empresa    = _Col(_Str(18))
     total_fornecedores = _Col(_Int, default=0)
@@ -607,12 +608,18 @@ class CpArquivo(Base):
 
     fornecedores    = _rel("CpFornecedor", back_populates="arquivo_origem")
 
+    __table_args__ = (
+        UniqueConstraint("empresa_id", "hash_arquivo", name="uq_cp_arquivo_empresa_hash"),
+        Index("ix_cp_arquivo_empresa", "empresa_id"),
+    )
+
 
 class CpFornecedor(Base):
     """CONCILPRO — conta de fornecedor extraída do Razão."""
     __tablename__ = "cp_fornecedor"
 
     id                  = _Col(_Int, primary_key=True, index=True)
+    empresa_id          = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     arquivo_origem_id   = _Col(_Int, _FK("cp_arquivo.id"))
     codigo_conta        = _Col(_Str(10), nullable=False)
     conta_contabil      = _Col(_Str(50), nullable=False)
@@ -638,6 +645,7 @@ class CpFornecedor(Base):
     conciliacoes    = _rel("CpConciliacao", back_populates="fornecedor", cascade="all, delete-orphan")
 
     __table_args__ = (
+        Index("ix_cp_fornecedor_empresa", "empresa_id"),
         Index("ix_cp_fornecedor_conta", "codigo_conta", "conta_contabil"),
         Index("ix_cp_fornecedor_status", "status_pagamento"),
     )
@@ -648,6 +656,7 @@ class CpLancamento(Base):
     __tablename__ = "cp_lancamento"
 
     id                    = _Col(_Int, primary_key=True, index=True)
+    empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     data_lancamento       = _Col(_Date, nullable=False)
     lote                  = _Col(_Str(50))
@@ -673,6 +682,7 @@ class CpLancamento(Base):
                                 back_populates="lancamento_debito")
 
     __table_args__ = (
+        Index("ix_cp_lancamento_empresa", "empresa_id"),
         Index("ix_cp_lancamento_forn_data", "fornecedor_id", "data_lancamento"),
         Index("ix_cp_lancamento_tipo", "tipo_operacao"),
         Index("ix_cp_lancamento_status", "status_pagamento"),
@@ -685,6 +695,7 @@ class CpConciliacao(Base):
     __tablename__ = "cp_conciliacao"
 
     id                    = _Col(_Int, primary_key=True, index=True)
+    empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     lancamento_credito_id = _Col(_Int, _FK("cp_lancamento.id"))
     lancamento_debito_id  = _Col(_Int, _FK("cp_lancamento.id"))
@@ -700,7 +711,10 @@ class CpConciliacao(Base):
     lancamento_debito  = _rel("CpLancamento", foreign_keys=[lancamento_debito_id],
                               back_populates="conciliacoes_debito")
 
-    __table_args__ = (Index("ix_cp_conciliacao_forn", "fornecedor_id"),)
+    __table_args__ = (
+        Index("ix_cp_conciliacao_empresa", "empresa_id"),
+        Index("ix_cp_conciliacao_forn", "fornecedor_id"),
+    )
 
 
 class CpDivergencia(Base):
@@ -708,6 +722,7 @@ class CpDivergencia(Base):
     __tablename__ = "cp_divergencia"
 
     id               = _Col(_Int, primary_key=True, index=True)
+    empresa_id       = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id    = _Col(_Int, _FK("cp_fornecedor.id"))
     lancamento_id    = _Col(_Int, _FK("cp_lancamento.id"))
     tipo             = _Col(_Str(50), nullable=False)
@@ -721,6 +736,7 @@ class CpDivergencia(Base):
     created_at       = _Col(_DT, default=_utcnow)
 
     __table_args__ = (
+        Index("ix_cp_divergencia_empresa", "empresa_id"),
         Index("ix_cp_divergencia_forn", "fornecedor_id"),
         Index("ix_cp_divergencia_resolvido", "resolvido"),
     )

@@ -8,21 +8,38 @@ o sistema contábil cria vários lançamentos para a mesma NF na mesma data.
 
 SOLUÇÃO:
 Após o parser extrair os lançamentos, consolidar por:
-  - numero_nf + data_lancamento + tipo_operacao
+  - numero_nf + série + data_lancamento + tipo_operacao
 
 IMPORTANTE:
-- COMPRAS: Consolidar se mesmo número de NF + mesma data
+- COMPRAS: Consolidar se mesmo número e série de NF + mesma data
 - PAGAMENTOS: NÃO consolidar (podem haver múltiplos pagamentos no mesmo dia)
 """
 
-from decimal import Decimal
-from typing import List, Dict
+import re
 from datetime import datetime
+from decimal import Decimal
+from typing import Dict, List
+
+
+_SERIE_NF_RE = re.compile(
+    r"\bS[ÉE]R(?:IE|\.)?\s*(?:N[ºO]\s*)?[:#-]?\s*([A-Z0-9][A-Z0-9./-]*)",
+    re.IGNORECASE,
+)
+
+
+def _serie_da_nota(lancamento: Dict) -> str:
+    explicita = lancamento.get("serie_nf") or lancamento.get("serie")
+    if explicita is not None and str(explicita).strip():
+        return str(explicita).strip().upper()
+
+    historico = str(lancamento.get("historico") or "")
+    encontrada = _SERIE_NF_RE.search(historico)
+    return encontrada.group(1).upper() if encontrada else ""
 
 
 def consolidar_lancamentos_fornecedor(lancamentos: List[Dict]) -> List[Dict]:
     """
-    Consolida lançamentos de COMPRA que têm o mesmo número de NF e mesma data.
+    Consolida compras com o mesmo número, série e data da NF.
     """
     compras = [l for l in lancamentos if l.get('tipo_operacao') == 'COMPRA']
     outros = [l for l in lancamentos if l.get('tipo_operacao') != 'COMPRA']
@@ -31,6 +48,7 @@ def consolidar_lancamentos_fornecedor(lancamentos: List[Dict]) -> List[Dict]:
 
     for lanc in compras:
         nf = lanc.get('numero_nf')
+        serie = _serie_da_nota(lanc)
         data = lanc.get('data_lancamento')
 
         if isinstance(data, datetime):
@@ -39,9 +57,9 @@ def consolidar_lancamentos_fornecedor(lancamentos: List[Dict]) -> List[Dict]:
             data_str = str(data)
 
         if not nf or nf == '':
-            chave = f"SEM_NF_{id(lanc)}"
+            chave = ("SEM_NF", id(lanc))
         else:
-            chave = f"{nf}_{data_str}"
+            chave = (str(nf), str(serie).strip(), data_str)
 
         if chave not in grupos:
             grupos[chave] = []
