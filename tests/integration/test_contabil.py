@@ -86,9 +86,10 @@ async def test_listar_registros_contabeis(client, db, tenant, usuario, empresa):
     r = await client.get(f"/api/v1/empresas/{empresa.id}/contabil")
     assert r.status_code == 200
     body = r.json()
-    assert body["total"] >= 1
-    assert body["items"][0]["dc"] == "C"
-    assert body["items"][0]["valor"] == 3000.0
+    assert body["total"] == 2
+    assert {item["dc"] for item in body["items"]} == {"D", "C"}
+    assert all(item["valor"] == 3000.0 for item in body["items"])
+    assert len({item["lancamento_id"] for item in body["items"]}) == 1
 
 
 @pytest.mark.asyncio
@@ -103,8 +104,34 @@ async def test_listar_registros_filtro_dc(client, db, tenant, usuario, empresa):
 
     r2 = await client.get(f"/api/v1/empresas/{empresa.id}/contabil?dc=D")
     assert r2.status_code == 200
-    # Não há débitos neste extrato
-    assert r2.json()["total"] == 0
+    # A contrapartida bancária da receita é um débito.
+    assert r2.json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_listar_registros_data_ate_inclui_dia_inteiro(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_e_processar(client, db, empresa, csrf)
+
+    r = await client.get(
+        f"/api/v1/empresas/{empresa.id}/contabil", params={"data_ate": "2024-04-01"}
+    )
+
+    assert r.status_code == 200
+    assert r.json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_listar_registros_data_invalida_retorna_422(
+    client, tenant, usuario, empresa
+):
+    await _login(client, tenant, usuario)
+    r = await client.get(
+        f"/api/v1/empresas/{empresa.id}/contabil", params={"data_ate": "nao-e-data"}
+    )
+    assert r.status_code == 422
 
 
 # ── Obter

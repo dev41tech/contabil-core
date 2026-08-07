@@ -25,9 +25,6 @@ _TIPO_LABEL: dict[str, str] = {
     "receita": "Receitas",
     "custo": "Custos",
     "despesa": "Despesas",
-    "ativo": "Ativo",
-    "passivo": "Passivo",
-    "patrimonio_liquido": "Patrimônio Líquido",
 }
 
 # Ordem de exibição no DRE
@@ -35,9 +32,13 @@ _TIPO_ORDEM: dict[str, int] = {
     "receita": 0,
     "custo": 1,
     "despesa": 2,
-    "ativo": 3,
-    "passivo": 4,
-    "patrimonio_liquido": 5,
+}
+
+# Natureza explícita das contas que pertencem à DRE.
+_DRE_NATUREZA: dict[str, str] = {
+    "receita": "C",
+    "custo": "D",
+    "despesa": "D",
 }
 
 
@@ -103,12 +104,11 @@ class RelatoriosService:
         grupos_map: dict[str, list[DRELinha]] = {}
         for conta_id, dc_map in totais.items():
             conta = contas.get(conta_id)
-            if not conta:
+            if not conta or conta.tipo not in _DRE_NATUREZA:
                 continue
             d = dc_map["D"]
             c = dc_map["C"]
-            # Saldo: receita tem natureza credora → C − D; demais → D − C
-            if conta.tipo in ("receita",):
+            if _DRE_NATUREZA[conta.tipo] == "C":
                 saldo = c - d
             else:
                 saldo = d - c
@@ -259,45 +259,48 @@ class RelatoriosService:
                 agencias=[],
             )
 
+        agencia_ids = [agencia.id for agencia in agencias]
+        saldos_iniciais: dict[UUID, float] = {agencia_id: 0.0 for agencia_id in agencia_ids}
+        if data_de:
+            sq = (
+                select(
+                    Transacao.agencia_id,
+                    Transacao.dc,
+                    func.sum(Transacao.valor).label("total"),
+                )
+                .where(
+                    Transacao.empresa_id == self._empresa_id,
+                    Transacao.agencia_id.in_(agencia_ids),
+                    Transacao.deleted_at.is_(None),
+                    Transacao.data < data_de,
+                )
+                .group_by(Transacao.agencia_id, Transacao.dc)
+            )
+            for agencia_id, dc, total in (await self._db.execute(sq)).all():
+                valor = float(total or 0)
+                saldos_iniciais[agencia_id] += valor if dc == "C" else -valor
+
+        tq = select(Transacao).where(
+            Transacao.empresa_id == self._empresa_id,
+            Transacao.agencia_id.in_(agencia_ids),
+            Transacao.deleted_at.is_(None),
+        )
+        if data_de:
+            tq = tq.where(Transacao.data >= data_de)
+        if data_ate:
+            tq = tq.where(Transacao.data <= data_ate)
+        tq = tq.order_by(Transacao.agencia_id, Transacao.data, Transacao.id)
+        transacoes_por_agencia: dict[UUID, list[Transacao]] = {
+            agencia_id: [] for agencia_id in agencia_ids
+        }
+        for transacao in (await self._db.execute(tq)).scalars().all():
+            transacoes_por_agencia[transacao.agencia_id].append(transacao)
+
         agencias_resp: list[LivroCaixaAgencia] = []
 
         for agencia in agencias:
-            # Saldo anterior: tudo antes de data_de
-            saldo_inicial = 0.0
-            if data_de:
-                sq = (
-                    select(
-                        Transacao.dc,
-                        func.sum(Transacao.valor).label("total"),
-                    )
-                    .where(
-                        Transacao.empresa_id == self._empresa_id,
-                        Transacao.agencia_id == agencia.id,
-                        Transacao.deleted_at.is_(None),
-                        Transacao.data < data_de,
-                    )
-                    .group_by(Transacao.dc)
-                )
-                for dc, total in (await self._db.execute(sq)).all():
-                    val = float(total or 0)
-                    saldo_inicial += val if dc == "C" else -val
-
-            # Lançamentos no período
-            tq = (
-                select(Transacao)
-                .where(
-                    Transacao.empresa_id == self._empresa_id,
-                    Transacao.agencia_id == agencia.id,
-                    Transacao.deleted_at.is_(None),
-                )
-                .order_by(Transacao.data)
-            )
-            if data_de:
-                tq = tq.where(Transacao.data >= data_de)
-            if data_ate:
-                tq = tq.where(Transacao.data <= data_ate)
-
-            transacoes = (await self._db.execute(tq)).scalars().all()
+            saldo_inicial = saldos_iniciais[agencia.id]
+            transacoes = transacoes_por_agencia[agencia.id]
 
             lancamentos: list[LivroCaixaLancamento] = []
             saldo_acc = saldo_inicial

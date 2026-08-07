@@ -12,6 +12,7 @@ class RegistroContabilResponse(BaseModel):
     id: UUID
     empresa_id: UUID
     transacao_id: UUID | None
+    lancamento_id: UUID
     conta_id: UUID
     agencia_id: UUID
     descricao: str

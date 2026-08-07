@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -30,22 +31,20 @@ async def listar_registros(
     conta_id: UUID | None = Query(default=None),
     agencia_id: UUID | None = Query(default=None),
     dc: str | None = Query(default=None, description="D ou C"),
-    data_de: str | None = Query(default=None, description="ISO 8601"),
-    data_ate: str | None = Query(default=None, description="ISO 8601"),
+    data_de: date | datetime | None = Query(default=None, description="ISO 8601"),
+    data_ate: date | datetime | None = Query(default=None, description="ISO 8601"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> RegistroContabilListResponse:
     """Lista registros contábeis gerados pelo NEO ou inseridos manualmente."""
-    from datetime import datetime
-
     return await _svc(empresa_id, db).listar(
         page=page,
         page_size=page_size,
         conta_id=conta_id,
         agencia_id=agencia_id,
         dc=dc,
-        data_de=datetime.fromisoformat(data_de) if data_de else None,
-        data_ate=datetime.fromisoformat(data_ate) if data_ate else None,
+        data_de=data_de,
+        data_ate=data_ate,
     )
 
 
