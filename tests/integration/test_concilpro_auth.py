@@ -11,7 +11,8 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-BASE = "/api/v1/concilpro"
+EMPRESA_ID = "00000000-0000-0000-0000-000000000001"
+BASE = f"/api/v1/empresas/{EMPRESA_ID}/concilpro"
 
 # Toda rota GET do módulo. Se uma rota nova aparecer e não estiver aqui,
 # test_todas_as_rotas_get_estao_cobertas falha.
@@ -68,7 +69,10 @@ async def test_todas_as_rotas_get_estao_cobertas():
         for rota in router.routes
         if "GET" in getattr(rota, "methods", set())
     }
-    cobertas = {f"/concilpro{r.split('?')[0]}" for r in ROTAS_GET}
+    cobertas = {
+        f"/empresas/{{empresa_id}}/concilpro{r.split('?')[0]}"
+        for r in ROTAS_GET
+    }
 
     # normaliza os path params ({arquivo_id} vs 1) comparando a quantidade de segmentos
     def forma(p: str) -> str:

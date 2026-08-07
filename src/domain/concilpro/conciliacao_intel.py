@@ -8,26 +8,32 @@ Regras:
 - Adiantamentos são contabilizados separadamente
 """
 
-from decimal import Decimal
 from collections import deque
+from decimal import Decimal
+from uuid import UUID
+
 from sqlalchemy.orm import Session
 
 from src.db.models import CpFornecedor as Fornecedor, CpLancamento as LancamentoFornecedor
 
 
-# Tolerância para "zerar" centavos residuais por arredondamento
-EPS = Decimal("0.01")
+CENTAVO = Decimal("0.01")
 
 
 def _d(x) -> Decimal:
-    return x if isinstance(x, Decimal) else Decimal(str(x or "0"))
+    valor = x if isinstance(x, Decimal) else Decimal(str(x or "0"))
+    return valor.quantize(CENTAVO)
 
 
 def _is_open(compra: LancamentoFornecedor) -> bool:
-    return _d(compra.valor_saldo) > EPS
+    return _d(compra.valor_saldo) > 0
 
 
-def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
+def conciliar_fornecedor_inteligente(
+    db: Session,
+    fornecedor_id: int,
+    empresa_id: UUID,
+):
     """
     Concilia um fornecedor aplicando TODOS os pagamentos via FIFO flexível.
 
@@ -41,11 +47,13 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
     """
     compras = db.query(LancamentoFornecedor).filter(
         LancamentoFornecedor.fornecedor_id == fornecedor_id,
+        LancamentoFornecedor.empresa_id == empresa_id,
         LancamentoFornecedor.tipo_operacao == "COMPRA"
     ).order_by(LancamentoFornecedor.data_lancamento).all()
 
     pagamentos = db.query(LancamentoFornecedor).filter(
         LancamentoFornecedor.fornecedor_id == fornecedor_id,
+        LancamentoFornecedor.empresa_id == empresa_id,
         LancamentoFornecedor.tipo_operacao == "PAGAMENTO"
     ).order_by(LancamentoFornecedor.data_lancamento).all()
 
@@ -80,7 +88,7 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
                 obj.valor_saldo = _d(obj.valor_credito) - abate
                 adiantamento_total -= abate
 
-                if _d(obj.valor_saldo) <= EPS:
+                if _d(obj.valor_saldo) == 0:
                     obj.valor_saldo = Decimal("0")
                     obj.status_pagamento = "PAGO"
                 else:
@@ -89,7 +97,7 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
 
                 print(f"   💰 Adiantamento aplicado: R$ {abate:,.2f} na NF {obj.numero_nf or 'S/N'}")
             else:
-                if _d(obj.valor_saldo) > EPS:
+                if _d(obj.valor_saldo) > 0:
                     fila.append(obj)
             continue
 
@@ -116,7 +124,7 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
             nf_atual.valor_pago_parcial = _d(nf_atual.valor_pago_parcial) + abate
             nf_atual.valor_saldo = _d(nf_atual.valor_credito) - _d(nf_atual.valor_pago_parcial)
 
-            if _d(nf_atual.valor_saldo) <= EPS:
+            if _d(nf_atual.valor_saldo) == 0:
                 nf_atual.valor_saldo = Decimal("0")
                 nf_atual.status_pagamento = "PAGO"
                 fila.popleft()
@@ -125,9 +133,7 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
 
             restante -= abate
 
-    db.commit()
-
-    pendentes = [c for c in compras if _d(c.valor_saldo) > EPS]
+    pendentes = [c for c in compras if _d(c.valor_saldo) > 0]
     parciais  = [c for c in compras if c.status_pagamento == "PARCIAL"]
 
     if adiantamento_total > 0:
@@ -139,12 +145,17 @@ def conciliar_fornecedor_inteligente(db: Session, fornecedor_id: int):
     return len(pendentes), len(parciais)
 
 
-def conciliar_todos_fornecedores_inteligente(db: Session, arquivo_id: int):
+def conciliar_todos_fornecedores_inteligente(
+    db: Session,
+    arquivo_id: int,
+    empresa_id: UUID,
+):
     """
     Concilia todos os fornecedores de um arquivo usando FIFO flexível.
     """
     fornecedores = db.query(Fornecedor).filter(
-        Fornecedor.arquivo_origem_id == arquivo_id
+        Fornecedor.arquivo_origem_id == arquivo_id,
+        Fornecedor.empresa_id == empresa_id,
     ).all()
 
     print(f"\n🔄 Iniciando conciliação FIFO flexível para {len(fornecedores)} fornecedores...")
@@ -152,14 +163,13 @@ def conciliar_todos_fornecedores_inteligente(db: Session, arquivo_id: int):
     for forn in fornecedores:
         if _d(forn.total_credito) > 0 or _d(forn.total_debito) > 0:
             print(f"\n📌 {forn.codigo_conta} - {forn.nome_fornecedor[:40]}")
-            try:
-                pendentes, parciais = conciliar_fornecedor_inteligente(db, forn.id)
-                forn.qtd_nfs_pendentes = pendentes
-                forn.qtd_nfs_parciais  = parciais
-            except Exception as e:
-                print(f"   ❌ Erro na conciliação: {e}")
-                import traceback
-                traceback.print_exc()
+            pendentes, parciais = conciliar_fornecedor_inteligente(
+                db,
+                forn.id,
+                empresa_id,
+            )
+            forn.qtd_nfs_pendentes = pendentes
+            forn.qtd_nfs_parciais = parciais
 
-    db.commit()
+    db.flush()
     print("\n✅ Conciliação FIFO flexível concluída!")
