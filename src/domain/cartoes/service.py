@@ -5,7 +5,7 @@ Regras de negócio:
 - Cada cartão pode ter 0..N faturas; cada fatura é única por competência (mês).
 - Lançamentos só podem ser adicionados a faturas com status "aberta" ou "fechada".
 - Faturas "pagas" são imutáveis (sem novos lançamentos ou alteração de status).
-- Ao adicionar/remover lançamentos, o valor_total da fatura é recalculado.
+- O valor total da fatura é sempre derivado da soma dos lançamentos ativos.
 - Ao associar uma transação bancária a uma fatura, o status muda para "paga".
 - Soft delete em cartões, faturas e lançamentos via deleted_at.
 """
@@ -13,17 +13,25 @@ Regras de negócio:
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
-from src.db.models import CartaoCredito, FaturaCartao, LancamentoCartao, Transacao
+from src.db.models import (
+    CartaoCredito,
+    FaturaCartao,
+    LancamentoCartao,
+    PlanoConta,
+    Transacao,
+)
 from src.schemas.cartoes import (
     AssociarTransacaoFaturaRequest,
     CartaoCreate,
@@ -35,7 +43,6 @@ from src.schemas.cartoes import (
     FaturaResponse,
     FaturaUpdate,
     ImportCSVResponse,
-    LancamentoBulkImport,
     LancamentoCreate,
     LancamentoListResponse,
     LancamentoResponse,
@@ -52,7 +59,7 @@ class CartaoService:
     # ── Cartões ───────────────────────────────────────────────────────────────
 
     async def listar_cartoes(self) -> CartaoListResponse:
-        rows = (
+        cartoes = (
             await self._db.execute(
                 select(CartaoCredito)
                 .where(
@@ -63,26 +70,48 @@ class CartaoService:
             )
         ).scalars().all()
 
-        items = []
-        for c in rows:
-            total_fat = (
+        faturas_por_cartao: dict[UUID, list[tuple[str, str, Decimal]]] = {}
+        if cartoes:
+            faturas = (
                 await self._db.execute(
-                    select(func.count()).where(
-                        FaturaCartao.cartao_id == c.id,
+                    select(
+                        FaturaCartao.cartao_id,
+                        FaturaCartao.competencia,
+                        FaturaCartao.status,
+                        func.coalesce(func.sum(LancamentoCartao.valor), 0),
+                    )
+                    .outerjoin(
+                        LancamentoCartao,
+                        and_(
+                            LancamentoCartao.fatura_id == FaturaCartao.id,
+                            LancamentoCartao.deleted_at.is_(None),
+                        ),
+                    )
+                    .where(
+                        FaturaCartao.cartao_id.in_([c.id for c in cartoes]),
                         FaturaCartao.deleted_at.is_(None),
                     )
+                    .group_by(
+                        FaturaCartao.id,
+                        FaturaCartao.cartao_id,
+                        FaturaCartao.competencia,
+                        FaturaCartao.status,
+                    )
+                    .order_by(FaturaCartao.competencia.desc())
                 )
-            ).scalar_one()
+            ).all()
+            for cartao_id, competencia, status, valor_total in faturas:
+                faturas_por_cartao.setdefault(cartao_id, []).append(
+                    (competencia, status, valor_total)
+                )
 
-            fat_aberta = (
-                await self._db.execute(
-                    select(FaturaCartao.valor_total).where(
-                        FaturaCartao.cartao_id == c.id,
-                        FaturaCartao.status == "aberta",
-                        FaturaCartao.deleted_at.is_(None),
-                    ).order_by(FaturaCartao.competencia.desc()).limit(1)
-                )
-            ).scalar_one_or_none()
+        items = []
+        for c in cartoes:
+            faturas = faturas_por_cartao.get(c.id, [])
+            fat_aberta = next(
+                (valor for _, status, valor in faturas if status == "aberta"),
+                None,
+            )
 
             items.append(
                 CartaoResponse(
@@ -95,8 +124,10 @@ class CartaoService:
                     dia_vencimento=c.dia_vencimento,
                     limite=float(c.limite) if c.limite else None,
                     ativo=c.ativo,
-                    total_faturas=total_fat,
-                    fatura_aberta_valor=float(fat_aberta) if fat_aberta else None,
+                    total_faturas=len(faturas),
+                    fatura_aberta_valor=(
+                        float(fat_aberta) if fat_aberta is not None else None
+                    ),
                 )
             )
         return CartaoListResponse(items=items, total=len(items))
@@ -167,27 +198,31 @@ class CartaoService:
         await self._get_cartao_or_404(cartao_id)
         rows = (
             await self._db.execute(
-                select(FaturaCartao, CartaoCredito)
-                .join(CartaoCredito, CartaoCredito.id == FaturaCartao.cartao_id)
+                select(
+                    FaturaCartao,
+                    func.count(LancamentoCartao.id),
+                    func.coalesce(func.sum(LancamentoCartao.valor), 0),
+                )
+                .outerjoin(
+                    LancamentoCartao,
+                    and_(
+                        LancamentoCartao.fatura_id == FaturaCartao.id,
+                        LancamentoCartao.deleted_at.is_(None),
+                    ),
+                )
                 .where(
                     FaturaCartao.cartao_id == cartao_id,
                     FaturaCartao.deleted_at.is_(None),
                 )
+                .group_by(FaturaCartao.id)
                 .order_by(FaturaCartao.competencia.desc())
             )
         ).all()
 
-        items = []
-        for f, c in rows:
-            total_lanc = (
-                await self._db.execute(
-                    select(func.count()).where(
-                        LancamentoCartao.fatura_id == f.id,
-                        LancamentoCartao.deleted_at.is_(None),
-                    )
-                )
-            ).scalar_one()
-            items.append(_fatura_to_response(f, c, total_lanc))
+        items = [
+            _fatura_to_response(fatura, cartao, total_lanc, valor_total)
+            for fatura, total_lanc, valor_total in rows
+        ]
 
         return FaturaListResponse(items=items, total=len(items))
 
@@ -223,14 +258,20 @@ class CartaoService:
         self._db.add(fatura)
         await self._db.flush()
         logger.info("fatura.criada", fatura_id=str(fatura.id), competencia=data.competencia)
-        return _fatura_to_response(fatura, cartao, 0)
+        return _fatura_to_response(fatura, cartao, 0, Decimal("0"))
 
     async def atualizar_fatura(
         self, cartao_id: UUID, fatura_id: UUID, data: FaturaUpdate
     ) -> FaturaResponse:
-        fatura, cartao = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, cartao = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
         if fatura.status == "paga" and data.status != "paga":
             raise ValidationError(message="Faturas pagas não podem ser reabertas.")
+        if fatura.status != "paga" and data.status == "paga":
+            raise ValidationError(
+                message="Uma fatura só pode ser paga pela associação de uma transação válida."
+            )
 
         if data.status is not None:
             fatura.status = data.status
@@ -240,13 +281,17 @@ class CartaoService:
             fatura.observacao = data.observacao
         await self._db.flush()
 
-        total_lanc = await self._count_lancamentos(fatura_id)
-        return _fatura_to_response(fatura, cartao, total_lanc)
+        total_lanc, valor_total = await self._totais_fatura(fatura_id)
+        return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
 
     async def associar_transacao(
         self, cartao_id: UUID, fatura_id: UUID, data: AssociarTransacaoFaturaRequest
     ) -> FaturaResponse:
-        fatura, cartao = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, cartao = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
+        if fatura.transacao_id is not None:
+            raise ConflictError(message="Esta fatura já possui uma transação de pagamento.")
 
         # Valida transação
         transacao = (
@@ -254,29 +299,54 @@ class CartaoService:
                 select(Transacao).where(
                     Transacao.id == data.transacao_id,
                     Transacao.empresa_id == self._empresa_id,
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if not transacao:
             raise NotFoundError(message="Transação não encontrada para esta empresa.")
+
+        outra_fatura = (
+            await self._db.execute(
+                select(FaturaCartao.id).where(
+                    FaturaCartao.transacao_id == data.transacao_id,
+                    FaturaCartao.id != fatura_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if outra_fatura:
+            raise ConflictError(message="Esta transação já quitou outra fatura.")
+
+        total_lanc, valor_total = await self._totais_fatura(fatura_id)
+        if transacao.dc != "D":
+            raise ValidationError(
+                message="O pagamento da fatura deve ser uma transação de débito."
+            )
+        if _valor_monetario(transacao.valor) != _valor_monetario(valor_total):
+            raise ValidationError(
+                message=(
+                    "O valor da transação deve ser igual ao total da fatura "
+                    f"({float(valor_total):.2f})."
+                )
+            )
 
         fatura.transacao_id = data.transacao_id
         fatura.status = "paga"
         await self._db.flush()
         logger.info("fatura.paga", fatura_id=str(fatura_id), transacao_id=str(data.transacao_id))
 
-        total_lanc = await self._count_lancamentos(fatura_id)
-        return _fatura_to_response(fatura, cartao, total_lanc)
+        return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
 
     async def desassociar_transacao(
         self, cartao_id: UUID, fatura_id: UUID
     ) -> FaturaResponse:
-        fatura, cartao = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, cartao = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
         fatura.transacao_id = None
         fatura.status = "fechada"
         await self._db.flush()
-        total_lanc = await self._count_lancamentos(fatura_id)
-        return _fatura_to_response(fatura, cartao, total_lanc)
+        total_lanc, valor_total = await self._totais_fatura(fatura_id)
+        return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
 
     # ── Lançamentos ───────────────────────────────────────────────────────────
 
@@ -303,9 +373,13 @@ class CartaoService:
     async def adicionar_lancamento(
         self, cartao_id: UUID, fatura_id: UUID, data: LancamentoCreate
     ) -> LancamentoResponse:
-        fatura, _ = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, _ = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
         if fatura.status == "paga":
             raise ValidationError(message="Não é possível adicionar lançamentos a uma fatura paga.")
+
+        await self._validar_conta(data.conta_id)
 
         lanc = LancamentoCartao(
             id=uuid.uuid4(),
@@ -320,13 +394,14 @@ class CartaoService:
         )
         self._db.add(lanc)
         await self._db.flush()
-        await self._recalcular_total(fatura)
         return _lancamento_to_response(lanc)
 
     async def importar_csv(
         self, cartao_id: UUID, fatura_id: UUID, conteudo: bytes
     ) -> ImportCSVResponse:
-        fatura, _ = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, _ = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
         if fatura.status == "paga":
             raise ValidationError(message="Não é possível importar lançamentos em fatura paga.")
 
@@ -335,7 +410,19 @@ class CartaoService:
 
         # Aceita cabeçalhos em PT e EN, case-insensitive
         importados = 0
+        duplicados = 0
         erros: list[str] = []
+        ids_existentes = set(
+            (
+                await self._db.execute(
+                    select(LancamentoCartao.id).where(
+                        LancamentoCartao.fatura_id == fatura_id,
+                        LancamentoCartao.deleted_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+        ids_no_arquivo: set[UUID] = set()
 
         for i, row in enumerate(reader, start=2):
             linha_num = i
@@ -379,8 +466,17 @@ class CartaoService:
                     erros.append(f"Linha {linha_num}: valor deve ser positivo ({valor_raw}).")
                     continue
 
+                identificador = _identificador_compra(
+                    row_lower, data_compra, descricao, valor
+                )
+                lancamento_id = uuid.uuid5(fatura_id, identificador)
+                if lancamento_id in ids_existentes or lancamento_id in ids_no_arquivo:
+                    duplicados += 1
+                    continue
+                ids_no_arquivo.add(lancamento_id)
+
                 lanc = LancamentoCartao(
-                    id=uuid.uuid4(),
+                    id=lancamento_id,
                     empresa_id=self._empresa_id,
                     fatura_id=fatura_id,
                     data_compra=data_compra,
@@ -395,20 +491,24 @@ class CartaoService:
 
         if importados > 0:
             await self._db.flush()
-            await self._recalcular_total(fatura)
 
         logger.info(
             "fatura.csv_importado",
             fatura_id=str(fatura_id),
             importados=importados,
+            duplicados=duplicados,
             erros=len(erros),
         )
-        return ImportCSVResponse(importados=importados, erros=erros)
+        return ImportCSVResponse(
+            importados=importados, duplicados=duplicados, erros=erros
+        )
 
     async def remover_lancamento(
         self, cartao_id: UUID, fatura_id: UUID, lancamento_id: UUID
     ) -> None:
-        fatura, _ = await self._get_fatura_or_404(cartao_id, fatura_id)
+        fatura, _ = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
         if fatura.status == "paga":
             raise ValidationError(message="Não é possível remover lançamentos de uma fatura paga.")
 
@@ -426,7 +526,6 @@ class CartaoService:
 
         lanc.deleted_at = datetime.now(UTC)
         await self._db.flush()
-        await self._recalcular_total(fatura)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -445,51 +544,62 @@ class CartaoService:
         return c
 
     async def _get_fatura_or_404(
-        self, cartao_id: UUID, fatura_id: UUID
+        self, cartao_id: UUID, fatura_id: UUID, *, for_update: bool = False
     ) -> tuple[FaturaCartao, CartaoCredito]:
-        row = (
-            await self._db.execute(
-                select(FaturaCartao, CartaoCredito)
-                .join(CartaoCredito, CartaoCredito.id == FaturaCartao.cartao_id)
-                .where(
-                    FaturaCartao.id == fatura_id,
-                    FaturaCartao.cartao_id == cartao_id,
-                    FaturaCartao.empresa_id == self._empresa_id,
-                    FaturaCartao.deleted_at.is_(None),
-                )
+        stmt = (
+            select(FaturaCartao, CartaoCredito)
+            .join(CartaoCredito, CartaoCredito.id == FaturaCartao.cartao_id)
+            .where(
+                FaturaCartao.id == fatura_id,
+                FaturaCartao.cartao_id == cartao_id,
+                FaturaCartao.empresa_id == self._empresa_id,
+                FaturaCartao.deleted_at.is_(None),
             )
-        ).one_or_none()
+        )
+        if for_update:
+            stmt = stmt.with_for_update(of=FaturaCartao)
+        row = (await self._db.execute(stmt)).one_or_none()
         if not row:
             raise NotFoundError(message="Fatura não encontrada.")
         return row
 
-    async def _recalcular_total(self, fatura: FaturaCartao) -> None:
-        total = (
+    async def _totais_fatura(self, fatura_id: UUID) -> tuple[int, Decimal]:
+        total_lanc, valor_total = (
             await self._db.execute(
-                select(func.coalesce(func.sum(LancamentoCartao.valor), 0)).where(
-                    LancamentoCartao.fatura_id == fatura.id,
-                    LancamentoCartao.deleted_at.is_(None),
-                )
-            )
-        ).scalar_one()
-        fatura.valor_total = total
-        await self._db.flush()
-
-    async def _count_lancamentos(self, fatura_id: UUID) -> int:
-        return (
-            await self._db.execute(
-                select(func.count()).where(
+                select(
+                    func.count(LancamentoCartao.id),
+                    func.coalesce(func.sum(LancamentoCartao.valor), 0),
+                ).where(
                     LancamentoCartao.fatura_id == fatura_id,
                     LancamentoCartao.deleted_at.is_(None),
                 )
             )
-        ).scalar_one()
+        ).one()
+        return total_lanc, Decimal(valor_total)
+
+    async def _validar_conta(self, conta_id: UUID | None) -> None:
+        if conta_id is None:
+            return
+        existe = (
+            await self._db.execute(
+                select(PlanoConta.id).where(
+                    PlanoConta.id == conta_id,
+                    PlanoConta.empresa_id == self._empresa_id,
+                    PlanoConta.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if not existe:
+            raise NotFoundError(message="Conta contábil não encontrada para esta empresa.")
 
 
 # ── helpers de conversão ──────────────────────────────────────────────────────
 
 def _fatura_to_response(
-    f: FaturaCartao, c: CartaoCredito, total_lancamentos: int
+    f: FaturaCartao,
+    c: CartaoCredito,
+    total_lancamentos: int,
+    valor_total: Decimal,
 ) -> FaturaResponse:
     return FaturaResponse(
         id=f.id,
@@ -501,12 +611,49 @@ def _fatura_to_response(
         competencia=f.competencia,
         data_fechamento=f.data_fechamento,
         data_vencimento=f.data_vencimento,
-        valor_total=float(f.valor_total),
+        valor_total=float(valor_total),
         status=f.status,
         transacao_id=f.transacao_id,
         observacao=f.observacao,
         total_lancamentos=total_lancamentos,
     )
+
+
+def _valor_monetario(valor: object) -> Decimal:
+    return Decimal(str(valor)).quantize(Decimal("0.01"))
+
+
+def _identificador_compra(
+    row: dict[str, str], data_compra: datetime, descricao: str, valor: float
+) -> str:
+    id_externo = next(
+        (
+            row.get(campo, "").strip()
+            for campo in (
+                "id",
+                "identificador",
+                "transaction_id",
+                "transactionid",
+                "purchase_id",
+                "reference",
+                "referencia",
+            )
+            if row.get(campo, "").strip()
+        ),
+        None,
+    )
+    if id_externo:
+        base = f"externo:{id_externo}"
+    else:
+        descricao_normalizada = " ".join(descricao.casefold().split())
+        base = "|".join(
+            (
+                data_compra.astimezone(UTC).isoformat(),
+                descricao_normalizada,
+                str(_valor_monetario(valor)),
+            )
+        )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 def _lancamento_to_response(l: LancamentoCartao) -> LancamentoResponse:

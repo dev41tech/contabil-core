@@ -257,6 +257,40 @@ async def test_criar_com_transacao_de_outra_empresa_rejeita(
     assert r.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_criar_com_agencia_de_outra_empresa_rejeita(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA AGENCIA LTDA",
+        cnpj="38.896.497/0001-08",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+    agencia_outra = AgenciaBancaria(
+        empresa_id=outra.id,
+        banco_sigla="BB",
+        agencia="0001",
+        numero="54321",
+    )
+    db.add(agencia_outra)
+    await db.flush()
+
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id),
+        json={"valor_pago": 100, "agencia_id": str(agencia_outra.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 404
+
+
 # ── filtros ───────────────────────────────────────────────────────────────────
 
 

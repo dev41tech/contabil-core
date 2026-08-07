@@ -11,24 +11,31 @@ Provedores suportados:
 
 Mapeamento Pluggy → nosso modelo:
   item         → ConexaoBancaria
-  account      → AgenciaBancaria  (criada automaticamente na 1ª sync)
+  account      → ConexaoBancaria + AgenciaBancaria (criada na 1ª sync)
   transaction  → Transacao        (dedup via hash_dedup)
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import structlog
+from jose import JWTError, jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
-from src.core.errors import ConflictError, NotFoundError, ValidationError
+from src.core.errors import (
+    ConflictError,
+    NotFoundError,
+    PluggyUnavailableError,
+    ValidationError,
+)
 from src.db.models import AgenciaBancaria, ConexaoBancaria, Transacao
 from src.domain.openbanking.providers.base import IOpenBankingProvider
 from src.domain.openbanking.providers.mock import MockProvider
@@ -44,6 +51,10 @@ from src.schemas.openbanking import (
 
 logger = structlog.get_logger(__name__)
 
+_CONNECT_SESSION_TYPE = "openbanking_connect"
+_CONNECT_SESSION_TTL = timedelta(minutes=15)
+_JWT_ALGORITHM = "HS256"
+
 
 def _get_provider() -> tuple[IOpenBankingProvider, str]:
     """Retorna (provedor, nome_provedor) com base na configuração."""
@@ -56,7 +67,14 @@ def _get_provider() -> tuple[IOpenBankingProvider, str]:
             ),
             "pluggy",
         )
-    return MockProvider(), "mock"
+    if settings.is_development:
+        return MockProvider(), "mock"
+    raise PluggyUnavailableError(
+        message=(
+            "Open Banking não está configurado: defina PLUGGY_CLIENT_ID e "
+            "PLUGGY_CLIENT_SECRET. O provedor mock só é permitido em desenvolvimento."
+        )
+    )
 
 
 class OpenBankingService:
@@ -71,18 +89,23 @@ class OpenBankingService:
         self, item_id: str | None = None
     ) -> ConnectTokenResponse:
         """Cria token para o widget de autenticação bancária."""
-        settings = get_settings()
-        token = await self._provider.criar_connect_token(item_id)
+        connection_session, client_user_id = self._criar_sessao_conexao()
+        token = await self._provider.criar_connect_token(
+            item_id, client_user_id=client_user_id
+        )
         return ConnectTokenResponse(
             access_token=token,
+            connection_session=connection_session,
             provedor=self._provedor_nome,
-            mock_mode=not settings.pluggy_enabled,
+            mock_mode=self._provedor_nome == "mock",
         )
 
     # ── salvar conexão ────────────────────────────────────────────────────────
 
-    async def salvar_conexao(self, data: SalvarConexaoRequest) -> ConexaoResponse:
-        """Persiste a conexão após o widget retornar o item_id."""
+    async def salvar_conexao(self, data: SalvarConexaoRequest) -> ConexaoListResponse:
+        """Persiste todas as contas após validar item, sessão e empresa."""
+        client_user_id = self._validar_sessao_conexao(data.connection_session)
+
         # Evita duplicatas (mesmo item_id por empresa)
         existente = (
             await self._db.execute(
@@ -98,10 +121,19 @@ class OpenBankingService:
                 message="Esta conta já está conectada. Utilize 'Sincronizar' para atualizar."
             )
 
-        # Obtém info da conta no provedor
+        # Confirma no provedor que o item nasceu do token emitido para esta empresa.
         try:
+            item_valido = await self._provider.validar_item(
+                data.item_id, client_user_id
+            )
+            if not item_valido:
+                raise ValidationError(
+                    message="O item bancário não pertence a esta sessão de conexão."
+                )
             contas = await self._provider.obter_contas(data.item_id)
             nome_inst = await self._provider.obter_nome_instituicao(data.item_id)
+        except ValidationError:
+            raise
         except Exception as exc:
             raise ValidationError(
                 message=f"Não foi possível obter informações do banco: {exc}"
@@ -112,32 +144,44 @@ class OpenBankingService:
                 message="Nenhuma conta corrente/poupança encontrada para este item."
             )
 
-        conta = contas[0]  # usa a primeira conta não-crédito
-
-        conexao = ConexaoBancaria(
-            id=uuid.uuid4(),
-            empresa_id=self._empresa_id,
-            provedor=self._provedor_nome,
-            item_id=data.item_id,
-            account_id_externo=conta.account_id,
-            instituicao_nome=data.instituicao_nome or nome_inst,
-            instituicao_codigo=conta.instituicao_codigo,
-            banco_sigla=conta.banco_sigla,
-            agencia_numero=conta.agencia,
-            conta_numero=conta.numero,
-            status="ativa",
-        )
-        self._db.add(conexao)
+        conexoes = []
+        account_ids: set[str] = set()
+        for conta in contas:
+            if conta.account_id in account_ids:
+                continue
+            account_ids.add(conta.account_id)
+            conexao = ConexaoBancaria(
+                id=uuid.uuid4(),
+                empresa_id=self._empresa_id,
+                provedor=self._provedor_nome,
+                item_id=data.item_id,
+                account_id_externo=conta.account_id,
+                instituicao_nome=(
+                    data.instituicao_nome
+                    if self._provedor_nome == "mock" and data.instituicao_nome
+                    else nome_inst
+                ),
+                instituicao_codigo=conta.instituicao_codigo,
+                banco_sigla=conta.banco_sigla,
+                agencia_numero=conta.agencia,
+                conta_numero=conta.numero,
+                status="ativa",
+            )
+            self._db.add(conexao)
+            conexoes.append(conexao)
         await self._db.flush()
 
         logger.info(
             "openbanking.conexao_criada",
-            conexao_id=str(conexao.id),
             empresa_id=str(self._empresa_id),
-            banco=conta.banco_sigla,
+            item_id=data.item_id,
+            total_contas=len(conexoes),
             provedor=self._provedor_nome,
         )
-        return _to_response(conexao)
+        return ConexaoListResponse(
+            items=[_to_response(conexao) for conexao in conexoes],
+            total=len(conexoes),
+        )
 
     # ── listar ────────────────────────────────────────────────────────────────
 
@@ -255,12 +299,11 @@ class OpenBankingService:
     async def criar_reconnect_token(self, conexao_id: UUID) -> ConnectTokenResponse:
         """Token para re-autenticar uma conexão expirada."""
         conexao = await self._get_or_404(conexao_id)
-        settings = get_settings()
         token = await self._provider.criar_connect_token(conexao.item_id)
         return ConnectTokenResponse(
             access_token=token,
             provedor=self._provedor_nome,
-            mock_mode=not settings.pluggy_enabled,
+            mock_mode=self._provedor_nome == "mock",
         )
 
     # ── remover ───────────────────────────────────────────────────────────────
@@ -287,12 +330,62 @@ class OpenBankingService:
             raise NotFoundError(message="Conexão bancária não encontrada.")
         return c
 
+    def _criar_sessao_conexao(self) -> tuple[str, str]:
+        settings = get_settings()
+        now = datetime.now(UTC)
+        client_user_id = secrets.token_urlsafe(24)
+        token = jwt.encode(
+            {
+                "typ": _CONNECT_SESSION_TYPE,
+                "empresa_id": str(self._empresa_id),
+                "client_user_id": client_user_id,
+                "iat": now,
+                "exp": now + _CONNECT_SESSION_TTL,
+            },
+            settings.secret_key.get_secret_value(),
+            algorithm=_JWT_ALGORITHM,
+        )
+        return token, client_user_id
+
+    def _validar_sessao_conexao(self, token: str) -> str:
+        settings = get_settings()
+        try:
+            payload = jwt.decode(
+                token,
+                settings.secret_key.get_secret_value(),
+                algorithms=[_JWT_ALGORITHM],
+            )
+            empresa_id = payload.get("empresa_id")
+            client_user_id = payload.get("client_user_id")
+            tipo = payload.get("typ")
+            if (
+                tipo != _CONNECT_SESSION_TYPE
+                or not isinstance(empresa_id, str)
+                or not hmac.compare_digest(empresa_id, str(self._empresa_id))
+                or not isinstance(client_user_id, str)
+                or not client_user_id
+            ):
+                raise ValidationError(
+                    message="Sessão de conexão inválida para esta empresa."
+                )
+            return client_user_id
+        except ValidationError:
+            raise
+        except JWTError as exc:
+            raise ValidationError(
+                message="Sessão de conexão inválida ou expirada. Gere um novo token."
+            ) from exc
+
     async def _garantir_agencia(self, conexao: ConexaoBancaria) -> AgenciaBancaria:
         """Cria AgenciaBancaria se ainda não existe, e vincula à conexão."""
         if conexao.agencia_id:
             ag = (
                 await self._db.execute(
-                    select(AgenciaBancaria).where(AgenciaBancaria.id == conexao.agencia_id)
+                    select(AgenciaBancaria).where(
+                        AgenciaBancaria.id == conexao.agencia_id,
+                        AgenciaBancaria.empresa_id == self._empresa_id,
+                        AgenciaBancaria.deleted_at.is_(None),
+                    )
                 )
             ).scalar_one_or_none()
             if ag:

@@ -165,4 +165,5 @@ class LancamentoListResponse(BaseModel):
 
 class ImportCSVResponse(BaseModel):
     importados: int
+    duplicados: int = 0
     erros: list[str]

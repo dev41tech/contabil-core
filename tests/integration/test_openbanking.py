@@ -1,9 +1,8 @@
 """Testes de integração — Open Banking.
 
-Sem credenciais Pluggy o serviço cai no `MockProvider`, que é determinístico por
-`item_id` — é o que torna estes testes estáveis. O que realmente precisa estar
-certo é a deduplicação: sincronizar duas vezes o mesmo período não pode duplicar
-transação no extrato, senão a conciliação passa a ver movimento que não existiu.
+Em desenvolvimento, sem credenciais Pluggy, o serviço usa o `MockProvider`, que
+é determinístico por `item_id`. Em outros ambientes, a ausência de credenciais
+deve falhar explicitamente.
 """
 
 from __future__ import annotations
@@ -14,7 +13,11 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.errors import PluggyUnavailableError
 from src.db.models import Empresa, Tenant, Usuario
+from src.domain.openbanking import service as openbanking_service
+from src.domain.openbanking.providers.base import ContaInfo
+from src.domain.openbanking.providers.mock import MockProvider
 
 _ITEM_ID = "item_teste_openbanking_001"
 
@@ -33,13 +36,21 @@ def _url(empresa_id, sufixo: str = "") -> str:
 
 
 async def _conectar(client: AsyncClient, empresa: Empresa, csrf: str, item_id=_ITEM_ID) -> dict:
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+    assert token.status_code == 200, token.text
     r = await client.post(
         _url(empresa.id, "/conexoes"),
-        json={"item_id": item_id},
+        json={
+            "item_id": item_id,
+            "connection_session": token.json()["connection_session"],
+        },
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 201, r.text
-    return r.json()
+    assert r.json()["total"] >= 1
+    return r.json()["items"][0]
 
 
 # ── acesso ────────────────────────────────────────────────────────────────────
@@ -75,6 +86,7 @@ async def test_connect_token_indica_mock_sem_credenciais(
     assert body["provedor"] == "mock"
     assert body["mock_mode"] is True
     assert body["access_token"].startswith("mock_")
+    assert body["connection_session"]
 
 
 # ── salvar conexão ────────────────────────────────────────────────────────────
@@ -103,9 +115,16 @@ async def test_conectar_o_mesmo_item_duas_vezes_rejeita(
     csrf = await _login(client, tenant, usuario)
     await _conectar(client, empresa, csrf)
 
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+
     r = await client.post(
         _url(empresa.id, "/conexoes"),
-        json={"item_id": _ITEM_ID},
+        json={
+            "item_id": _ITEM_ID,
+            "connection_session": token.json()["connection_session"],
+        },
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 409
@@ -116,10 +135,150 @@ async def test_item_id_vazio_rejeita(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
     csrf = await _login(client, tenant, usuario)
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
     r = await client.post(
-        _url(empresa.id, "/conexoes"), json={"item_id": ""}, headers={"X-CSRF-Token": csrf}
+        _url(empresa.id, "/conexoes"),
+        json={
+            "item_id": "",
+            "connection_session": token.json()["connection_session"],
+        },
+        headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_callback_exige_sessao_emitida_pelo_servidor(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, "/conexoes"),
+        json={"item_id": _ITEM_ID},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sessao_de_uma_empresa_nao_pode_anexar_item_em_outra(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA OPEN BANKING LTDA",
+        cnpj="48.309.387/0001-04",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+    csrf = await _login(client, tenant, usuario)
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+
+    r = await client.post(
+        _url(outra.id, "/conexoes"),
+        json={
+            "item_id": _ITEM_ID,
+            "connection_session": token.json()["connection_session"],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_callback_rejeita_item_sem_vinculo_no_provedor(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    async def item_de_outra_sessao(
+        self: MockProvider, item_id: str, client_user_id: str
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(MockProvider, "validar_item", item_de_outra_sessao)
+    csrf = await _login(client, tenant, usuario)
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+    r = await client.post(
+        _url(empresa.id, "/conexoes"),
+        json={
+            "item_id": _ITEM_ID,
+            "connection_session": token.json()["connection_session"],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_salvar_conexao_representa_todas_as_contas_do_item(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    original = MockProvider.obter_contas
+
+    async def duas_contas(self: MockProvider, item_id: str) -> list[ContaInfo]:
+        contas = await original(self, item_id)
+        primeira = contas[0]
+        return [
+            primeira,
+            ContaInfo(
+                account_id=f"{primeira.account_id}_poupanca",
+                banco_sigla=primeira.banco_sigla,
+                instituicao_nome=primeira.instituicao_nome,
+                instituicao_codigo=primeira.instituicao_codigo,
+                agencia=primeira.agencia,
+                numero=f"{primeira.numero}-P",
+                tipo="SAVINGS",
+                saldo=1000,
+            ),
+        ]
+
+    monkeypatch.setattr(MockProvider, "obter_contas", duas_contas)
+    csrf = await _login(client, tenant, usuario)
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+    r = await client.post(
+        _url(empresa.id, "/conexoes"),
+        json={
+            "item_id": _ITEM_ID,
+            "connection_session": token.json()["connection_session"],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 201, r.text
+    assert r.json()["total"] == 2
+    assert len({item["conta_numero"] for item in r.json()["items"]}) == 2
+
+
+def test_mock_nao_e_permitido_fora_de_desenvolvimento(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class SettingsSemPluggy:
+        pluggy_enabled = False
+        is_development = False
+
+    monkeypatch.setattr(openbanking_service, "get_settings", lambda: SettingsSemPluggy())
+    with pytest.raises(PluggyUnavailableError):
+        openbanking_service._get_provider()
 
 
 @pytest.mark.asyncio

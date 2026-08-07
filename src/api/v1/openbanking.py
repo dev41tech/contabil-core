@@ -13,7 +13,6 @@ from src.domain.openbanking.service import OpenBankingService
 from src.schemas.openbanking import (
     ConnectTokenResponse,
     ConexaoListResponse,
-    ConexaoResponse,
     SalvarConexaoRequest,
     SincronizarRequest,
     SincronizarResponse,
@@ -55,15 +54,15 @@ async def criar_connect_token(
 
 @router.post(
     "/conexoes",
-    response_model=ConexaoResponse,
+    response_model=ConexaoListResponse,
     status_code=201,
     dependencies=[Depends(require_csrf)],
 )
 async def salvar_conexao(
     body: SalvarConexaoRequest,
     svc: OpenBankingService = Depends(_svc),
-) -> ConexaoResponse:
-    """Salva a conexão após o widget retornar o item_id."""
+) -> ConexaoListResponse:
+    """Salva todas as contas do item após validar a sessão do widget."""
     return await svc.salvar_conexao(body)
 
 

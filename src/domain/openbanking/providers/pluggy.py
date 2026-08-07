@@ -16,7 +16,7 @@ Fluxo de autenticação:
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import logging
 from datetime import UTC, date, datetime, timedelta
 
@@ -65,11 +65,17 @@ class PluggyProvider(IOpenBankingProvider):
 
     # ── interface ─────────────────────────────────────────────────────────────
 
-    async def criar_connect_token(self, item_id: str | None = None) -> str:
+    async def criar_connect_token(
+        self,
+        item_id: str | None = None,
+        client_user_id: str | None = None,
+    ) -> str:
         api_key = await self._get_api_key()
         body: dict = {}
         if item_id:
             body["itemId"] = item_id
+        if client_user_id:
+            body["clientUserId"] = client_user_id
 
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
@@ -80,6 +86,17 @@ class PluggyProvider(IOpenBankingProvider):
             r.raise_for_status()
 
         return r.json()["accessToken"]
+
+    async def validar_item(self, item_id: str, client_user_id: str) -> bool:
+        api_key = await self._get_api_key()
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{_BASE}/items/{item_id}",
+                headers=self._headers(api_key),
+            )
+            r.raise_for_status()
+        vinculo = r.json().get("clientUserId")
+        return isinstance(vinculo, str) and hmac.compare_digest(vinculo, client_user_id)
 
     async def obter_contas(self, item_id: str) -> list[ContaInfo]:
         api_key = await self._get_api_key()
