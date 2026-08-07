@@ -16,7 +16,15 @@ import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import AgenciaBancaria, Empresa, Tenant, Transacao, Usuario
+from src.db.models import (
+    AgenciaBancaria,
+    Empresa,
+    FaturaCartao,
+    PlanoConta,
+    Tenant,
+    Transacao,
+    Usuario,
+)
 
 
 async def _login(client: AsyncClient, tenant: Tenant, usuario: Usuario) -> str:
@@ -236,6 +244,7 @@ async def test_fatura_paga_nao_reabre(
     csrf = await _login(client, tenant, usuario)
     cartao = await _criar_cartao(client, empresa, csrf)
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
 
     await client.post(
         _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
@@ -261,6 +270,7 @@ async def test_associar_transacao_marca_como_paga(
     csrf = await _login(client, tenant, usuario)
     cartao = await _criar_cartao(client, empresa, csrf)
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
 
     r = await client.post(
         _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
@@ -279,6 +289,7 @@ async def test_desassociar_volta_para_fechada(
     csrf = await _login(client, tenant, usuario)
     cartao = await _criar_cartao(client, empresa, csrf)
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
 
     await client.post(
         _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
@@ -308,6 +319,98 @@ async def test_associar_transacao_inexistente_retorna_404(
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_status_paga_nao_pode_ser_definido_diretamente(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+
+    r = await client.patch(
+        _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}"),
+        json={"status": "paga"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_associar_exige_mesmo_valor_e_direcao_de_debito(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+    transacao: Transacao,
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 1)
+    url = _url(
+        empresa.id,
+        f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao",
+    )
+
+    r = await client.post(
+        url,
+        json={"transacao_id": str(transacao.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+    transacao.valor = 1
+    transacao.dc = "C"
+    await db.flush()
+    r = await client.post(
+        url,
+        json={"transacao_id": str(transacao.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_mesma_transacao_nao_quita_duas_faturas(
+    client: AsyncClient,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+    transacao: Transacao,
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura_a = await _criar_fatura(
+        client, empresa, cartao["id"], csrf, competencia="2026-03"
+    )
+    fatura_b = await _criar_fatura(
+        client, empresa, cartao["id"], csrf, competencia="2026-04"
+    )
+    for fatura in (fatura_a, fatura_b):
+        await _add_lancamento(
+            client, empresa, cartao["id"], fatura["id"], csrf, 2_500
+        )
+
+    payload = {"transacao_id": str(transacao.id)}
+    sufixo = f"/{cartao['id']}/faturas/{fatura_a['id']}/associar-transacao"
+    assert (
+        await client.post(
+            _url(empresa.id, sufixo),
+            json=payload,
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).status_code == 200
+    sufixo = f"/{cartao['id']}/faturas/{fatura_b['id']}/associar-transacao"
+    assert (
+        await client.post(
+            _url(empresa.id, sufixo),
+            json=payload,
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).status_code == 409
 
 
 # ── lançamentos e total da fatura ─────────────────────────────────────────────
@@ -363,6 +466,7 @@ async def test_fatura_paga_nao_aceita_lancamento_novo(
     csrf = await _login(client, tenant, usuario)
     cartao = await _criar_cartao(client, empresa, csrf)
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
     await client.post(
         _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
         json={"transacao_id": str(transacao.id)},
@@ -391,6 +495,69 @@ async def test_valor_de_lancamento_precisa_ser_positivo(
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_lancamento_rejeita_conta_contabil_de_outra_empresa(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA CONTA CARTAO LTDA",
+        cnpj="44.398.564/0001-35",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+    conta_outra = PlanoConta(
+        empresa_id=outra.id,
+        codigo="1.1.01",
+        descricao="Conta de outro cliente",
+        tipo="ativo",
+        tipo_sa="A",
+    )
+    db.add(conta_outra)
+    await db.flush()
+
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    r = await client.post(
+        _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/lancamentos"),
+        json={
+            "data_compra": "2026-03-05T00:00:00Z",
+            "descricao": "COMPRA",
+            "valor": 10,
+            "conta_id": str(conta_outra.id),
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_total_da_fatura_e_derivado_dos_lancamentos(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 123.45)
+    registro = await db.get(FaturaCartao, uuid.UUID(fatura["id"]))
+    assert registro is not None
+    registro.valor_total = 999_999
+    await db.flush()
+
+    faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
+    assert faturas["items"][0]["valor_total"] == 123.45
 
 
 # ── importação de CSV ─────────────────────────────────────────────────────────
@@ -448,6 +615,39 @@ async def test_importar_csv_aceita_cabecalho_em_ingles(
 
 
 @pytest.mark.asyncio
+async def test_reupload_do_mesmo_csv_nao_duplica_compras(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    csv_texto = (
+        "id,data_compra,descricao,valor\n"
+        "compra-externa-123,05/03/2026,POSTO IPIRANGA,200.00\n"
+    )
+
+    primeira = await _importar(
+        client, empresa, cartao["id"], fatura["id"], csrf, csv_texto
+    )
+    segunda = await _importar(
+        client, empresa, cartao["id"], fatura["id"], csrf, csv_texto
+    )
+    assert primeira["importados"] == 1
+    assert segunda["importados"] == 0
+    assert segunda["duplicados"] == 1
+
+    lancamentos = (
+        await client.get(
+            _url(
+                empresa.id,
+                f"/{cartao['id']}/faturas/{fatura['id']}/lancamentos",
+            )
+        )
+    ).json()
+    assert lancamentos["total"] == 1
+
+
+@pytest.mark.asyncio
 async def test_importar_csv_relata_linha_com_erro_sem_perder_as_boas(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
@@ -478,6 +678,7 @@ async def test_importar_csv_em_fatura_paga_rejeita(
     csrf = await _login(client, tenant, usuario)
     cartao = await _criar_cartao(client, empresa, csrf)
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
     await client.post(
         _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
         json={"transacao_id": str(transacao.id)},

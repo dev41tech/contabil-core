@@ -10,12 +10,18 @@ from pydantic import BaseModel, Field
 
 class ConnectTokenResponse(BaseModel):
     access_token: str
+    connection_session: str | None = None
     provedor: str       # "pluggy" | "mock"
     mock_mode: bool     # True = sem credenciais Pluggy, usar fluxo simplificado
 
 
 class SalvarConexaoRequest(BaseModel):
     item_id: str = Field(..., min_length=1, description="ID do item retornado pelo widget")
+    connection_session: str = Field(
+        ...,
+        min_length=1,
+        description="Sessão opaca retornada junto com o connect token",
+    )
     # Usado apenas no mock mode
     instituicao_nome: str | None = None
 
