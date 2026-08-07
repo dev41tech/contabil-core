@@ -362,10 +362,13 @@ class NotaFiscal(Base, TimestampMixin):
     transacao_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transacoes.id"), nullable=True
     )
-    chave_acesso: Mapped[str | None] = mapped_column(String(60), nullable=True, unique=True)
+    chave_acesso: Mapped[str | None] = mapped_column(String(44), nullable=True)
+    dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     __table_args__ = (
+        UniqueConstraint("empresa_id", "chave_acesso", name="uq_nota_empresa_chave"),
+        UniqueConstraint("empresa_id", "dedup_key", name="uq_nota_empresa_dedup"),
         Index("ix_nota_empresa_status", "empresa_id", "status"),
         Index("ix_nota_empresa_emissao", "empresa_id", "data_emissao"),
     )

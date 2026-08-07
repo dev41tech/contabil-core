@@ -38,6 +38,16 @@ class NotaFiscalCreate(BaseModel):
             raise ValueError("CNPJ deve ter 14 dígitos.")
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
 
+    @field_validator("chave_acesso", mode="before")
+    @classmethod
+    def valida_chave_acesso(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        digits = "".join(c for c in str(v) if c.isdigit())
+        if len(digits) != 44:
+            raise ValueError("Chave de acesso deve ter 44 dígitos.")
+        return digits
+
 
 class AssociarTransacaoRequest(BaseModel):
     transacao_id: UUID

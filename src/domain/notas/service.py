@@ -10,18 +10,23 @@ Responsabilidades:
 
 from __future__ import annotations
 
+import hashlib
+import re
 import zipfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import Decimal
 from io import BytesIO
 from uuid import UUID
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
-from src.db.models import NotaFiscal, Transacao
-from src.domain.notas.xml_parser import NotaParseada, parse_nota_xml
+from src.db.models import Empresa, NotaFiscal, Transacao
+from src.domain.notas.xml_parser import parse_nota_xml
 from src.schemas.notas import (
     AssociarTransacaoRequest,
     NotaFiscalCreate,
@@ -84,15 +89,16 @@ class NotaService:
         return NotaFiscalResponse.model_validate(nota)
 
     async def criar(self, data: NotaFiscalCreate) -> NotaFiscalResponse:
-        # Chave de acesso única (se informada)
-        if data.chave_acesso:
-            existing = await self._db.execute(
-                select(NotaFiscal).where(NotaFiscal.chave_acesso == data.chave_acesso)
+        chave_acesso = _normalizar_chave_acesso(data.chave_acesso)
+        dedup_key = _calcular_identidade_nota(data, chave_acesso)
+        existing = await self._db.execute(
+            select(NotaFiscal).where(
+                NotaFiscal.empresa_id == self._empresa_id,
+                NotaFiscal.dedup_key == dedup_key,
             )
-            if existing.scalar_one_or_none():
-                raise ConflictError(
-                    message=f"Nota com chave de acesso '{data.chave_acesso}' já importada."
-                )
+        )
+        if existing.scalar_one_or_none():
+            raise ConflictError(message="Esta nota fiscal já foi cadastrada nesta empresa.")
 
         nota = NotaFiscal(
             empresa_id=self._empresa_id,
@@ -104,11 +110,18 @@ class NotaService:
             cnpj_destinatario=data.cnpj_destinatario,
             valor=data.valor,
             data_emissao=data.data_emissao,
-            chave_acesso=data.chave_acesso,
+            chave_acesso=chave_acesso,
+            dedup_key=dedup_key,
             observacao=data.observacao,
         )
-        self._db.add(nota)
-        await self._db.flush()
+        try:
+            async with self._db.begin_nested():
+                self._db.add(nota)
+                await self._db.flush()
+        except IntegrityError as exc:
+            raise ConflictError(
+                message="Esta nota fiscal já foi cadastrada nesta empresa."
+            ) from exc
 
         logger.info(
             "nota.criada",
@@ -183,6 +196,25 @@ class NotaService:
             resultado.erros.append(f"{nome_arquivo}: {exc}")
             return resultado
 
+        empresa = (
+            await self._db.execute(
+                select(Empresa).where(Empresa.id == self._empresa_id)
+            )
+        ).scalar_one_or_none()
+        if empresa is None:
+            resultado.erros.append(f"{nome_arquivo}: empresa do contexto não encontrada.")
+            return resultado
+        cnpj_empresa = _somente_digitos(empresa.cnpj)
+        envolvidos = {
+            _somente_digitos(nota_parseada.cnpj_emitente),
+            _somente_digitos(nota_parseada.cnpj_destinatario),
+        }
+        if cnpj_empresa not in envolvidos:
+            resultado.erros.append(
+                f"{nome_arquivo}: CNPJ da empresa não consta como emitente nem destinatário."
+            )
+            return resultado
+
         try:
             await self.criar(
                 NotaFiscalCreate(
@@ -211,17 +243,24 @@ class NotaService:
         resultado = ImportXmlResult()
         try:
             with zipfile.ZipFile(BytesIO(conteudo)) as zf:
-                xml_entries = [
-                    name for name in zf.namelist()
-                    if name.lower().endswith(".xml")
-                ]
+                infos = zf.infolist()
+                erro_limite = _validar_zip(infos)
+                if erro_limite:
+                    resultado.erros.append(erro_limite)
+                    return resultado
+                xml_entries = [info for info in infos if info.filename.lower().endswith(".xml")]
                 if not xml_entries:
                     resultado.erros.append("ZIP não contém nenhum arquivo .xml.")
                     return resultado
 
-                for nome in xml_entries:
+                for info in xml_entries:
+                    nome = info.filename
                     try:
-                        xml_bytes = zf.read(nome)
+                        with zf.open(info) as entry:
+                            xml_bytes = entry.read(_MAX_XML_BYTES + 1)
+                        if len(xml_bytes) > _MAX_XML_BYTES:
+                            resultado.erros.append(f"{nome}: XML excede o limite de 10 MiB.")
+                            continue
                     except Exception as exc:
                         resultado.erros.append(f"{nome}: erro ao ler arquivo do ZIP: {exc}")
                         continue
@@ -248,3 +287,70 @@ class NotaService:
         if not nota:
             raise NotFoundError(message="Nota fiscal não encontrada.")
         return nota
+
+
+_MAX_ZIP_ENTRADAS = 1_000
+_MAX_ZIP_DESCOMPACTADO = 100 * 1024 * 1024
+_MAX_ZIP_RAZAO_COMPRESSAO = 100
+_MAX_XML_BYTES = 10 * 1024 * 1024
+
+
+def _validar_zip(infos: list[zipfile.ZipInfo]) -> str | None:
+    if len(infos) > _MAX_ZIP_ENTRADAS:
+        return f"ZIP excede o limite de {_MAX_ZIP_ENTRADAS} entradas."
+    if sum(info.file_size for info in infos) > _MAX_ZIP_DESCOMPACTADO:
+        return "ZIP excede o limite total descompactado de 100 MiB."
+    for info in infos:
+        if info.file_size > _MAX_XML_BYTES and info.filename.lower().endswith(".xml"):
+            return f"{info.filename}: XML excede o limite de 10 MiB."
+        if info.file_size and (
+            info.compress_size == 0
+            or info.file_size / info.compress_size > _MAX_ZIP_RAZAO_COMPRESSAO
+        ):
+            return f"{info.filename}: razão de compressão insegura."
+    return None
+
+
+def _somente_digitos(valor: str | None) -> str:
+    return re.sub(r"\D", "", valor or "")
+
+
+def _normalizar_chave_acesso(chave: str | None) -> str | None:
+    if chave is None:
+        return None
+    digits = _somente_digitos(chave)
+    if not re.fullmatch(r"\d{44}", digits):
+        raise ValidationError(message="Chave de acesso deve conter exatamente 44 dígitos.")
+    return digits
+
+
+def _calcular_identidade_nota(data: NotaFiscalCreate, chave_acesso: str | None) -> str:
+    if data.tipo == "nfe":
+        if not chave_acesso:
+            # Cadastro manual legado sem chave: ainda precisa ser idempotente.
+            origem = "|".join((
+                "nfe-sem-chave",
+                _somente_digitos(data.cnpj_emitente),
+                data.numero.strip(),
+                (data.serie or "").strip(),
+                str(Decimal(str(data.valor)).quantize(Decimal("0.01"))),
+                _data_utc(data.data_emissao).isoformat(),
+            ))
+        else:
+            origem = f"nfe|{chave_acesso}"
+    else:
+        origem = "|".join((
+            "nfse",
+            _somente_digitos(data.cnpj_emitente),
+            data.numero.strip(),
+            (data.serie or "").strip(),
+            str(Decimal(str(data.valor)).quantize(Decimal("0.01"))),
+            _data_utc(data.data_emissao).isoformat(),
+        ))
+    return hashlib.sha256(origem.encode("utf-8")).hexdigest()
+
+
+def _data_utc(data: datetime) -> datetime:
+    if data.tzinfo is None:
+        return data.replace(tzinfo=UTC)
+    return data.astimezone(UTC)

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from datetime import timezone
+from decimal import Decimal
 
-import pytest
-
-from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx
+from src.domain.extrato.ofx_parser import parse_ofx, parse_ofx_detalhado
 
 _OFX1_COMPLETO = """\
 OFXHEADER:100
@@ -75,7 +74,7 @@ def test_parse_ofx1_dois_registros():
 def test_parse_ofx1_credito():
     transacoes = parse_ofx(_OFX1_COMPLETO)
     cred = next(t for t in transacoes if t.fitid == "TX001")
-    assert cred.valor == 1500.00
+    assert cred.valor == Decimal("1500.00")
     assert cred.historico == "TED RECEBIDA CLIENTE"
     assert cred.tipo_ofx == "CREDIT"
     assert cred.data.tzinfo == timezone.utc
@@ -84,7 +83,7 @@ def test_parse_ofx1_credito():
 def test_parse_ofx1_debito():
     transacoes = parse_ofx(_OFX1_COMPLETO)
     deb = next(t for t in transacoes if t.fitid == "TX002")
-    assert deb.valor == -250.50
+    assert deb.valor == Decimal("-250.50")
     assert deb.historico == "BOLETO PAGO"
     assert deb.tipo_ofx == "DEBIT"
 
@@ -102,7 +101,7 @@ def test_parse_ofx2_xml():
     assert len(transacoes) == 1
     t = transacoes[0]
     assert t.fitid == "XML001"
-    assert t.valor == 999.99
+    assert t.valor == Decimal("999.99")
     assert t.historico == "DEPOSITO PIX"
 
 
@@ -143,11 +142,11 @@ def test_parse_ofx_valor_com_virgula():
     # Valor com vírgula deve ser convertido (vírgula → ponto)
     transacoes = parse_ofx(ofx)
     assert len(transacoes) == 1
-    assert transacoes[0].valor == 1500.00
+    assert transacoes[0].valor == Decimal("1500.00")
 
 
-def test_parse_ofx_registro_sem_fitid_ignorado():
-    """Bloco sem FITID deve ser silenciosamente ignorado."""
+def test_parse_ofx_registro_sem_fitid_reportado():
+    """Bloco sem FITID é rejeitado, mas nunca desaparece da contagem."""
     ofx = """\
 <OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
 <STMTTRN>
@@ -165,6 +164,17 @@ def test_parse_ofx_registro_sem_fitid_ignorado():
 </STMTTRN>
 </BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
 """
-    transacoes = parse_ofx(ofx)
-    assert len(transacoes) == 1
-    assert transacoes[0].fitid == "COM_FITID"
+    resultado = parse_ofx_detalhado(ofx)
+    assert resultado.total_blocos == 2
+    assert len(resultado.erros) == 1
+    assert "FITID" in resultado.erros[0]
+    assert resultado.transacoes[0].fitid == "COM_FITID"
+
+
+def test_parse_ofx_data_com_fracao_e_timezone():
+    ofx = _OFX_COM_TIMEZONE.replace(
+        "20240301120000[-3:BRT]", "20240301120000.125[-3:BRT]"
+    )
+    transacao = parse_ofx(ofx)[0]
+    assert transacao.data.microsecond == 125_000
+    assert transacao.data.utcoffset().total_seconds() == -3 * 3600

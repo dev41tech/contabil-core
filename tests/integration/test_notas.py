@@ -105,6 +105,42 @@ async def test_criar_nota_chave_duplicada_rejeita(client, tenant, usuario, empre
     assert r2.status_code == 409
 
 
+@pytest.mark.asyncio
+async def test_mesma_chave_pode_existir_em_empresas_diferentes(
+    client, db, tenant, usuario, empresa
+):
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA LTDA",
+        cnpj="98.765.432/0001-10",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+    csrf = await _login(client, tenant, usuario)
+    payload = {**_NOTA_PAYLOAD, "numero": "ESCOPO001", "chave_acesso": "9" * 44}
+
+    r1 = await client.post(_url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf})
+    r2 = await client.post(_url(outra.id), json=payload, headers={"X-CSRF-Token": csrf})
+
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_nfse_sem_chave_e_deduplicada_por_identidade_composta(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    payload = {**_NOTA_PAYLOAD, "tipo": "nfse", "numero": "NFSE-42"}
+
+    r1 = await client.post(_url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf})
+    r2 = await client.post(_url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf})
+
+    assert r1.status_code == 201
+    assert r2.status_code == 409
+
+
 # ── Listar
 
 

@@ -83,7 +83,7 @@ class PlanoContaUpdate(BaseModel):
         default=None,
         min_length=1,
         max_length=30,
-        description="Classificação/código. Editável (use com cuidado — quebra referências em regras).",
+        description="Classificação/código. Imutável após a criação.",
     )
     descricao: str | None = Field(default=None, min_length=2, max_length=300)
     tipo: str | None = None

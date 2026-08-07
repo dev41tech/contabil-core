@@ -119,6 +119,35 @@ async def test_importar_ofx_deduplicacao(client, tenant, usuario, empresa):
 
 
 @pytest.mark.asyncio
+async def test_fitid_repetido_no_mesmo_lote_e_deduplicado(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    repetido = _OFX_VALIDO.replace("<FITID>TX002", "<FITID>TX001")
+
+    r = await _importar(client, empresa, agencia["id"], csrf, repetido)
+
+    assert r.status_code == 201
+    assert r.json()["total_no_arquivo"] == 2
+    assert r.json()["importadas"] == 1
+    assert r.json()["duplicadas"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bloco_ofx_rejeitado_aparece_na_contagem_de_erros(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    invalido = "<STMTTRN><DTPOSTED>20240117<TRNAMT>10.00</STMTTRN>"
+    conteudo = _OFX_VALIDO.replace("</BANKTRANLIST>", invalido + "</BANKTRANLIST>")
+
+    r = await _importar(client, empresa, agencia["id"], csrf, conteudo)
+
+    assert r.status_code == 201
+    assert r.json()["total_no_arquivo"] == 3
+    assert r.json()["importadas"] == 2
+    assert r.json()["erros"] == 1
+
+
+@pytest.mark.asyncio
 async def test_importar_ofx_invalido_rejeita(client, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)

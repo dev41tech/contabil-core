@@ -126,6 +126,20 @@ async def test_dre_calcula_resultado_liquido(
 
 
 @pytest.mark.asyncio
+async def test_dre_preserva_movimento_de_conta_legada_removida(
+    client, db, tenant, usuario, empresa, contas, movimento
+):
+    contas["receita"].deleted_at = datetime.now(UTC)
+    await db.flush()
+    await _login(client, tenant, usuario)
+
+    r = await client.get(_url(empresa.id, "dre"))
+
+    receitas = next(grupo for grupo in r.json()["grupos"] if grupo["tipo"] == "receita")
+    assert receitas["total"] == 10_000
+
+
+@pytest.mark.asyncio
 async def test_dre_respeita_natureza_da_conta(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, movimento
 ):
