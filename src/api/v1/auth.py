@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import secrets
-from datetime import UTC, datetime, timedelta
-
-import structlog
-from fastapi import APIRouter, Cookie, Depends, Response
+from fastapi import APIRouter, Cookie, Depends, Request, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, require_auth
@@ -22,9 +19,6 @@ from src.db.models import Tenant, Usuario
 from src.db.session import get_db
 from src.domain.auth.service import AuthService
 from src.schemas.auth import LoginRequest, LoginResponse, MeResponse, RefreshResponse
-from sqlalchemy import select
-
-logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -70,10 +64,17 @@ def _clear_auth_cookies(response: Response) -> None:
 @router.post("/login", response_model=LoginResponse, status_code=200)
 async def login(
     body: LoginRequest,
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> LoginResponse:
     """Autentica o usuário e define cookies HttpOnly."""
+    client_ip = request.client.host if request.client else "unknown"
+    await request.app.state.login_rate_limiter.check(
+        ip=client_ip,
+        tenant_id=body.tenant_id,
+        identity=body.email,
+    )
     service = AuthService(db)
     access_token, refresh_token = await service.login(
         email=body.email,
@@ -136,7 +137,7 @@ async def buscar_tenant_por_cnpj(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Endpoint público: resolve CNPJ → tenant_id para a tela de login."""
-    result = await db.execute(select(Tenant).where(Tenant.cnpj == cnpj))
+    result = await db.execute(select(Tenant).where(Tenant.cnpj == cnpj, Tenant.ativo == True))
     tenant = result.scalar_one_or_none()
     if not tenant:
         from fastapi import HTTPException

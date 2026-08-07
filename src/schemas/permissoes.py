@@ -7,7 +7,22 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 MODULOS_VALIDOS = frozenset(
-    ["extrato", "regras", "notas", "comprovantes", "contabil", "exportacao", "*"]
+    [
+        "agencias",
+        "cartoes",
+        "comprovantes",
+        "contabil",
+        "exportacao",
+        "extrato",
+        "neo",
+        "notas",
+        "openbanking",
+        "plano_contas",
+        "regras",
+        "relatorios",
+        "stats",
+        "*",
+    ]
 )
 
 
@@ -17,7 +32,8 @@ class PermissaoCreate(BaseModel):
         default="*",
         description=(
             "Módulos separados por vírgula. '*' = acesso total. "
-            "Opções: extrato, regras, notas, comprovantes, contabil, exportacao"
+            "Opções: agencias, cartoes, comprovantes, contabil, exportacao, "
+            "extrato, neo, notas, openbanking, plano_contas, regras, relatorios, stats"
         ),
     )
 

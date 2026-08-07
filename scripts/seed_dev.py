@@ -3,22 +3,34 @@
 Cria um escritório + usuário admin + 3 empresas de exemplo.
 
 Uso:
-    python scripts/seed_dev.py
+    python scripts/seed_dev.py --i-know-what-im-doing
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import secrets
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.config import get_settings
 from src.core.security import hash_password
-from src.db.models import Base, Empresa, Tenant, Usuario
+from src.db.models import Empresa, Tenant, Usuario
 
 
-async def seed() -> None:
+async def seed(*, confirmed: bool = False) -> None:
     settings = get_settings()
+    if settings.environment not in {"development", "test"}:
+        raise SystemExit(
+            "Seed recusado: ENVIRONMENT deve ser development ou test."
+        )
+    if not confirmed:
+        raise SystemExit(
+            "Seed recusado: confirme o destino com --i-know-what-im-doing."
+        )
+
+    admin_password = secrets.token_urlsafe(18)
     engine = create_async_engine(str(settings.database_url), echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -37,7 +49,7 @@ async def seed() -> None:
             tenant_id=tenant.id,
             email="admin@41contabil.com.br",
             nome="Luiz Admin",
-            senha_hash=hash_password("Admin@123"),
+            senha_hash=hash_password(admin_password),
             role="admin",
         )
         db.add(admin)
@@ -69,15 +81,22 @@ async def seed() -> None:
         await db.commit()
 
         print(f"✅ Tenant criado: {tenant.id}")
-        print(f"✅ Admin: admin@41contabil.com.br / Admin@123")
+        print("✅ Admin: admin@41contabil.com.br")
         print(f"✅ {len(empresas)} empresas criadas")
         print(f"\n📋 Para fazer login use:")
         print(f'   tenant_id: "{tenant.id}"')
         print(f'   email: "admin@41contabil.com.br"')
-        print(f'   senha: "Admin@123"')
+        print(f'   senha: "{admin_password}"')
 
     await engine.dispose()
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    parser = argparse.ArgumentParser(description="Cria dados locais de desenvolvimento.")
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        action="store_true",
+        help="Confirma que DATABASE_URL aponta para um banco descartável.",
+    )
+    args = parser.parse_args()
+    asyncio.run(seed(confirmed=args.i_know_what_im_doing))

@@ -19,8 +19,10 @@ from src.api.middleware import (
     unhandled_error_handler,
 )
 from src.api.v1 import router as v1_router
+from src.api.v1.setup import router as setup_router
 from src.core.config import get_settings
 from src.core.logging import configure_logging
+from src.core.rate_limit import LoginRateLimiter
 from src.db.session import get_db
 
 _startup_logger = structlog.get_logger("startup")
@@ -89,6 +91,9 @@ async def _lifespan(app: FastAPI):
     """Eventos de ciclo de vida da aplicação."""
     _reset_stuck_processando()
     yield
+    rate_limiter = getattr(app.state, "login_rate_limiter", None)
+    if rate_limiter is not None:
+        await rate_limiter.close()
 
 
 def create_app() -> FastAPI:
@@ -107,6 +112,7 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json" if not settings.is_production else None,
         lifespan=_lifespan,
     )
+    app.state.login_rate_limiter = LoginRateLimiter(settings)
 
     # ── Middleware (ordem importa — primeiro registrado = mais externo)
     app.add_middleware(
@@ -125,6 +131,8 @@ def create_app() -> FastAPI:
 
     # ── Routers
     app.include_router(v1_router)
+    if settings.enable_setup_endpoint:
+        app.include_router(setup_router, prefix="/api/v1")
 
     @app.get("/api/health", tags=["infra"])
     async def health(response: Response, db: AsyncSession = Depends(get_db)) -> dict:

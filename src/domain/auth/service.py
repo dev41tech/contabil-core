@@ -8,7 +8,7 @@ Responsabilidades:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
@@ -23,9 +23,13 @@ from src.core.security import (
     decode_refresh_token,
     verify_password,
 )
-from src.db.models import RefreshToken, Usuario
+from src.db.models import RefreshToken, Tenant, Usuario
 
 logger = structlog.get_logger(__name__)
+
+# Hash bcrypt válido usado quando o e-mail/tenant não existe. Assim uma tentativa
+# inválida sempre paga o mesmo custo de bcrypt e não revela a existência do usuário.
+_DUMMY_PASSWORD_HASH = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6Ttx7EZ6YkYxja1o8dWfJwY8dQXgG"
 
 
 class AuthService:
@@ -39,15 +43,22 @@ class AuthService:
         Lança InvalidCredentialsError se credenciais inválidas.
         """
         result = await self._db.execute(
-            select(Usuario).where(
+            select(Usuario)
+            .join(Tenant, Tenant.id == Usuario.tenant_id)
+            .where(
                 Usuario.email == email.lower().strip(),
                 Usuario.tenant_id == tenant_id,
                 Usuario.ativo == True,
+                Tenant.ativo == True,
             )
         )
         user = result.scalar_one_or_none()
+        password_ok = verify_password(
+            senha,
+            user.senha_hash if user else _DUMMY_PASSWORD_HASH,
+        )
 
-        if not user or not verify_password(senha, user.senha_hash):
+        if not user or not password_ok:
             # Mesma mensagem independente do motivo — evita enumeração de usuários
             logger.warning("auth.login.failed", email=email, tenant_id=str(tenant_id))
             raise InvalidCredentialsError()
@@ -76,32 +87,37 @@ class AuthService:
         user_id = UUID(payload["sub"])
         tenant_id = UUID(payload["tenant_id"])
 
-        # Verifica se o refresh token existe e não foi revogado
+        # Consome o token em um único UPDATE condicional. Requisições concorrentes
+        # não conseguem observar e usar o mesmo token antes da revogação.
         result = await self._db.execute(
-            select(RefreshToken).where(
+            update(RefreshToken)
+            .where(
                 RefreshToken.jti == jti,
+                RefreshToken.usuario_id == user_id,
                 RefreshToken.revogado == False,
             )
+            .values(revogado=True)
+            .returning(RefreshToken.usuario_id)
         )
-        stored = result.scalar_one_or_none()
-        if not stored:
+        consumed_user_id = result.scalar_one_or_none()
+        if consumed_user_id is None:
             logger.warning("auth.refresh.invalid_or_revoked", jti=jti)
             raise InvalidTokenError(message="Refresh token inválido ou já utilizado.")
 
-        # Busca role atual do usuário
+        # Busca role atual e também invalida sessões de tenant desativado.
         result = await self._db.execute(
-            select(Usuario).where(Usuario.id == user_id, Usuario.ativo == True)
+            select(Usuario)
+            .join(Tenant, Tenant.id == Usuario.tenant_id)
+            .where(
+                Usuario.id == user_id,
+                Usuario.tenant_id == tenant_id,
+                Usuario.ativo == True,
+                Tenant.ativo == True,
+            )
         )
         user = result.scalar_one_or_none()
         if not user:
             raise InvalidTokenError(message="Usuário não encontrado.")
-
-        # Revoga o token atual (rotação — single use)
-        await self._db.execute(
-            update(RefreshToken)
-            .where(RefreshToken.jti == jti)
-            .values(revogado=True)
-        )
 
         new_access = create_access_token(user_id, tenant_id, user.role)
         new_refresh = create_refresh_token(user_id, tenant_id)
