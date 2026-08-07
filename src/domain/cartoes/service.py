@@ -195,7 +195,7 @@ class CartaoService:
     # ── Faturas ───────────────────────────────────────────────────────────────
 
     async def listar_faturas(self, cartao_id: UUID) -> FaturaListResponse:
-        await self._get_cartao_or_404(cartao_id)
+        cartao = await self._get_cartao_or_404(cartao_id)
         rows = (
             await self._db.execute(
                 select(

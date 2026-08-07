@@ -69,7 +69,7 @@ class MockProvider(IOpenBankingProvider):
         numero = str(rng.randint(10000, 99999)) + "-" + str(rng.randint(0, 9))
         return [
             ContaInfo(
-                account_id=f"mock_acc_{item_id[:8]}",
+                account_id=f"mock_acc_{hashlib.sha1(item_id.encode()).hexdigest()[:12]}",
                 banco_sigla=sigla,
                 instituicao_nome=nome,
                 instituicao_codigo=codigo,
