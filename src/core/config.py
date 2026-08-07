@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # para que a recusa venha daqui com JSON tipado, não do nginx em HTML.
     max_upload_mb: int = 25
 
+    # PDF bancário: processamento síncrono pesado e, opcionalmente, envio a IA.
+    pdf_max_pages: int = 25
+    pdf_parse_timeout_seconds: int = 60
+    pdf_max_ai_calls: int = 10
+    allow_financial_data_to_openai: bool = False
+
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024

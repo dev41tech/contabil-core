@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, UploadFile, File
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
@@ -47,12 +48,24 @@ async def importar_extrato(
     svc = _svc(empresa_id, db)
 
     if nome.endswith(".pdf"):
-        from src.domain.extrato.pdf_parser import PDFParseError, parse_pdf
+        from starlette.concurrency import run_in_threadpool
+
+        from src.core.config import get_settings
         from src.core.errors import ValidationError as AppValidationError
+        from src.domain.extrato.pdf_parser import PDFParseError, parse_pdf
+
         try:
-            transacoes_pdf = parse_pdf(conteudo_bytes)
+            timeout = get_settings().pdf_parse_timeout_seconds + 5
+            transacoes_pdf = await asyncio.wait_for(
+                run_in_threadpool(parse_pdf, conteudo_bytes),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            raise AppValidationError(
+                message="Processamento do PDF excedeu o tempo limite."
+            ) from None
         except PDFParseError as e:
-            raise AppValidationError(message=f"Arquivo PDF inválido: {e}")
+            raise AppValidationError(message=f"Arquivo PDF inválido: {e}") from e
         return await svc.importar_transacoes_raw(transacoes_pdf, agencia_id)
     else:
         # OFX (padrão)

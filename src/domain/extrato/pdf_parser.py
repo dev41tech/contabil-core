@@ -23,11 +23,14 @@ import hashlib
 import json
 import logging
 import re
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from io import BytesIO
 
-from src.domain.extrato.ofx_parser import TransacaoOFX
 from src.core.config import get_settings
+from src.domain.extrato.ofx_parser import TransacaoOFX
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,28 @@ except ImportError:
 
 class PDFParseError(Exception):
     pass
+
+
+@dataclass
+class _PDFBudget:
+    deadline: float
+    max_pages: int
+    ai_calls_restantes: int
+
+    def verificar_tempo(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise PDFParseError("Processamento do PDF excedeu o tempo limite.")
+
+    def consumir_chamada_ai(self) -> None:
+        self.verificar_tempo()
+        if self.ai_calls_restantes <= 0:
+            raise PDFParseError("PDF excedeu o limite de chamadas ao serviço de IA.")
+        self.ai_calls_restantes -= 1
+
+    @property
+    def timeout_restante(self) -> float:
+        self.verificar_tempo()
+        return max(1.0, min(30.0, self.deadline - time.monotonic()))
 
 
 # ──────────────────────────────────────────────────────────── helpers gerais
@@ -129,18 +154,26 @@ _SKIP_RE = re.compile(
 _AI_TEXT_MAX_CHARS = 80_000
 
 
-def _extrair_linhas_pdfplumber(conteudo_bytes: bytes) -> tuple[list[str], int]:
+def _extrair_linhas_pdfplumber(
+    conteudo_bytes: bytes, budget: _PDFBudget
+) -> tuple[list[str], int]:
     """Extrai todas as linhas de texto do PDF via pdfplumber.
 
     Retorna (linhas, total_chars). Se total_chars < 50 o PDF não tem camada de texto.
     """
     all_lines: list[str] = []
+    total_chars = 0
     with pdfplumber.open(BytesIO(conteudo_bytes)) as pdf:
         if not pdf.pages:
             raise PDFParseError("PDF sem páginas.")
-        total_chars = sum(len(p.extract_text() or "") for p in pdf.pages)
+        if len(pdf.pages) > budget.max_pages:
+            raise PDFParseError(
+                f"PDF excede o limite de {budget.max_pages} páginas."
+            )
         for page in pdf.pages:
+            budget.verificar_tempo()
             text = page.extract_text() or ""
+            total_chars += len(text)
             all_lines.extend(text.splitlines())
     return all_lines, total_chars
 
@@ -280,21 +313,21 @@ def _parse_ai_response(raw: str) -> list[dict]:
             return []
         return result
     except json.JSONDecodeError as e:
-        logger.warning("Falha ao parsear JSON da IA: %s | resposta: %.500s", e, raw)
+        logger.warning("Falha ao parsear JSON da IA: %s (resposta com %d chars)", e, len(raw))
         return []
 
 
 # ──────────────────────────────────────────────────────────── Camada 2: AI texto
 
-def _parse_por_ai_texto(linhas: list[str]) -> list[TransacaoOFX]:
+def _parse_por_ai_texto(linhas: list[str], budget: _PDFBudget) -> list[TransacaoOFX]:
     """Camada 2: envia o texto já extraído pelo pdfplumber ao GPT-4o-mini.
 
     Muito mais barato que Vision (~10× menos custo) porque não processa imagens.
     Usado quando o regex não reconhece o layout do banco (BB, Caixa, Sicoob, etc.).
     """
     settings = get_settings()
-    if not settings.openai_enabled:
-        logger.info("AI texto: OPENAI_API_KEY não configurada — pulando camada 2")
+    if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
+        logger.info("AI texto desabilitada para dados financeiros — pulando camada 2")
         return []
 
     texto = "\n".join(linhas)
@@ -306,6 +339,7 @@ def _parse_por_ai_texto(linhas: list[str]) -> list[TransacaoOFX]:
         texto = texto[:_AI_TEXT_MAX_CHARS]
 
     logger.info("AI texto: enviando %d chars para gpt-4o-mini", len(texto))
+    budget.consumir_chamada_ai()
 
     from openai import OpenAI
     client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
@@ -313,6 +347,7 @@ def _parse_por_ai_texto(linhas: list[str]) -> list[TransacaoOFX]:
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
+            timeout=budget.timeout_restante,
             max_tokens=4096,
             temperature=0,
             messages=[
@@ -325,7 +360,7 @@ def _parse_por_ai_texto(linhas: list[str]) -> list[TransacaoOFX]:
         return []
 
     raw = response.choices[0].message.content or ""
-    logger.info("AI texto raw response (primeiros 500 chars): %.500s", raw)
+    logger.info("AI texto: resposta recebida com %d chars", len(raw))
 
     items = _parse_ai_response(raw)
     transacoes: list[TransacaoOFX] = []
@@ -350,19 +385,20 @@ def _render_page_to_png(pdf_bytes: bytes, page_num: int, dpi: int = 150) -> byte
     return png_bytes
 
 
-def _ocr_page_with_openai(png_bytes: bytes) -> list[dict]:
+def _ocr_page_with_openai(png_bytes: bytes, budget: _PDFBudget) -> list[dict]:
     settings = get_settings()
-    if not settings.openai_enabled:
+    if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
         raise PDFParseError(
-            "OPENAI_API_KEY não configurada. "
-            "Adicione a chave no .env para processar PDFs de imagem (ex: extrato Itaú): "
-            "OPENAI_API_KEY=sk-..."
+            "OCR externo desabilitado. Configure consentimento explícito para enviar "
+            "dados financeiros ao provedor de IA."
         )
+    budget.consumir_chamada_ai()
     from openai import OpenAI
     client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
     img_b64 = base64.standard_b64encode(png_bytes).decode()
     response = client.chat.completions.create(
         model="gpt-4o",
+        timeout=budget.timeout_restante,
         max_tokens=4096,
         temperature=0,
         messages=[
@@ -374,23 +410,26 @@ def _ocr_page_with_openai(png_bytes: bytes) -> list[dict]:
         ],
     )
     raw = response.choices[0].message.content or ""
-    logger.info("OCR raw response (primeiros 500 chars): %.500s", raw)
+    logger.info("OCR: resposta recebida com %d chars", len(raw))
     return _parse_ai_response(raw)
 
 
-def _parse_por_ocr(conteudo_bytes: bytes) -> list[TransacaoOFX]:
+def _parse_por_ocr(conteudo_bytes: bytes, budget: _PDFBudget) -> list[TransacaoOFX]:
     if not _FITZ_AVAILABLE:
         raise PDFParseError("PyMuPDF não instalado. Execute: pip install pymupdf")
     doc = fitz.open(stream=conteudo_bytes, filetype="pdf")
     num_pages = doc.page_count
     doc.close()
+    if num_pages > budget.max_pages:
+        raise PDFParseError(f"PDF excede o limite de {budget.max_pages} páginas.")
     transacoes: list[TransacaoOFX] = []
     idx = 0
     for page_num in range(num_pages):
+        budget.verificar_tempo()
         logger.info("OCR: processando página %d/%d", page_num + 1, num_pages)
         try:
             png_bytes = _render_page_to_png(conteudo_bytes, page_num)
-            ocr_items = _ocr_page_with_openai(png_bytes)
+            ocr_items = _ocr_page_with_openai(png_bytes, budget)
         except PDFParseError:
             raise
         except Exception as e:
@@ -456,7 +495,7 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
             tipo_ofx="CREDIT" if valor >= 0 else "DEBIT",
         )
     except Exception as e:
-        logger.warning("IA: erro ao converter item %s: %s", item, e)
+        logger.warning("IA: item inválido descartado (%s)", type(e).__name__)
         return None
 
 
@@ -487,10 +526,17 @@ def parse_pdf(conteudo_bytes: bytes) -> list[TransacaoOFX]:
             "Execute: pip install pdfplumber pymupdf"
         )
 
+    settings = get_settings()
+    budget = _PDFBudget(
+        deadline=time.monotonic() + settings.pdf_parse_timeout_seconds,
+        max_pages=settings.pdf_max_pages,
+        ai_calls_restantes=settings.pdf_max_ai_calls,
+    )
+
     # ── Camadas 1 e 2: requerem pdfplumber ───────────────────────────────────
     if _PDFPLUMBER_AVAILABLE:
         try:
-            linhas, total_chars = _extrair_linhas_pdfplumber(conteudo_bytes)
+            linhas, total_chars = _extrair_linhas_pdfplumber(conteudo_bytes, budget)
         except PDFParseError:
             raise
         except Exception as e:
@@ -504,7 +550,11 @@ def parse_pdf(conteudo_bytes: bytes) -> list[TransacaoOFX]:
             referencia_ano = datetime.now(UTC).year
             transacoes = _parse_linhas_multipagina(linhas, referencia_ano)
             if transacoes:
-                logger.info("PDF parser: %d transações via pdfplumber regex (camada 1)", len(transacoes))
+                _validar_completude(linhas, transacoes)
+                logger.info(
+                    "PDF parser: %d transações via pdfplumber regex (camada 1)",
+                    len(transacoes),
+                )
                 return transacoes
 
             logger.info(
@@ -513,42 +563,86 @@ def parse_pdf(conteudo_bytes: bytes) -> list[TransacaoOFX]:
             )
 
             # ── Camada 2: AI texto ────────────────────────────────────────────
-            transacoes = _parse_por_ai_texto(linhas)
+            transacoes = _parse_por_ai_texto(linhas, budget)
             if transacoes:
+                _validar_completude(linhas, transacoes)
                 logger.info("PDF parser: %d transações via AI texto (camada 2)", len(transacoes))
                 return transacoes
 
-            logger.info(
-                "AI texto: 0 transações — pode ser layout complexo, "
-                "tentando OCR Vision (camada 3)"
-            )
+            logger.info("AI texto: 0 transações extraídas")
         else:
             logger.info(
                 "pdfplumber: PDF sem camada de texto (%d chars) — "
-                "indo direto para OCR Vision (camada 3)",
+                "extração verificável indisponível",
                 total_chars,
             )
 
-    # ── Camada 3: OCR Vision ──────────────────────────────────────────────────
-    if not _FITZ_AVAILABLE:
+    raise PDFParseError(
+        "Não foi possível obter uma extração com saldos/totais verificáveis; "
+        "nenhum lançamento foi importado."
+    )
+
+
+_VALOR_DECLARADO_RE = re.compile(
+    r"(?P<valor>-?\(?\d[\d.]*,\d{2}\)?)(?:\s*(?P<dc>[DC]))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _valor_declarado(linha: str) -> Decimal | None:
+    match = _VALOR_DECLARADO_RE.search(linha)
+    if not match:
+        return None
+    valor = _parse_valor(match.group("valor"))
+    if valor is None:
+        return None
+    decimal = Decimal(str(valor))
+    dc = (match.group("dc") or "").upper()
+    if dc == "D":
+        decimal = -abs(decimal)
+    elif dc == "C":
+        decimal = abs(decimal)
+    return decimal
+
+
+def _validar_completude(linhas: list[str], transacoes: list[TransacaoOFX]) -> None:
+    saldos_iniciais: list[Decimal] = []
+    saldos_finais: list[Decimal] = []
+    total_debitos: Decimal | None = None
+    total_creditos: Decimal | None = None
+    for linha in linhas:
+        normalizada = linha.upper()
+        valor = _valor_declarado(linha)
+        if valor is None:
+            continue
+        if "SALDO ANTERIOR" in normalizada or "SALDO INICIAL" in normalizada:
+            saldos_iniciais.append(valor)
+        elif "SALDO FINAL" in normalizada or "SALDO ATUAL" in normalizada:
+            saldos_finais.append(valor)
+        elif "TOTAL" in normalizada and ("DÉBIT" in normalizada or "DEBIT" in normalizada):
+            total_debitos = abs(valor)
+        elif "TOTAL" in normalizada and ("CRÉDIT" in normalizada or "CREDIT" in normalizada):
+            total_creditos = abs(valor)
+
+    valores = [Decimal(str(t.valor)) for t in transacoes]
+    tolerancia = Decimal("0.05")
+    validou = False
+    if saldos_iniciais and saldos_finais:
+        diferenca = saldos_finais[-1] - saldos_iniciais[0]
+        if abs(sum(valores, Decimal("0")) - diferenca) > tolerancia:
+            raise PDFParseError(
+                "Extração incompleta: lançamentos não reconciliam saldo inicial e final."
+            )
+        validou = True
+    if total_debitos is not None and total_creditos is not None:
+        debitos = sum((-v for v in valores if v < 0), Decimal("0"))
+        creditos = sum((v for v in valores if v > 0), Decimal("0"))
+        if abs(debitos - total_debitos) > tolerancia or abs(creditos - total_creditos) > tolerancia:
+            raise PDFParseError(
+                "Extração incompleta: lançamentos não reconciliam os totais declarados."
+            )
+        validou = True
+    if not validou:
         raise PDFParseError(
-            "PyMuPDF não instalado e nenhuma camada anterior funcionou. "
-            "Execute: pip install pymupdf"
+            "Não foi possível validar a completude: saldos ou totais declarados não encontrados."
         )
-
-    logger.info("PDF parser: usando OCR Vision GPT-4o (camada 3)")
-    try:
-        transacoes = _parse_por_ocr(conteudo_bytes)
-    except PDFParseError:
-        raise
-    except Exception as e:
-        raise PDFParseError(f"OCR Vision falhou: {e}") from e
-
-    if not transacoes:
-        raise PDFParseError(
-            "Nenhuma transação encontrada no PDF. "
-            "Verifique se o arquivo é um extrato bancário válido."
-        )
-
-    logger.info("PDF parser: %d transações via OCR Vision (camada 3)", len(transacoes))
-    return transacoes

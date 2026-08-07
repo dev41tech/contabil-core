@@ -95,7 +95,6 @@ class RelatoriosService:
         contas_q = select(PlanoConta).where(
             PlanoConta.empresa_id == self._empresa_id,
             PlanoConta.id.in_(list(totais.keys())),
-            PlanoConta.deleted_at.is_(None),
         )
         contas = {c.id: c for c in (await self._db.execute(contas_q)).scalars().all()}
 
@@ -185,10 +184,11 @@ class RelatoriosService:
                 totais[conta_id] = {"D": 0.0, "C": 0.0}
             totais[conta_id][dc] += float(total or 0)
 
-        # Inclui todas as contas da empresa — mesmo sem movimentação
+        # Inclui contas ativas mesmo sem movimento e contas removidas que ainda
+        # tenham histórico (dados legados anteriores ao bloqueio de remoção).
         contas_q = select(PlanoConta).where(
             PlanoConta.empresa_id == self._empresa_id,
-            PlanoConta.deleted_at.is_(None),
+            (PlanoConta.deleted_at.is_(None) | PlanoConta.id.in_(list(totais.keys()))),
         )
         contas = (await self._db.execute(contas_q)).scalars().all()
 

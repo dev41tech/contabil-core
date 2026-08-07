@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zipfile
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, UploadFile
@@ -152,24 +153,71 @@ def _parse_planilha(conteudo: bytes, nome: str) -> list[dict]:
 
 
 def _parse_xlsx(conteudo: bytes) -> list[dict]:
+    from io import BytesIO
+
+    from src.core.errors import ValidationError as AppValidationError
+
+    _validar_xlsx_compactado(conteudo)
     try:
         import openpyxl
-        from io import BytesIO
         wb = openpyxl.load_workbook(BytesIO(conteudo), read_only=True, data_only=True)
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
+        rows = ws.iter_rows(values_only=True)
+        primeira = next(rows, None)
     except Exception as e:
-        from src.core.errors import ValidationError as AppValidationError
         raise AppValidationError(message=f"Erro ao ler XLSX: {e}")
 
-    if not rows:
-        from src.core.errors import ValidationError as AppValidationError
+    if primeira is None:
+        wb.close()
         raise AppValidationError(message="Planilha vazia.")
 
-    # Detecta cabeçalho
-    header = [str(c).strip().lower() if c else "" for c in rows[0]]
-    data_rows = rows[1:]
-    return _rows_to_dicts(header, data_rows, start_line=2)
+    header = [str(c).strip().lower() if c else "" for c in primeira]
+    if len(header) > _MAX_XLSX_COLUNAS:
+        wb.close()
+        raise AppValidationError(
+            message=f"Planilha excede o limite de {_MAX_XLSX_COLUNAS} colunas."
+        )
+    try:
+        return _rows_to_dicts(
+            header,
+            rows,
+            start_line=2,
+            max_rows=_MAX_XLSX_LINHAS,
+            max_cells=_MAX_XLSX_CELULAS,
+        )
+    finally:
+        wb.close()
+
+
+_MAX_XLSX_ENTRADAS = 1_000
+_MAX_XLSX_DESCOMPACTADO = 100 * 1024 * 1024
+_MAX_XLSX_RAZAO_COMPRESSAO = 200
+_MAX_XLSX_LINHAS = 50_000
+_MAX_XLSX_COLUNAS = 100
+_MAX_XLSX_CELULAS = 500_000
+
+
+def _validar_xlsx_compactado(conteudo: bytes) -> None:
+    from io import BytesIO
+
+    from src.core.errors import ValidationError as AppValidationError
+
+    try:
+        with zipfile.ZipFile(BytesIO(conteudo)) as zf:
+            infos = zf.infolist()
+            if len(infos) > _MAX_XLSX_ENTRADAS:
+                raise AppValidationError(message="XLSX contém entradas internas demais.")
+            total = sum(info.file_size for info in infos)
+            if total > _MAX_XLSX_DESCOMPACTADO:
+                raise AppValidationError(message="XLSX excede o limite descompactado de 100 MiB.")
+            for info in infos:
+                if info.file_size and (
+                    info.compress_size == 0
+                    or info.file_size / info.compress_size > _MAX_XLSX_RAZAO_COMPRESSAO
+                ):
+                    raise AppValidationError(message="XLSX possui razão de compressão insegura.")
+    except zipfile.BadZipFile as exc:
+        raise AppValidationError(message=f"XLSX inválido: {exc}") from exc
 
 
 def _parse_csv(conteudo: bytes) -> list[dict]:
@@ -193,7 +241,13 @@ def _parse_csv(conteudo: bytes) -> list[dict]:
     return _rows_to_dicts(header, data_rows, start_line=2)
 
 
-def _rows_to_dicts(header: list[str], data_rows: list, start_line: int) -> list[dict]:
+def _rows_to_dicts(
+    header: list[str],
+    data_rows,
+    start_line: int,
+    max_rows: int | None = None,
+    max_cells: int | None = None,
+) -> list[dict]:
     # Normaliza nomes de coluna (aceita variantes)
     _alias = {
         "classificacao": "codigo", "classificação": "codigo",
@@ -206,6 +260,12 @@ def _rows_to_dicts(header: list[str], data_rows: list, start_line: int) -> list[
 
     result = []
     for i, row in enumerate(data_rows, start=start_line):
+        if max_rows is not None and i - start_line >= max_rows:
+            from src.core.errors import ValidationError as AppValidationError
+            raise AppValidationError(message=f"Planilha excede o limite de {max_rows} linhas.")
+        if max_cells is not None and (i - start_line + 1) * len(header) > max_cells:
+            from src.core.errors import ValidationError as AppValidationError
+            raise AppValidationError(message=f"Planilha excede o limite de {max_cells} células.")
         cells = [str(c).strip() if c is not None else "" for c in row]
         d = {normalized[j]: cells[j] for j in range(min(len(normalized), len(cells)))}
         # Preenche colunas ausentes
