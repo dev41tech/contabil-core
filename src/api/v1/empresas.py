@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import AuthContext, require_auth, require_csrf
+from src.api.deps import AuthContext, require_admin, require_auth, require_csrf
 from src.db.session import get_db
 from src.domain.empresas.service import EmpresaService
 from src.schemas.empresas import (
@@ -22,7 +22,12 @@ router = APIRouter(prefix="/empresas", tags=["empresas"])
 
 
 def _svc(ctx: AuthContext, db: AsyncSession) -> EmpresaService:
-    return EmpresaService(db=db, tenant_id=ctx.tenant_id)
+    return EmpresaService(
+        db=db,
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        role=ctx.role,
+    )
 
 
 @router.get("", response_model=EmpresaListResponse)
@@ -69,7 +74,7 @@ async def obter_empresa(
 @router.post("", response_model=EmpresaResponse, status_code=201, dependencies=[Depends(require_csrf)])
 async def criar_empresa(
     body: EmpresaCreate,
-    ctx: AuthContext = Depends(require_auth),
+    ctx: AuthContext = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> EmpresaResponse:
     return await _svc(ctx, db).criar(body)
@@ -79,7 +84,7 @@ async def criar_empresa(
 async def atualizar_empresa(
     empresa_id: UUID,
     body: EmpresaUpdate,
-    ctx: AuthContext = Depends(require_auth),
+    ctx: AuthContext = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> EmpresaResponse:
     return await _svc(ctx, db).atualizar(empresa_id, body)
@@ -88,7 +93,7 @@ async def atualizar_empresa(
 @router.delete("/{empresa_id}", status_code=204, dependencies=[Depends(require_csrf)])
 async def desativar_empresa(
     empresa_id: UUID,
-    ctx: AuthContext = Depends(require_auth),
+    ctx: AuthContext = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     await _svc(ctx, db).desativar(empresa_id)

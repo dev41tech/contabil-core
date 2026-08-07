@@ -17,7 +17,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.errors import ConflictError, NotFoundError, ValidationError
+from src.core.errors import ConflictError, NotFoundError
 from src.db.models import Empresa, Permissao, Usuario
 from src.schemas.permissoes import (
     PermissaoCreate,
@@ -40,11 +40,19 @@ class PermissaoService:
     # ── consultas ────────────────────────────────────────────────────────────
 
     async def listar(self) -> PermissaoListResponse:
+        await self._get_empresa_or_404()
         rows = (
             await self._db.execute(
                 select(Permissao, Usuario)
                 .join(Usuario, Usuario.id == Permissao.usuario_id)
-                .where(Permissao.empresa_id == self._empresa_id)
+                .join(Empresa, Empresa.id == Permissao.empresa_id)
+                .where(
+                    Permissao.empresa_id == self._empresa_id,
+                    Empresa.tenant_id == self._tenant_id,
+                    Empresa.ativa == True,
+                    Empresa.deleted_at == None,
+                    Usuario.tenant_id == self._tenant_id,
+                )
                 .order_by(Usuario.nome)
             )
         ).all()
@@ -66,6 +74,7 @@ class PermissaoService:
     # ── mutações ─────────────────────────────────────────────────────────────
 
     async def conceder(self, data: PermissaoCreate) -> PermissaoResponse:
+        await self._get_empresa_or_404()
         usuario = await self._get_usuario_or_404(data.usuario_id)
 
         # Verifica se já existe
@@ -144,9 +153,14 @@ class PermissaoService:
             await self._db.execute(
                 select(Permissao, Usuario)
                 .join(Usuario, Usuario.id == Permissao.usuario_id)
+                .join(Empresa, Empresa.id == Permissao.empresa_id)
                 .where(
                     Permissao.usuario_id == usuario_id,
                     Permissao.empresa_id == self._empresa_id,
+                    Empresa.tenant_id == self._tenant_id,
+                    Empresa.ativa == True,
+                    Empresa.deleted_at == None,
+                    Usuario.tenant_id == self._tenant_id,
                 )
             )
         ).one_or_none()
@@ -155,6 +169,21 @@ class PermissaoService:
                 message="Permissão não encontrada para este usuário/empresa."
             )
         return row
+
+    async def _get_empresa_or_404(self) -> Empresa:
+        empresa = (
+            await self._db.execute(
+                select(Empresa).where(
+                    Empresa.id == self._empresa_id,
+                    Empresa.tenant_id == self._tenant_id,
+                    Empresa.ativa == True,
+                    Empresa.deleted_at == None,
+                )
+            )
+        ).scalar_one_or_none()
+        if not empresa:
+            raise NotFoundError(message="Empresa não encontrada neste escritório.")
+        return empresa
 
     async def _get_usuario_or_404(self, usuario_id: UUID) -> Usuario:
         usuario = (
