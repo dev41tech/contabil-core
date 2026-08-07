@@ -148,6 +148,31 @@ async def test_stats_conciliados_mais_nao_conciliados_fecham_o_total(
 
 
 @pytest.mark.asyncio
+async def test_stats_ignora_transacao_soft_deleted_em_todas_as_agregacoes(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+    tres_transacoes_uma_conciliada,
+):
+    # A removida é justamente a única conciliada; nem o registro contábil ainda
+    # ligado a ela pode fazê-la reaparecer no resumo ou na agência.
+    tres_transacoes_uma_conciliada[0].deleted_at = datetime.now(UTC)
+    await db.flush()
+
+    await _login(client, tenant, usuario)
+    body = (await client.get(_url(empresa.id))).json()
+
+    assert body["resumo"]["total_transacoes"] == 2
+    assert body["resumo"]["total_conciliados"] == 0
+    assert body["resumo"]["total_nao_conciliados"] == 2
+    assert body["por_agencia"][0]["conciliados"] == 0
+    assert body["por_agencia"][0]["nao_conciliados"] == 2
+    assert sum(mes["transacoes"] for mes in body["mensal"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_stats_nao_conta_transacao_de_outra_empresa(
     client: AsyncClient,
     db: AsyncSession,

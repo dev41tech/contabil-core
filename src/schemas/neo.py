@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -29,7 +30,7 @@ class NeoDecisaoResponse(BaseModel):
     transacao_id: UUID
     transacao_descricao: str | None = None
     # Campos extras para popular os modais de ação manual
-    transacao_valor: float | None = None
+    transacao_valor: Decimal | None = None
     transacao_dc: str | None = None
     agencia_id: UUID | None = None
     regra_id: UUID | None

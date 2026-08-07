@@ -8,6 +8,7 @@ deve falhar explicitamente.
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 import pytest
 from httpx import AsyncClient
@@ -246,7 +247,7 @@ async def test_salvar_conexao_representa_todas_as_contas_do_item(
                 agencia=primeira.agencia,
                 numero=f"{primeira.numero}-P",
                 tipo="SAVINGS",
-                saldo=1000,
+                saldo=Decimal("1000.00"),
             ),
         ]
 
@@ -267,6 +268,38 @@ async def test_salvar_conexao_representa_todas_as_contas_do_item(
     assert r.status_code == 201, r.text
     assert r.json()["total"] == 2
     assert len({item["conta_numero"] for item in r.json()["items"]}) == 2
+
+
+@pytest.mark.asyncio
+async def test_erro_do_provedor_ao_validar_nao_vaza_detalhe_interno(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    segredo = "senha-interna-do-provedor"
+
+    async def falhar(self: MockProvider, item_id: str):
+        raise RuntimeError(segredo)
+
+    monkeypatch.setattr(MockProvider, "obter_contas", falhar)
+    csrf = await _login(client, tenant, usuario)
+    token = await client.post(
+        _url(empresa.id, "/connect-token"), headers={"X-CSRF-Token": csrf}
+    )
+    r = await client.post(
+        _url(empresa.id, "/conexoes"),
+        json={
+            "item_id": _ITEM_ID,
+            "connection_session": token.json()["connection_session"],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+    assert segredo not in r.text
+    assert "validar a conexão bancária" in r.text
 
 
 def test_mock_nao_e_permitido_fora_de_desenvolvimento(
@@ -323,6 +356,37 @@ async def test_sincronizar_importa_e_cria_agencia(
 
     agencias = (await client.get(f"/api/v1/empresas/{empresa.id}/agencias")).json()
     assert agencias["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_erro_do_provedor_ao_sincronizar_nao_vaza_no_cliente_nem_na_conexao(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    segredo = "token-secreto-na-stack-do-provedor"
+    csrf = await _login(client, tenant, usuario)
+    conexao = await _conectar(client, empresa, csrf)
+
+    async def falhar(self: MockProvider, account_id, data_inicio, data_fim):
+        raise RuntimeError(segredo)
+
+    monkeypatch.setattr(MockProvider, "obter_transacoes", falhar)
+    r = await client.post(
+        _url(empresa.id, f"/conexoes/{conexao['id']}/sincronizar"),
+        json={"dias": 30},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+    assert segredo not in r.text
+    assert "sincronizar as transações bancárias" in r.text
+
+    armazenada = (await client.get(_url(empresa.id, "/conexoes"))).json()["items"][0]
+    assert segredo not in armazenada["erro_msg"]
+    assert armazenada["erro_msg"] == "Falha temporária ao sincronizar transações."
 
 
 @pytest.mark.asyncio

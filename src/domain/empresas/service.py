@@ -13,6 +13,7 @@ from sqlalchemy.sql import Select
 from src.core.cnpj import valido as cnpj_valido
 from src.core.errors import ConflictError, EmpresaNaoEncontradaError
 from src.db.models import Empresa, Permissao
+from src.domain.auditoria import registrar_auditoria
 from src.schemas.empresas import (
     CnpjInvalidoListResponse,
     EmpresaCnpjInvalidoResponse,
@@ -151,12 +152,23 @@ class EmpresaService:
         )
         self._db.add(empresa)
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            usuario_id=self._user_id,
+            empresa_id=empresa.id,
+            acao="empresa.criada",
+            entidade="empresa",
+            entidade_id=empresa.id,
+            dados_depois=_snapshot_empresa(empresa),
+        )
 
         logger.info("empresa.criada", empresa_id=str(empresa.id), cnpj=empresa.cnpj)
         return EmpresaResponse.model_validate(empresa)
 
     async def atualizar(self, empresa_id: UUID, data: EmpresaUpdate) -> EmpresaResponse:
         empresa = await self._get_or_404(empresa_id)
+        antes = _snapshot_empresa(empresa)
 
         if data.razao_social is not None:
             empresa.razao_social = data.razao_social.strip()
@@ -164,13 +176,36 @@ class EmpresaService:
             empresa.regime_tributario = data.regime_tributario
 
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            usuario_id=self._user_id,
+            empresa_id=empresa.id,
+            acao="empresa.atualizada",
+            entidade="empresa",
+            entidade_id=empresa.id,
+            dados_antes=antes,
+            dados_depois=_snapshot_empresa(empresa),
+        )
         logger.info("empresa.atualizada", empresa_id=str(empresa_id))
         return EmpresaResponse.model_validate(empresa)
 
     async def desativar(self, empresa_id: UUID) -> None:
         empresa = await self._get_or_404(empresa_id)
+        antes = _snapshot_empresa(empresa)
         empresa.ativa = False
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            usuario_id=self._user_id,
+            empresa_id=empresa.id,
+            acao="empresa.desativada",
+            entidade="empresa",
+            entidade_id=empresa.id,
+            dados_antes=antes,
+            dados_depois=_snapshot_empresa(empresa),
+        )
         logger.info("empresa.desativada", empresa_id=str(empresa_id))
 
     async def _get_or_404(self, empresa_id: UUID) -> Empresa:
@@ -185,3 +220,12 @@ class EmpresaService:
         if not empresa:
             raise EmpresaNaoEncontradaError()
         return empresa
+
+
+def _snapshot_empresa(empresa: Empresa) -> dict[str, object]:
+    return {
+        "razao_social": empresa.razao_social,
+        "cnpj": empresa.cnpj,
+        "regime_tributario": empresa.regime_tributario,
+        "ativa": empresa.ativa,
+    }

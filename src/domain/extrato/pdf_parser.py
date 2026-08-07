@@ -26,7 +26,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 from src.core.config import get_settings
@@ -104,25 +104,25 @@ def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
     return None
 
 
-def _parse_valor(s: str) -> float | None:
+def _parse_valor(s: str) -> Decimal | None:
     s = s.strip().replace("R$", "").replace(" ", "").replace("\xa0", "")
     negative = s.startswith("-") or s.startswith("(")
     s = s.lstrip("-(").rstrip(")")
     if re.match(r"^\d{1,3}(,\d{3})*\.\d{2}$", s):
-        val = float(s.replace(",", ""))
+        val = Decimal(s.replace(",", ""))
     elif "," in s and "." in s:
-        val = float(s.replace(".", "").replace(",", "."))
+        val = Decimal(s.replace(".", "").replace(",", "."))
     elif "," in s:
-        val = float(s.replace(",", "."))
+        val = Decimal(s.replace(",", "."))
     else:
         try:
-            val = float(s)
-        except ValueError:
+            val = Decimal(s)
+        except InvalidOperation:
             return None
     return -val if negative else val
 
 
-def _gerar_fitid(data: datetime, historico: str, valor: float, idx: int) -> str:
+def _gerar_fitid(data: datetime, historico: str, valor: Decimal, idx: int) -> str:
     raw = f"{data.isoformat()}{historico}{valor}{idx}"
     return "PDF" + hashlib.md5(raw.encode()).hexdigest()[:12].upper()
 
@@ -249,7 +249,7 @@ def _parse_linhas_multipagina(
 
         # ── Valor ─────────────────────────────────────────────────────────────
         valor = _parse_valor(val_str)
-        if valor is None or abs(valor) < 0.001:
+        if valor is None or abs(valor) < Decimal("0.001"):
             continue
 
         fitid = _gerar_fitid(last_date, historico, valor, idx)
@@ -302,7 +302,7 @@ def _parse_ai_response(raw: str) -> list[dict]:
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     raw = re.sub(r"\s*```\s*$", "", raw).strip()
     try:
-        result = json.loads(raw)
+        result = json.loads(raw, parse_float=Decimal)
         if isinstance(result, dict):
             for key in ("transacoes", "transactions", "items", "data", "extrato"):
                 if key in result and isinstance(result[key], list):
@@ -476,8 +476,8 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
             return None
         try:
             valor_clean = valor_raw.replace("R$", "").replace(" ", "").replace("\xa0", "")
-            valor = float(valor_clean)
-        except (TypeError, ValueError):
+            valor = Decimal(valor_clean)
+        except (TypeError, InvalidOperation):
             valor = _parse_valor(valor_raw)
             if valor is None:
                 return None
@@ -596,7 +596,7 @@ def _valor_declarado(linha: str) -> Decimal | None:
     valor = _parse_valor(match.group("valor"))
     if valor is None:
         return None
-    decimal = Decimal(str(valor))
+    decimal = valor
     dc = (match.group("dc") or "").upper()
     if dc == "D":
         decimal = -abs(decimal)
@@ -624,7 +624,7 @@ def _validar_completude(linhas: list[str], transacoes: list[TransacaoOFX]) -> No
         elif "TOTAL" in normalizada and ("CRÉDIT" in normalizada or "CREDIT" in normalizada):
             total_creditos = abs(valor)
 
-    valores = [Decimal(str(t.valor)) for t in transacoes]
+    valores = [t.valor for t in transacoes]
     tolerancia = Decimal("0.05")
     validou = False
     if saldos_iniciais and saldos_finais:

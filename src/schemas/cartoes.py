@@ -5,9 +5,12 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
+
+from src.schemas.types import Competencia
 
 BANDEIRAS = ("visa", "mastercard", "elo", "amex", "hipercard", "outros")
 STATUS_FATURA = ("aberta", "fechada", "paga")
@@ -21,7 +24,7 @@ class CartaoCreate(BaseModel):
     ultimos_digitos: str | None = Field(default=None, min_length=4, max_length=4)
     dia_fechamento: int = Field(..., ge=1, le=28)
     dia_vencimento: int = Field(..., ge=1, le=28)
-    limite: float | None = Field(default=None, ge=0)
+    limite: Decimal | None = Field(default=None, ge=0)
 
     @field_validator("bandeira")
     @classmethod
@@ -46,7 +49,7 @@ class CartaoUpdate(BaseModel):
     nome: str | None = Field(default=None, min_length=2, max_length=200)
     dia_fechamento: int | None = Field(default=None, ge=1, le=28)
     dia_vencimento: int | None = Field(default=None, ge=1, le=28)
-    limite: float | None = None
+    limite: Decimal | None = None
     ativo: bool | None = None
 
 
@@ -58,10 +61,10 @@ class CartaoResponse(BaseModel):
     ultimos_digitos: str | None
     dia_fechamento: int
     dia_vencimento: int
-    limite: float | None
+    limite: Decimal | None
     ativo: bool
     total_faturas: int = 0
-    fatura_aberta_valor: float | None = None
+    fatura_aberta_valor: Decimal | None = None
 
     model_config = {"from_attributes": True}
 
@@ -74,11 +77,7 @@ class CartaoListResponse(BaseModel):
 # ── Fatura ────────────────────────────────────────────────────────────────────
 
 class FaturaCreate(BaseModel):
-    competencia: str = Field(
-        ...,
-        pattern=r"^\d{4}-\d{2}$",
-        description="Mês de competência. Ex: 2024-03",
-    )
+    competencia: Competencia = Field(description="Mês de competência. Ex: 2024-03")
     data_fechamento: datetime | None = None
     data_vencimento: datetime | None = None
     observacao: str | None = Field(default=None, max_length=500)
@@ -113,7 +112,7 @@ class FaturaResponse(BaseModel):
     competencia: str
     data_fechamento: datetime | None
     data_vencimento: datetime | None
-    valor_total: float
+    valor_total: Decimal
     status: str
     transacao_id: UUID | None
     observacao: str | None
@@ -132,7 +131,7 @@ class FaturaListResponse(BaseModel):
 class LancamentoCreate(BaseModel):
     data_compra: datetime
     descricao: str = Field(..., min_length=1, max_length=500)
-    valor: float = Field(..., gt=0)
+    valor: Decimal = Field(..., gt=0)
     conta_id: UUID | None = None
     parcela_atual: int | None = Field(default=None, ge=1)
     parcela_total: int | None = Field(default=None, ge=1)
@@ -149,7 +148,7 @@ class LancamentoResponse(BaseModel):
     empresa_id: UUID
     data_compra: datetime
     descricao: str
-    valor: float
+    valor: Decimal
     conta_id: UUID | None
     parcela_atual: int | None
     parcela_total: int | None
@@ -160,7 +159,7 @@ class LancamentoResponse(BaseModel):
 class LancamentoListResponse(BaseModel):
     items: list[LancamentoResponse]
     total: int
-    valor_total: float
+    valor_total: Decimal
 
 
 class ImportCSVResponse(BaseModel):

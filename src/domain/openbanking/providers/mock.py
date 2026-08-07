@@ -13,6 +13,7 @@ import hashlib
 import random
 import secrets
 from datetime import date, timedelta
+from decimal import Decimal
 
 from src.domain.openbanking.providers.base import (
     ContaInfo,
@@ -76,7 +77,7 @@ class MockProvider(IOpenBankingProvider):
                 agencia=agencia,
                 numero=numero,
                 tipo="CHECKING",
-                saldo=round(rng.uniform(5_000, 200_000), 2),
+                saldo=Decimal(rng.randint(500_000, 20_000_000)) / Decimal("100"),
             )
         ]
 
@@ -94,7 +95,7 @@ class MockProvider(IOpenBankingProvider):
                 dc = "D" if rng.random() < 0.65 else "C"
                 historicos = _HISTORICOS_DEBITO if dc == "D" else _HISTORICOS_CREDITO
                 historico = rng.choice(historicos)
-                valor = round(rng.uniform(50, 15_000), 2)
+                valor = Decimal(rng.randint(5_000, 1_500_000)) / Decimal("100")
 
                 id_ext = hashlib.md5(
                     f"{account_id}{cur}{i}".encode()

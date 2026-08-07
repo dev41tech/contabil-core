@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -13,11 +14,11 @@ class ComprovanteCreate(BaseModel):
     cpf_cnpj: str | None = None
     data_pagamento: datetime | None = None
     data_vencimento: datetime | None = None
-    valor_documento: float | None = None
-    valor_pago: float = Field(..., gt=0)
-    juros: float = Field(default=0, ge=0)
-    multa: float = Field(default=0, ge=0)
-    desconto: float = Field(default=0, ge=0)
+    valor_documento: Decimal | None = None
+    valor_pago: Decimal = Field(..., gt=0)
+    juros: Decimal = Field(default=Decimal("0.00"), ge=0)
+    multa: Decimal = Field(default=Decimal("0.00"), ge=0)
+    desconto: Decimal = Field(default=Decimal("0.00"), ge=0)
     observacao: str | None = None
     agencia_id: UUID | None = None
     transacao_id: UUID | None = None
@@ -34,11 +35,11 @@ class ComprovanteResponse(BaseModel):
     cpf_cnpj: str | None
     data_pagamento: datetime | None
     data_vencimento: datetime | None
-    valor_documento: float | None
-    valor_pago: float
-    juros: float
-    multa: float
-    desconto: float
+    valor_documento: Decimal | None
+    valor_pago: Decimal
+    juros: Decimal
+    multa: Decimal
+    desconto: Decimal
     observacao: str | None
     arquivo_nome: str | None
     tem_arquivo: bool = False

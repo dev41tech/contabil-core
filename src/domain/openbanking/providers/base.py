@@ -8,6 +8,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 
 @dataclass
@@ -20,7 +21,7 @@ class ContaInfo:
     agencia: str | None
     numero: str | None
     tipo: str  # "CHECKING" | "SAVINGS" | "CREDIT"
-    saldo: float | None
+    saldo: Decimal | None
 
 
 @dataclass
@@ -28,7 +29,7 @@ class TransacaoInfo:
     """Dados de uma transação bancária retornados pelo provedor."""
     id_externo: str      # ID único no provedor (usado para dedup)
     data: date
-    valor: float         # sempre positivo
+    valor: Decimal       # sempre positivo
     dc: str              # "D" ou "C"
     descricao: str
     categoria: str | None

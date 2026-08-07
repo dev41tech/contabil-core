@@ -566,7 +566,10 @@ async def obter_resumo(
             "fornecedores_adiantados":   sum(1 for f in fornecedores if f.status_pagamento == "ADIANTADO"),
             "fornecedores_sem_movimento": sum(1 for f in fornecedores if f.status_pagamento == "SEM_MOVIMENTO"),
             "fornecedores_com_divergencia": sum(1 for f in fornecedores if f.divergencia_calculo),
-            "valor_total_a_pagar":       float(sum(f.valor_a_pagar or 0 for f in fornecedores)),
+            "valor_total_a_pagar":       sum(
+                (f.valor_a_pagar or Decimal("0.00") for f in fornecedores),
+                Decimal("0.00"),
+            ),
         },
     }
 
@@ -599,10 +602,10 @@ async def listar_fornecedores(
             "codigo_conta":     f.codigo_conta,
             "conta_contabil":   f.conta_contabil,
             "nome_fornecedor":  f.nome_fornecedor,
-            "total_credito":    float(f.total_credito or 0),
-            "total_debito":     float(f.total_debito or 0),
-            "saldo_final":      float(f.saldo_final or 0),
-            "valor_a_pagar":    float(f.valor_a_pagar or 0),
+            "total_credito":    f.total_credito or Decimal("0.00"),
+            "total_debito":     f.total_debito or Decimal("0.00"),
+            "saldo_final":      f.saldo_final or Decimal("0.00"),
+            "valor_a_pagar":    f.valor_a_pagar or Decimal("0.00"),
             "status_pagamento": f.status_pagamento,
             "qtd_nfs_pendentes": f.qtd_nfs_pendentes,
             "qtd_nfs_parciais":  f.qtd_nfs_parciais,
@@ -650,11 +653,11 @@ async def obter_fornecedor_detalhado(
             "conta_contabil":     fornecedor.conta_contabil,
             "nome_fornecedor":    fornecedor.nome_fornecedor,
             "cnpj":               fornecedor.cnpj,
-            "saldo_anterior":     float(fornecedor.saldo_anterior or 0),
-            "total_credito":      float(fornecedor.total_credito or 0),
-            "total_debito":       float(fornecedor.total_debito or 0),
-            "saldo_final":        float(fornecedor.saldo_final or 0),
-            "valor_a_pagar":      float(fornecedor.valor_a_pagar or 0),
+            "saldo_anterior":     fornecedor.saldo_anterior or Decimal("0.00"),
+            "total_credito":      fornecedor.total_credito or Decimal("0.00"),
+            "total_debito":       fornecedor.total_debito or Decimal("0.00"),
+            "saldo_final":        fornecedor.saldo_final or Decimal("0.00"),
+            "valor_a_pagar":      fornecedor.valor_a_pagar or Decimal("0.00"),
             "status_pagamento":   fornecedor.status_pagamento,
             "divergencia_calculo": fornecedor.divergencia_calculo,
             "divergencia_motivo":  fornecedor.mensagem_erro,
@@ -665,9 +668,9 @@ async def obter_fornecedor_detalhado(
                 "data_lancamento":  c.data_lancamento.isoformat() if c.data_lancamento else None,
                 "numero_nf":        c.numero_nf,
                 "historico":        c.historico,
-                "valor_total":      float(c.valor_credito or 0),
-                "valor_pago_parcial": float(c.valor_pago_parcial or 0),
-                "valor_saldo":      float(c.valor_saldo or 0),
+                "valor_total":      c.valor_credito or Decimal("0.00"),
+                "valor_pago_parcial": c.valor_pago_parcial or Decimal("0.00"),
+                "valor_saldo":      c.valor_saldo or Decimal("0.00"),
                 "status_pagamento": c.status_pagamento,
             }
             for c in compras_pendentes
@@ -679,9 +682,9 @@ async def obter_fornecedor_detalhado(
                 "lote":          l.lote,
                 "historico":     l.historico,
                 "tipo_operacao": l.tipo_operacao,
-                "valor_debito":  float(l.valor_debito or 0),
-                "valor_credito": float(l.valor_credito or 0),
-                "saldo_apos":    float(l.saldo_apos_lancamento or 0),
+                "valor_debito":  l.valor_debito or Decimal("0.00"),
+                "valor_credito": l.valor_credito or Decimal("0.00"),
+                "saldo_apos":    l.saldo_apos_lancamento or Decimal("0.00"),
             }
             for l in lancamentos
         ],
@@ -742,8 +745,8 @@ async def conciliacao_fifo_detalhada(
             pags_por_nf[compra.id].append({
                 "data_pagamento": pag.data_lancamento.isoformat() if pag.data_lancamento else None,
                 "historico": pag.historico,
-                "valor_pago": float(aplicado),
-                "saldo_restante": float(saldo[compra.id]),
+                "valor_pago": aplicado,
+                "saldo_restante": saldo[compra.id],
             })
 
     result = []
@@ -753,10 +756,10 @@ async def conciliacao_fifo_detalhada(
             "numero_nf":       compra.numero_nf or "—",
             "data_lancamento": compra.data_lancamento.isoformat() if compra.data_lancamento else None,
             "historico":       compra.historico,
-            "valor_total":     float(compra.valor_credito or 0),
-            "valor_pago":      float(compra.valor_pago_parcial or 0),
+            "valor_total":     compra.valor_credito or Decimal("0.00"),
+            "valor_pago":      compra.valor_pago_parcial or Decimal("0.00"),
             "data_pagamento":  pags[-1]["data_pagamento"] if pags else None,
-            "valor_saldo":     float(compra.valor_saldo or 0),
+            "valor_saldo":     compra.valor_saldo or Decimal("0.00"),
             "status":          compra.status_pagamento or "PENDENTE",
             "pagamentos":      pags,
         })
@@ -788,7 +791,7 @@ async def listar_divergencias(
             "tipo":          d.tipo,
             "severidade":    d.severidade,
             "descricao":     d.descricao,
-            "diferenca":     float(d.diferenca or 0),
+            "diferenca":     d.diferenca or Decimal("0.00"),
             "created_at":    d.created_at.isoformat() if d.created_at else None,
         }
         for d in divergencias
@@ -854,9 +857,9 @@ async def exportar_excel(
         ws.cell(row=row, column=2,  value=_celula_texto_segura(f.conta_contabil))
         ws.cell(row=row, column=3,  value=_celula_texto_segura(f.nome_fornecedor))
         ws.cell(row=row, column=4,  value=_celula_texto_segura(f.cnpj))
-        ws.cell(row=row, column=5,  value=float(f.total_credito or 0))
-        ws.cell(row=row, column=6,  value=float(f.total_debito or 0))
-        ws.cell(row=row, column=7,  value=float(f.valor_a_pagar or 0))
+        ws.cell(row=row, column=5,  value=f.total_credito or Decimal("0.00"))
+        ws.cell(row=row, column=6,  value=f.total_debito or Decimal("0.00"))
+        ws.cell(row=row, column=7,  value=f.valor_a_pagar or Decimal("0.00"))
         ws.cell(row=row, column=8,  value=_celula_texto_segura(f.status_pagamento))
         ws.cell(row=row, column=9,  value=f.qtd_nfs_pendentes)
         ws.cell(row=row, column=10, value="Sim" if f.divergencia_calculo else "Não")

@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import logging
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
@@ -124,7 +125,7 @@ class PluggyProvider(IOpenBankingProvider):
                     agencia=bank_data.get("transferNumber", "").split("/")[0] if "/" in bank_data.get("transferNumber", "") else None,
                     numero=bank_data.get("transferNumber", "").split("/")[-1] if bank_data.get("transferNumber") else acc.get("number"),
                     tipo=tipo,
-                    saldo=acc.get("balance"),
+                    saldo=_decimal_api(acc["balance"]) if acc.get("balance") is not None else None,
                 )
             )
         return contas
@@ -172,8 +173,18 @@ class PluggyProvider(IOpenBankingProvider):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _decimal_api(value: object) -> Decimal:
+    try:
+        decimal = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError("Transação bancária retornou valor inválido.") from exc
+    if not decimal.is_finite():
+        raise ValueError("Transação bancária retornou valor inválido.")
+    return decimal
+
+
 def _map_transacao(t: dict) -> TransacaoInfo:
-    amount = float(t.get("amount", 0))
+    amount = _decimal_api(t.get("amount", 0))
     tipo = t.get("type", "DEBIT")
     dc = "C" if tipo == "CREDIT" or amount > 0 else "D"
     return TransacaoInfo(

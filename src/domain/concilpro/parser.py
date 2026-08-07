@@ -1124,8 +1124,8 @@ def _construir_fornecedor_de_ia(dados_ia: dict, linhas: List[str]) -> Optional[D
 
     print(
         f"✅ IA parseou bloco: {len(lancamentos)} lançamentos, "
-        f"débito={float(dados_ia.get('total_debito') or 0):.2f}, "
-        f"crédito={float(dados_ia.get('total_credito') or 0):.2f}, "
+        f"débito={_ia_decimal(dados_ia.get('total_debito')):.2f}, "
+        f"crédito={_ia_decimal(dados_ia.get('total_credito')):.2f}, "
         f"conciliação: {len(conciliacao_ia)} NFs, "
         f"saldo_confere={validacao_ia.get('saldo_confere', '?')}"
     )
@@ -1233,7 +1233,7 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
 
     def _tem_valores(lancamentos: list) -> bool:
         return any(
-            float(l.get("valor_credito") or 0) + float(l.get("valor_debito") or 0) > 0
+            _ia_decimal(l.get("valor_credito")) + _ia_decimal(l.get("valor_debito")) > 0
             for l in lancamentos
         )
 

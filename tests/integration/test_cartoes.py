@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -25,6 +26,10 @@ from src.db.models import (
     Transacao,
     Usuario,
 )
+
+
+def _money(value: object) -> Decimal:
+    return Decimal(str(value))
 
 
 async def _login(client: AsyncClient, tenant: Tenant, usuario: Usuario) -> str:
@@ -225,6 +230,27 @@ async def test_competencia_fora_do_formato_rejeita(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("competencia", ["2026-00", "2026-13", "2026-99"])
+async def test_competencia_com_mes_invalido_rejeita(
+    competencia: str,
+    client: AsyncClient,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id, f"/{cartao['id']}/faturas"),
+        json={"competencia": competencia},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_fatura_nasce_aberta_e_zerada(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
@@ -233,7 +259,7 @@ async def test_fatura_nasce_aberta_e_zerada(
     fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
 
     assert fatura["status"] == "aberta"
-    assert fatura["valor_total"] == 0
+    assert _money(fatura["valor_total"]) == Decimal("0.00")
     assert fatura["total_lancamentos"] == 0
 
 
@@ -431,10 +457,10 @@ async def test_total_da_fatura_acompanha_os_lancamentos(
         await client.get(_url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/lancamentos"))
     ).json()
     assert body["total"] == 2
-    assert body["valor_total"] == 500
+    assert _money(body["valor_total"]) == Decimal("500.00")
 
     faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
-    assert faturas["items"][0]["valor_total"] == 500
+    assert _money(faturas["items"][0]["valor_total"]) == Decimal("500.00")
 
 
 @pytest.mark.asyncio
@@ -455,7 +481,7 @@ async def test_remover_lancamento_recalcula_o_total(
     assert r.status_code == 204
 
     faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
-    assert faturas["items"][0]["valor_total"] == 200
+    assert _money(faturas["items"][0]["valor_total"]) == Decimal("200.00")
 
 
 @pytest.mark.asyncio
@@ -557,7 +583,7 @@ async def test_total_da_fatura_e_derivado_dos_lancamentos(
     await db.flush()
 
     faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
-    assert faturas["items"][0]["valor_total"] == 123.45
+    assert _money(faturas["items"][0]["valor_total"]) == Decimal("123.45")
 
 
 # ── importação de CSV ─────────────────────────────────────────────────────────
@@ -596,7 +622,7 @@ async def test_importar_csv_em_formato_brasileiro(
     assert body["erros"] == []
 
     faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
-    assert faturas["items"][0]["valor_total"] == 1_500
+    assert _money(faturas["items"][0]["valor_total"]) == Decimal("1500.00")
 
 
 @pytest.mark.asyncio

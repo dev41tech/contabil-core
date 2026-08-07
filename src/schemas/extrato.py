@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -13,7 +14,7 @@ class TransacaoResponse(BaseModel):
     empresa_id: UUID
     agencia_id: UUID
     data: datetime
-    valor: float
+    valor: Decimal
     historico: str
     dc: str
     status: str
