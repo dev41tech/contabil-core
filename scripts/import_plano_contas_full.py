@@ -1,27 +1,20 @@
 #!/usr/bin/env python
-"""
-Importa o Plano de Contas COMPLETO do MrContador para cada empresa.
+"""Importa o plano de contas completo do MrContador para cada empresa.
 
-O script anterior (import_mrcont.py) so criou PlanoConta para contas
-referenciadas nas regras CSV. Este script completa o plano de contas
-importando TODAS as contas do arquivo JSON extraido do MrContador.
-
-Entrada: C:/Users/nathan.carvalho/Downloads/mrcont_plano_contas.json
-  (gerado pelo script de extracao via browser)
-
-Execucao:
-    cd C:/Users/nathan.carvalho/Documents/contabil-core
-    .venv/Scripts/python scripts/import_plano_contas_full.py
+Por segurança, a execução padrão é dry-run. Para persistir as inclusões é
+necessário informar as duas flags ``--aplicar --confirmar-escrita``.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -33,174 +26,257 @@ from sqlalchemy.orm import sessionmaker
 from src.db.models import Empresa, PlanoConta
 
 DATABASE_URL = "postgresql+asyncpg://contabil:contabil@localhost:5435/contabil_dev"
-JSON_PATH    = Path("C:/Users/nathan.carvalho/Downloads/mrcont_plano_contas.json")
+JSON_PATH = Path("C:/Users/nathan.carvalho/Downloads/mrcont_plano_contas.json")
+FUZZY_THRESHOLD = 0.75
+FUZZY_MIN_MARGIN = 0.10
 
-# ─── helpers ────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="explicita o modo padrão: apenas mostra o que seria incluído",
+    )
+    parser.add_argument(
+        "--aplicar",
+        action="store_true",
+        help="habilita inclusões; exige também --confirmar-escrita",
+    )
+    parser.add_argument(
+        "--confirmar-escrita",
+        action="store_true",
+        help="segunda confirmação explícita para gravar no banco",
+    )
+    args = parser.parse_args()
+    if args.dry_run and (args.aplicar or args.confirmar_escrita):
+        parser.error("--dry-run não pode ser combinado com flags de escrita")
+    if args.aplicar != args.confirmar_escrita:
+        parser.error("para gravar, informe juntas: --aplicar --confirmar-escrita")
+    return args
+
 
 def _normalize(name: str) -> str:
     name = name.upper()
     name = re.sub(r"[^A-Z0-9 ]", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _normalize_cnpj(value: object) -> str | None:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits if len(digits) == 14 else None
+
+
+def _jaccard(left: str, right: str) -> float:
+    left_words = set(left.split())
+    right_words = set(right.split())
+    union = left_words | right_words
+    return len(left_words & right_words) / len(union) if union else 0.0
+
+
+def _indexar_mrcontador(data: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **info,
+            "nome": nome,
+            "nome_normalizado": _normalize(nome),
+            "cnpj_fornecido": bool(str(info.get("cnpj") or "").strip()),
+            "cnpj_normalizado": _normalize_cnpj(info.get("cnpj")),
+        }
+        for nome, info in data.items()
+    ]
+
+
+def _casar_empresa(
+    razao_social: str,
+    cnpj: object,
+    candidatos: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    """Casa por CNPJ ou, sem CNPJ disponível no candidato, por nome inequívoco."""
+    cnpj_normalizado = _normalize_cnpj(cnpj)
+    cnpj_fornecido = bool(str(cnpj or "").strip())
+    elegiveis = candidatos
+
+    if cnpj_fornecido:
+        if cnpj_normalizado is None:
+            return None, "CNPJ da empresa inválido; fallback fuzzy bloqueado"
+        por_cnpj = [c for c in candidatos if c["cnpj_normalizado"] == cnpj_normalizado]
+        if len(por_cnpj) == 1:
+            return por_cnpj[0], "CNPJ"
+        if len(por_cnpj) > 1:
+            return None, f"CNPJ duplicado no JSON ({len(por_cnpj)} candidatos)"
+
+        elegiveis = [c for c in candidatos if not c["cnpj_fornecido"]]
+        if not elegiveis:
+            return None, "CNPJ sem correspondência; fallback fuzzy bloqueado"
+
+    nome_normalizado = _normalize(razao_social)
+    por_nome = [c for c in elegiveis if c["nome_normalizado"] == nome_normalizado]
+    if len(por_nome) == 1:
+        return por_nome[0], "nome exato (sem CNPJ comparável)"
+    if len(por_nome) > 1:
+        return None, f"nome exato ambíguo ({len(por_nome)} candidatos)"
+
+    pontuados = sorted(
+        (
+            (_jaccard(nome_normalizado, candidato["nome_normalizado"]), candidato)
+            for candidato in elegiveis
+        ),
+        key=lambda item: (-item[0], item[1]["nome_normalizado"], item[1]["nome"]),
+    )
+    if not pontuados or pontuados[0][0] < FUZZY_THRESHOLD:
+        melhor = pontuados[0][0] if pontuados else 0.0
+        return None, f"melhor similaridade insuficiente ({melhor:.2f})"
+
+    melhor_score, melhor = pontuados[0]
+    segundo_score = pontuados[1][0] if len(pontuados) > 1 else 0.0
+    margem = melhor_score - segundo_score
+    if len(pontuados) > 1 and margem < FUZZY_MIN_MARGIN:
+        return None, (
+            f"fuzzy ambíguo (melhor={melhor_score:.2f}, "
+            f"segundo={segundo_score:.2f}, margem={margem:.2f})"
+        )
+    return melhor, f"fuzzy (score={melhor_score:.2f}, margem={margem:.2f})"
 
 
 def _guess_tipo(classificacao: str) -> str:
     try:
-        d = str(int(classificacao.split(".")[0]))[0]
-        return {"1": "ativo", "2": "passivo", "3": "patrimonio_liquido",
-                "4": "receita", "5": "despesa", "6": "custo"}.get(d, "despesa")
+        first_digit = str(int(classificacao.split(".")[0]))[0]
+        return {
+            "1": "ativo",
+            "2": "passivo",
+            "3": "patrimonio_liquido",
+            "4": "receita",
+            "5": "despesa",
+            "6": "custo",
+        }.get(first_digit, "despesa")
     except Exception:
         return "despesa"
 
 
-# ─── main ────────────────────────────────────────────────────────────────────
-
 async def importar_empresa(
     session: AsyncSession,
     empresa: Empresa,
-    mrc_contas: list[dict],
-) -> dict:
-    """Cria PlanoConta para todas as contas MrContador que ainda nao existem."""
+    contas_mrc: list[dict[str, Any]],
+    aplicar: bool,
+) -> dict[str, int]:
+    """Calcula e, somente no modo de aplicação, inclui as contas inexistentes."""
+    class_counter = Counter(conta["classificacao"] for conta in contas_mrc)
+    duplicadas = {codigo for codigo, quantidade in class_counter.items() if quantidade > 1}
 
-    # Detecta classificacoes duplicadas no MrContador (dados com colisao)
-    class_counter: Counter = Counter(c["classificacao"] for c in mrc_contas)
-    dup_classificacoes: set[str] = {k for k, v in class_counter.items() if v > 1}
-
-    # Carrega codigos ja existentes no banco para esta empresa
-    res = await session.execute(
+    result = await session.execute(
         select(PlanoConta.codigo).where(
             PlanoConta.empresa_id == empresa.id,
             PlanoConta.deleted_at.is_(None),
         )
     )
-    existing_codigos: set[str] = {row[0] for row in res.all()}
+    codigos_existentes = {row[0] for row in result.all()}
 
-    criadas  = 0
-    puladas  = 0  # ja existia
-    colisoes = 0  # classificacao duplicada no MrContador
+    criadas = 0
+    puladas = 0
+    colisoes = 0
+    codigos_processados = set(codigos_existentes)
 
-    # Rastreia classificacoes ja inseridas nesta execucao (evita duplicata dentro do loop)
-    inserted_classificacoes: set[str] = set(existing_codigos)
-
-    for c in mrc_contas:
-        classificacao = c["classificacao"]
-        descricao     = c["descricao"] or f"Conta {c['conta']}"
-        tipo_sa       = c["tipo"]   # S ou A
-        tipo          = _guess_tipo(classificacao)
-        conta_num     = str(c["conta"])
-
-        # Classificacao duplicada no MrContador: usa codigo numerico como fallback
-        if classificacao in dup_classificacoes:
-            codigo_usar = conta_num
+    for conta in contas_mrc:
+        classificacao = conta["classificacao"]
+        conta_numero = str(conta["conta"])
+        if classificacao in duplicadas:
+            codigo = conta_numero
             colisoes += 1
         else:
-            codigo_usar = classificacao
+            codigo = classificacao
 
-        # Ja existe no banco? Pula
-        if codigo_usar in inserted_classificacoes:
+        if codigo in codigos_processados:
             puladas += 1
             continue
 
-        pc = PlanoConta(
-            empresa_id = empresa.id,
-            codigo     = codigo_usar,
-            descricao  = descricao,
-            tipo       = tipo,
-            tipo_sa    = tipo_sa,
-        )
-        session.add(pc)
-        inserted_classificacoes.add(codigo_usar)
+        if aplicar:
+            session.add(
+                PlanoConta(
+                    empresa_id=empresa.id,
+                    codigo=codigo,
+                    descricao=conta["descricao"] or f"Conta {conta['conta']}",
+                    tipo=_guess_tipo(classificacao),
+                    tipo_sa=conta["tipo"],
+                )
+            )
+        codigos_processados.add(codigo)
         criadas += 1
 
-    await session.flush()
+    if aplicar:
+        await session.flush()
     return {"criadas": criadas, "puladas": puladas, "colisoes": colisoes}
 
 
-async def main() -> None:
-    print("=" * 65)
-    print("  Importacao Plano de Contas Completo - MrContador -> Contabil Core")
-    print("=" * 65)
+async def main(aplicar: bool = False) -> None:
+    modo = "APLICAÇÃO" if aplicar else "DRY-RUN (nenhuma alteração será gravada)"
+    print("=" * 70)
+    print("  Importação Plano de Contas Completo - MrContador -> Contábil Core")
+    print(f"  Modo: {modo}")
+    print("=" * 70)
 
-    with open(JSON_PATH, encoding="utf-8") as f:
-        mrc_data: dict = json.load(f)
-
-    # Indice normalizado do MrContador
-    mrc_by_norm: dict[str, tuple[str, dict]] = {}
-    for nome, info in mrc_data.items():
-        mrc_by_norm[_normalize(nome)] = (nome, info)
+    with JSON_PATH.open(encoding="utf-8") as arquivo:
+        mrc_data: dict[str, dict[str, Any]] = json.load(arquivo)
+    candidatos = _indexar_mrcontador(mrc_data)
 
     engine = create_async_engine(DATABASE_URL, echo=False)
-    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(
-            select(Empresa).where(Empresa.deleted_at.is_(None))
-        )
-        empresas = res.scalars().all()
+    async with async_session() as session:
+        result = await session.execute(select(Empresa).where(Empresa.deleted_at.is_(None)))
+        empresas = result.scalars().all()
 
     print(f"\nEmpresas no banco : {len(empresas)}")
     print(f"Empresas no JSON  : {len(mrc_data)}\n")
 
     totais = {"matched": 0, "sem_match": 0, "criadas": 0, "puladas": 0, "colisoes": 0}
-    sem_match: list[str] = []
+    sem_match: list[tuple[str, str]] = []
 
-    for empresa in sorted(empresas, key=lambda e: e.razao_social):
-        norm = _normalize(empresa.razao_social)
-        match = mrc_by_norm.get(norm)
-
-        # Fuzzy fallback
-        if not match:
-            best_score, best_entry = 0.0, None
-            words_db = set(norm.split())
-            for mrc_norm, entry in mrc_by_norm.items():
-                words_mrc = set(mrc_norm.split())
-                inter = words_db & words_mrc
-                union = words_db | words_mrc
-                score = len(inter) / len(union) if union else 0
-                if score > best_score:
-                    best_score, best_entry = score, entry
-            if best_score >= 0.75:
-                match = best_entry
-
-        if not match:
-            sem_match.append(empresa.razao_social)
+    for empresa in sorted(empresas, key=lambda item: item.razao_social):
+        mrc_info, criterio = _casar_empresa(empresa.razao_social, empresa.cnpj, candidatos)
+        if mrc_info is None:
+            sem_match.append((empresa.razao_social, criterio))
             totais["sem_match"] += 1
             continue
 
-        mrc_nome, mrc_info = match
-        mrc_contas = mrc_info.get("contas", [])
+        contas_mrc = mrc_info.get("contas", [])
         totais["matched"] += 1
 
-        async with AsyncSessionLocal() as session:
+        async with async_session() as session:
             async with session.begin():
-                r = await importar_empresa(session, empresa, mrc_contas)
+                resultado = await importar_empresa(session, empresa, contas_mrc, aplicar)
 
-        totais["criadas"]  += r["criadas"]
-        totais["puladas"]  += r["puladas"]
-        totais["colisoes"] += r["colisoes"]
-
-        print(f"  {empresa.razao_social[:48]:<48} | "
-              f"mrc={len(mrc_contas):>4} | "
-              f"novas={r['criadas']:>4} puladas={r['puladas']:>4}")
+        totais["criadas"] += resultado["criadas"]
+        totais["puladas"] += resultado["puladas"]
+        totais["colisoes"] += resultado["colisoes"]
+        prefixo = "OK " if aplicar else "DRY"
+        print(
+            f"  {prefixo} {empresa.razao_social[:36]:<36} | "
+            f"match={mrc_info['nome'][:24]:<24} | {criterio} | "
+            f"mrc={len(contas_mrc):>4} novas={resultado['criadas']:>4} "
+            f"puladas={resultado['puladas']:>4}"
+        )
 
     await engine.dispose()
 
-    print()
-    print("=" * 65)
+    print("\n" + "=" * 70)
     print("  RESULTADO FINAL")
-    print("=" * 65)
+    print("=" * 70)
     print(f"  Empresas com match      : {totais['matched']}")
     print(f"  Empresas sem match      : {totais['sem_match']}")
     print(f"  Contas criadas (novas)  : {totais['criadas']}")
-    print(f"  Contas ja existiam      : {totais['puladas']}")
-    print(f"  Colisoes de classif.    : {totais['colisoes']} (codigo numerico mantido)")
+    print(f"  Contas já existentes    : {totais['puladas']}")
+    print(f"  Colisões de classificação: {totais['colisoes']} (código numérico mantido)")
     if sem_match:
-        print()
-        print("  Sem correspondencia:")
-        for n in sem_match:
-            print(f"    - {n}")
-    print("=" * 65)
+        print("\n  Sem correspondência:")
+        for nome, motivo in sem_match:
+            print(f"    - {nome}: {motivo}")
+    if not aplicar:
+        print("\n  DRY-RUN concluído: nenhuma alteração foi gravada.")
+        print("  Para gravar, execute novamente com --aplicar --confirmar-escrita.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    argumentos = parse_args()
+    asyncio.run(main(aplicar=argumentos.aplicar))
