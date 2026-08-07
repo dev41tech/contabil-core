@@ -434,6 +434,7 @@ async def test_autoassociacao_de_nota_respeita_direcao_financeira(
         cnpj_destinatario=empresa.cnpj,
         valor=200,
         data_emissao=debito.data,
+        dedup_key="teste-nota-recebida",
     )
     emitida_mesmo_valor = NotaFiscal(
         empresa_id=empresa.id,
@@ -443,6 +444,7 @@ async def test_autoassociacao_de_nota_respeita_direcao_financeira(
         cnpj_destinatario="22.222.222/0001-22",
         valor=200,
         data_emissao=debito.data,
+        dedup_key="teste-nota-emitida",
     )
     db.add_all([recebida, emitida_mesmo_valor])
     await db.flush()
