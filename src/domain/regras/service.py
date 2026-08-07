@@ -15,6 +15,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, PlanoConta, Regra
@@ -40,16 +41,21 @@ class RegraService:
         apenas_ativas: bool = False,
         agencia_id: UUID | None = None,
     ) -> RegraListResponse:
-        q = select(Regra).where(
-            Regra.empresa_id == self._empresa_id,
-            Regra.ativa == True if apenas_ativas else True,
+        q = (
+            select(Regra)
+            .options(joinedload(Regra.conta), joinedload(Regra.agencia))
+            .where(Regra.empresa_id == self._empresa_id)
+        )
+        count_q = select(func.count(Regra.id)).where(
+            Regra.empresa_id == self._empresa_id
         )
         if apenas_ativas:
             q = q.where(Regra.ativa == True)
+            count_q = count_q.where(Regra.ativa == True)
         if agencia_id:
             q = q.where(Regra.agencia_id == agencia_id)
+            count_q = count_q.where(Regra.agencia_id == agencia_id)
 
-        count_q = select(func.count()).select_from(q.subquery())
         total = (await self._db.execute(count_q)).scalar_one()
 
         rows = (
@@ -59,7 +65,7 @@ class RegraService:
         ).scalars().all()
 
         return RegraListResponse(
-            items=[await self._to_response(r) for r in rows],
+            items=[self._to_response(r) for r in rows],
             total=total,
             page=page,
             page_size=page_size,
@@ -67,11 +73,11 @@ class RegraService:
 
     async def obter(self, regra_id: UUID) -> RegraResponse:
         regra = await self._get_or_404(regra_id)
-        return await self._to_response(regra)
+        return self._to_response(regra)
 
     async def criar(self, data: RegraCreate) -> RegraResponse:
-        await self._validar_conta(data.conta_id)
-        await self._validar_agencia(data.agencia_id)
+        conta = await self._validar_conta(data.conta_id)
+        agencia = await self._validar_agencia(data.agencia_id)
         await self._assert_historico_livre(data.agencia_id, data.historico)
 
         regra = Regra(
@@ -80,6 +86,7 @@ class RegraService:
             agencia_id=data.agencia_id,
             descricao=data.descricao,
             historico=data.historico,
+            historico_normalizado=self._normalizar_historico(data.historico),
             dc=data.dc,
             tipo=data.tipo,
             manter_historico=data.manter_historico,
@@ -93,7 +100,7 @@ class RegraService:
             empresa_id=str(self._empresa_id),
             historico=regra.historico,
         )
-        return await self._to_response(regra)
+        return self._to_response(regra, conta=conta, agencia=agencia)
 
     async def atualizar(self, regra_id: UUID, data: RegraUpdate) -> RegraResponse:
         regra = await self._get_or_404(regra_id)
@@ -106,12 +113,16 @@ class RegraService:
             regra.tipo = data.tipo
         if data.manter_historico is not None:
             regra.manter_historico = data.manter_historico
+        if data.ativa is True and not regra.ativa:
+            await self._assert_historico_livre(
+                regra.agencia_id, regra.historico, excluir_id=regra.id
+            )
         if data.ativa is not None:
             regra.ativa = data.ativa
 
         await self._db.flush()
         logger.info("regra.atualizada", regra_id=str(regra_id))
-        return await self._to_response(regra)
+        return self._to_response(regra)
 
     async def desativar(self, regra_id: UUID) -> None:
         regra = await self._get_or_404(regra_id)
@@ -123,7 +134,9 @@ class RegraService:
 
     async def _get_or_404(self, regra_id: UUID) -> Regra:
         result = await self._db.execute(
-            select(Regra).where(
+            select(Regra)
+            .options(joinedload(Regra.conta), joinedload(Regra.agencia))
+            .where(
                 Regra.id == regra_id,
                 Regra.empresa_id == self._empresa_id,
             )
@@ -159,23 +172,39 @@ class RegraService:
             raise ValidationError(message="Agência bancária não encontrada nesta empresa.")
         return agencia
 
-    async def _assert_historico_livre(self, agencia_id: UUID, historico: str) -> None:
-        result = await self._db.execute(
-            select(Regra).where(
-                Regra.empresa_id == self._empresa_id,
-                Regra.agencia_id == agencia_id,
-                Regra.historico == historico,
-                Regra.ativa == True,
-            )
+    async def _assert_historico_livre(
+        self, agencia_id: UUID, historico: str, excluir_id: UUID | None = None
+    ) -> None:
+        q = select(Regra.id).where(
+            Regra.empresa_id == self._empresa_id,
+            Regra.agencia_id == agencia_id,
+            Regra.historico_normalizado == self._normalizar_historico(historico),
+            Regra.ativa == True,
+            Regra.deleted_at.is_(None),
         )
+        if excluir_id:
+            q = q.where(Regra.id != excluir_id)
+        result = await self._db.execute(q)
         if result.scalar_one_or_none():
             raise ConflictError(
-                message=f"Já existe uma regra ativa com o histórico '{historico}' para esta agência."
+                message=(
+                    f"Já existe uma regra ativa com o histórico '{historico}' "
+                    "para esta agência."
+                )
             )
 
-    async def _to_response(self, regra: Regra) -> RegraResponse:
-        conta = await self._db.get(PlanoConta, regra.conta_id)
-        agencia = await self._db.get(AgenciaBancaria, regra.agencia_id)
+    @staticmethod
+    def _normalizar_historico(historico: str) -> str:
+        return historico.strip().lower()
+
+    def _to_response(
+        self,
+        regra: Regra,
+        conta: PlanoConta | None = None,
+        agencia: AgenciaBancaria | None = None,
+    ) -> RegraResponse:
+        conta = conta or regra.conta
+        agencia = agencia or regra.agencia
         return RegraResponse(
             id=regra.id,
             empresa_id=regra.empresa_id,

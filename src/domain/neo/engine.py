@@ -12,7 +12,7 @@ Desempate entre regras candidatas:
   devolveu, para que o mesmo extrato produza sempre a mesma classificação.
 
 Ao encontrar match:
-  - Cria RegistroContabil vinculado à transação.
+  - Cria um lançamento contábil com classificação e contrapartida bancária.
   - Atualiza status da transação para "processada".
   - Salva NeoDecisao com a estratégia usada.
   - Tenta auto-associar Comprovantes e NotasFiscais com valor/data próximos.
@@ -30,13 +30,23 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Comprovante, NeoDecisao, NotaFiscal, Regra, RegistroContabil, Transacao
+from src.db.models import (
+    AgenciaBancaria,
+    Comprovante,
+    Empresa,
+    NeoDecisao,
+    NotaFiscal,
+    PlanoConta,
+    Regra,
+    RegistroContabil,
+    Transacao,
+)
 from src.schemas.neo import NeoResultado
 
 logger = structlog.get_logger(__name__)
@@ -51,30 +61,49 @@ class NeoEngine:
     def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
         self._db = db
         self._empresa_id = empresa_id
+        self._comprovantes_consumidos: set[UUID] = set()
+        self._notas_consumidas: set[UUID] = set()
+        self._contas_bancarias: dict[UUID, PlanoConta] = {}
+        self._empresa_cnpj: str | None = None
 
     async def processar(self, agencia_id: UUID | None = None) -> NeoResultado:
         """Processa todas as transações pendentes da empresa (ou de uma agência específica)."""
         regras = await self._carregar_regras(agencia_id)
         pendentes = await self._carregar_pendentes(agencia_id)
+        sem_regra_existentes = await self._carregar_sem_regra_existentes(pendentes)
+        self._comprovantes_consumidos.clear()
+        self._notas_consumidas.clear()
+        self._empresa_cnpj = (
+            await self._db.execute(
+                select(Empresa.cnpj).where(Empresa.id == self._empresa_id)
+            )
+        ).scalar_one()
 
         associadas = sem_regra = erros = 0
         comprovantes_associados = notas_associadas = 0
 
         for transacao in pendentes:
             try:
-                regra, estrategia = self._encontrar_regra(transacao, regras)
-                if regra:
-                    await self._registrar_match(transacao, regra, estrategia)
+                teve_match = associou_comprovante = associou_nota = False
+                async with self._db.begin_nested():
+                    regra, estrategia = self._encontrar_regra(transacao, regras)
+                    if regra:
+                        await self._registrar_match(transacao, regra, estrategia)
+                        teve_match = True
+                        associou_comprovante = await self._tentar_associar_comprovante(
+                            transacao
+                        )
+                        associou_nota = await self._tentar_associar_nota_fiscal(transacao)
+                    else:
+                        if transacao.id not in sem_regra_existentes:
+                            await self._registrar_sem_regra(transacao)
+                            sem_regra_existentes.add(transacao.id)
+                    await self._db.flush()
+                if teve_match:
                     associadas += 1
-                    # Auto-associação de comprovantes e notas fiscais (tasks 5 & 6)
-                    comp = await self._tentar_associar_comprovante(transacao)
-                    if comp:
-                        comprovantes_associados += 1
-                    nf = await self._tentar_associar_nota_fiscal(transacao)
-                    if nf:
-                        notas_associadas += 1
+                    comprovantes_associados += int(associou_comprovante)
+                    notas_associadas += int(associou_nota)
                 else:
-                    await self._registrar_sem_regra(transacao)
                     sem_regra += 1
             except Exception as exc:
                 logger.error(
@@ -83,6 +112,7 @@ class NeoEngine:
                     erro=str(exc),
                 )
                 await self._registrar_erro(transacao, str(exc))
+                await self._db.flush()
                 erros += 1
 
         await self._db.flush()
@@ -125,17 +155,17 @@ class NeoEngine:
 
         # 1. Match exato
         for regra in candidatas:
-            if historico_t == regra.historico.lower().strip():
+            if historico_t == regra.historico_normalizado:
                 return regra, "exato"
 
         # 2. Match por substring (regra dentro da transação)
         for regra in candidatas:
-            if regra.historico.lower().strip() in historico_t:
+            if regra.historico_normalizado in historico_t:
                 return regra, "substring"
 
         # 3. Match por prefixo (transação começa com o histórico da regra)
         for regra in candidatas:
-            if historico_t.startswith(regra.historico.lower().strip()):
+            if historico_t.startswith(regra.historico_normalizado):
                 return regra, "prefixo"
 
         return None, None
@@ -149,20 +179,14 @@ class NeoEngine:
             transacao.historico if regra.manter_historico else regra.descricao
         )
 
-        registro = RegistroContabil(
-            empresa_id=self._empresa_id,
-            transacao_id=transacao.id,
+        await self._registrar_partidas(
+            transacao=transacao,
             conta_id=regra.conta_id,
-            agencia_id=transacao.agencia_id,
             descricao=regra.descricao,
             historico=historico_saida,
-            historico_extrato=transacao.historico,
             dc=regra.dc,
             tipo_regra=regra.tipo,
-            valor=transacao.valor,
-            data_lancamento=transacao.data,
         )
-        self._db.add(registro)
 
         transacao.status = "processada"
 
@@ -175,6 +199,112 @@ class NeoEngine:
             motivo=f"Regra '{regra.historico}' ({estrategia})",
         )
         self._db.add(decisao)
+
+    async def registrar_partidas_manuais(
+        self, transacao: Transacao, conta_id: UUID, descricao: str
+    ) -> None:
+        """Cria, atomicamente, a classificação manual e sua contrapartida bancária."""
+        await self._registrar_partidas(
+            transacao=transacao,
+            conta_id=conta_id,
+            descricao=descricao,
+            historico=transacao.historico,
+            dc=transacao.dc,
+            tipo_regra="manual",
+        )
+
+    async def _registrar_partidas(
+        self,
+        transacao: Transacao,
+        conta_id: UUID,
+        descricao: str,
+        historico: str,
+        dc: str,
+        tipo_regra: str,
+    ) -> None:
+        conta_bancaria = await self._obter_conta_bancaria(transacao.agencia_id)
+        lancamento_id = uuid4()
+        dados_comuns = {
+            "empresa_id": self._empresa_id,
+            "transacao_id": transacao.id,
+            "lancamento_id": lancamento_id,
+            "agencia_id": transacao.agencia_id,
+            "historico": historico,
+            "historico_extrato": transacao.historico,
+            "tipo_regra": tipo_regra,
+            "valor": transacao.valor,
+            "data_lancamento": transacao.data,
+        }
+        self._db.add(
+            RegistroContabil(
+                **dados_comuns,
+                conta_id=conta_id,
+                descricao=descricao,
+                dc=dc,
+            )
+        )
+        self._db.add(
+            RegistroContabil(
+                **dados_comuns,
+                conta_id=conta_bancaria.id,
+                descricao=f"Contrapartida bancária: {descricao}",
+                dc="C" if dc == "D" else "D",
+            )
+        )
+
+    async def _obter_conta_bancaria(self, agencia_id: UUID) -> PlanoConta:
+        if agencia_id in self._contas_bancarias:
+            return self._contas_bancarias[agencia_id]
+
+        agencia = (
+            await self._db.execute(
+                select(AgenciaBancaria)
+                .where(
+                    AgenciaBancaria.id == agencia_id,
+                    AgenciaBancaria.empresa_id == self._empresa_id,
+                    AgenciaBancaria.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalar_one()
+
+        conta = None
+        if agencia.conta_contabil_id:
+            conta = (
+                await self._db.execute(
+                    select(PlanoConta).where(
+                        PlanoConta.id == agencia.conta_contabil_id,
+                        PlanoConta.empresa_id == self._empresa_id,
+                        PlanoConta.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
+        if conta is None:
+            codigo = f"1.1.B.{agencia.id.hex[:16]}"
+            conta = (
+                await self._db.execute(
+                    select(PlanoConta).where(
+                        PlanoConta.empresa_id == self._empresa_id,
+                        PlanoConta.codigo == codigo,
+                        PlanoConta.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if conta is None:
+                conta = PlanoConta(
+                    empresa_id=self._empresa_id,
+                    codigo=codigo,
+                    descricao=f"Conta bancária {agencia.descricao}",
+                    tipo="ativo",
+                    tipo_sa="A",
+                )
+                self._db.add(conta)
+                await self._db.flush()
+            agencia.conta_contabil_id = conta.id
+
+        self._contas_bancarias[agencia_id] = conta
+        return conta
 
     async def _registrar_sem_regra(self, transacao: Transacao) -> None:
         decisao = NeoDecisao(
@@ -206,6 +336,7 @@ class NeoEngine:
 
         Critérios:
           - Mesmo empresa_id
+          - Transação de débito (comprovante representa pagamento)
           - transacao_id IS NULL (ainda não associado)
           - |valor_pago - transacao.valor| <= R$ 0,01
           - |data_pagamento - transacao.data| <= 3 dias
@@ -213,6 +344,9 @@ class NeoEngine:
         Só associa se houver EXATAMENTE 1 match (evita falso positivos).
         Retorna True se associou, False caso contrário.
         """
+        if transacao.dc != "D":
+            return False
+
         try:
             data_min = transacao.data - timedelta(days=_DATA_TOLERANCIA_COMP)
             data_max = transacao.data + timedelta(days=_DATA_TOLERANCIA_COMP)
@@ -222,10 +356,14 @@ class NeoEngine:
                 and_(
                     Comprovante.empresa_id == self._empresa_id,
                     Comprovante.transacao_id.is_(None),
+                    Comprovante.deleted_at.is_(None),
                     Comprovante.data_pagamento >= data_min,
                     Comprovante.data_pagamento <= data_max,
                 )
             )
+            if self._comprovantes_consumidos:
+                q = q.where(Comprovante.id.not_in(self._comprovantes_consumidos))
+            q = q.with_for_update(skip_locked=True)
             candidatos = (await self._db.execute(q)).scalars().all()
 
             # Filtra por tolerância de valor (em Python para evitar erros de float no SQL)
@@ -239,6 +377,7 @@ class NeoEngine:
                 return False
 
             matches[0].transacao_id = transacao.id
+            self._comprovantes_consumidos.add(matches[0].id)
             logger.info(
                 "neo.comprovante_associado",
                 comprovante_id=str(matches[0].id),
@@ -247,7 +386,11 @@ class NeoEngine:
             return True
 
         except Exception as exc:
-            logger.warning("neo.auto_comprovante.erro", transacao_id=str(transacao.id), erro=str(exc))
+            logger.warning(
+                "neo.auto_comprovante.erro",
+                transacao_id=str(transacao.id),
+                erro=str(exc),
+            )
             return False
 
     # ── Auto-associação de notas fiscais (Task 6) ─────────────────────────────
@@ -257,6 +400,7 @@ class NeoEngine:
 
         Critérios:
           - Mesmo empresa_id
+          - Natureza compatível: emitida = crédito; recebida = débito
           - transacao_id IS NULL (ainda não associada)
           - status = 'pendente'
           - |valor - transacao.valor| <= R$ 0,01
@@ -274,16 +418,21 @@ class NeoEngine:
                 and_(
                     NotaFiscal.empresa_id == self._empresa_id,
                     NotaFiscal.transacao_id.is_(None),
+                    NotaFiscal.deleted_at.is_(None),
                     NotaFiscal.status == "pendente",
                     NotaFiscal.data_emissao >= data_min,
                     NotaFiscal.data_emissao <= data_max,
                 )
             )
+            if self._notas_consumidas:
+                q = q.where(NotaFiscal.id.not_in(self._notas_consumidas))
+            q = q.with_for_update(skip_locked=True)
             candidatas = (await self._db.execute(q)).scalars().all()
 
             matches = [
                 nf for nf in candidatas
                 if abs(Decimal(str(nf.valor)) - valor) <= _VALOR_TOLERANCIA
+                and self._direcao_nota(nf) == transacao.dc
             ]
 
             if len(matches) != 1:
@@ -291,6 +440,7 @@ class NeoEngine:
 
             matches[0].transacao_id = transacao.id
             matches[0].status = "associada"
+            self._notas_consumidas.add(matches[0].id)
             logger.info(
                 "neo.nota_associada",
                 nota_id=str(matches[0].id),
@@ -340,7 +490,33 @@ class NeoEngine:
                 Transacao.status == "pendente",
             )
             .order_by(Transacao.data.asc(), Transacao.id.asc())
+            .with_for_update(skip_locked=True)
         )
         if agencia_id:
             q = q.where(Transacao.agencia_id == agencia_id)
         return (await self._db.execute(q)).scalars().all()
+
+    async def _carregar_sem_regra_existentes(
+        self, transacoes: list[Transacao]
+    ) -> set[UUID]:
+        if not transacoes:
+            return set()
+        q = select(NeoDecisao.transacao_id).where(
+            NeoDecisao.transacao_id.in_([t.id for t in transacoes]),
+            NeoDecisao.resultado == "sem_regra",
+        )
+        return set((await self._db.execute(q)).scalars().all())
+
+    def _direcao_nota(self, nota: NotaFiscal) -> str | None:
+        empresa = self._somente_digitos(self._empresa_cnpj)
+        emitente = self._somente_digitos(nota.cnpj_emitente)
+        destinatario = self._somente_digitos(nota.cnpj_destinatario)
+        if empresa and emitente == empresa and destinatario != empresa:
+            return "C"
+        if empresa and destinatario == empresa and emitente != empresa:
+            return "D"
+        return None
+
+    @staticmethod
+    def _somente_digitos(valor: str | None) -> str:
+        return "".join(ch for ch in (valor or "") if ch.isdigit())

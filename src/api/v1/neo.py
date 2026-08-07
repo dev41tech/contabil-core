@@ -5,11 +5,11 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
-from src.db.models import NeoDecisao, Regra, RegistroContabil, Transacao
+from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
 from src.db.session import get_db
 from src.domain.neo.engine import NeoEngine
 from src.schemas.neo import (
@@ -119,8 +119,8 @@ async def associar_manual(
 ) -> NeoDecisaoResponse:
     """Associa manualmente uma transação sem regra a uma conta contábil.
 
-    Cria um RegistroContabil com estrategia='manual', marca a decisão como
-    'associada' e atualiza o status da transação para 'processada'.
+    Cria as duas partidas do lançamento com estrategia='manual', marca a
+    decisão como 'associada' e atualiza o status da transação para 'processada'.
     """
     # Busca e valida a decisão
     decisao_result = await db.execute(
@@ -138,29 +138,41 @@ async def associar_manual(
             detail="Apenas decisões com resultado 'sem_regra' podem ser associadas manualmente.",
         )
 
-    # Busca a transação
+    # Bloqueia a transação para serializar esta associação com o processamento automático.
     t_result = await db.execute(
-        select(Transacao).where(Transacao.id == decisao.transacao_id)
+        select(Transacao)
+        .where(
+            Transacao.id == decisao.transacao_id,
+            Transacao.empresa_id == empresa_id,
+        )
+        .with_for_update()
     )
     transacao = t_result.scalar_one_or_none()
     if not transacao:
         raise HTTPException(status_code=404, detail="Transação não encontrada.")
+    if transacao.status != "pendente":
+        raise HTTPException(
+            status_code=422,
+            detail="A transação já foi contabilizada ou não está mais pendente.",
+        )
 
-    # Cria o registro contábil
-    registro = RegistroContabil(
-        empresa_id=empresa_id,
-        transacao_id=transacao.id,
-        conta_id=body.conta_id,
-        agencia_id=transacao.agencia_id,
-        descricao=body.descricao,
-        historico=transacao.historico,
-        historico_extrato=transacao.historico,
-        dc=transacao.dc,
-        tipo_regra="manual",
-        valor=transacao.valor,
-        data_lancamento=transacao.data,
-    )
-    db.add(registro)
+    conta = (
+        await db.execute(
+            select(PlanoConta).where(
+                PlanoConta.id == body.conta_id,
+                PlanoConta.empresa_id == empresa_id,
+                PlanoConta.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not conta:
+        raise HTTPException(
+            status_code=422,
+            detail="Conta contábil não encontrada nesta empresa.",
+        )
+
+    engine = NeoEngine(db=db, empresa_id=empresa_id)
+    await engine.registrar_partidas_manuais(transacao, conta.id, body.descricao)
 
     # Atualiza a decisão
     decisao.resultado = "associada"

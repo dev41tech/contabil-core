@@ -22,9 +22,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from src.db.session import Base
 
@@ -207,9 +208,13 @@ class AgenciaBancaria(Base, TimestampMixin):
     numero: Mapped[str] = mapped_column(String(20), nullable=False)
     digito: Mapped[str | None] = mapped_column(String(5), nullable=True)
     ativa: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    conta_contabil_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("plano_contas.id"), nullable=True, unique=True
+    )
 
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="agencias")
     regras: Mapped[list[Regra]] = relationship("Regra", back_populates="agencia")
+    conta_contabil: Mapped[PlanoConta | None] = relationship("PlanoConta")
 
     @property
     def descricao(self) -> str:
@@ -231,6 +236,7 @@ class Regra(Base, TimestampMixin):
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
+    historico_normalizado: Mapped[str] = mapped_column(String(500), nullable=False)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_enum"), nullable=False)
     tipo: Mapped[str] = mapped_column(
         Enum("automatica", "manual", name="tipo_regra_enum"), nullable=False
@@ -243,8 +249,21 @@ class Regra(Base, TimestampMixin):
     agencia: Mapped[AgenciaBancaria] = relationship("AgenciaBancaria", back_populates="regras")
 
     __table_args__ = (
-        UniqueConstraint("empresa_id", "agencia_id", "historico", name="uq_regra_empresa_agencia_historico"),
+        Index(
+            "uq_regra_empresa_agencia_historico_normalizado_ativa",
+            "empresa_id",
+            "agencia_id",
+            "historico_normalizado",
+            unique=True,
+            postgresql_where=text("ativa = true AND deleted_at IS NULL"),
+            sqlite_where=text("ativa = 1 AND deleted_at IS NULL"),
+        ),
     )
+
+    @validates("historico")
+    def _normalizar_historico(self, _key: str, value: str) -> str:
+        self.historico_normalizado = value.strip().lower()
+        return value
 
 
 # ─────────────────────────────────────────────────────────────── Extrato / Transação
@@ -281,7 +300,12 @@ class RegistroContabil(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
-    transacao_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("transacoes.id"), nullable=True)
+    transacao_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transacoes.id"), nullable=True
+    )
+    lancamento_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), default=uuid.uuid4, nullable=False
+    )
     conta_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("plano_contas.id"), nullable=False)
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -296,7 +320,18 @@ class RegistroContabil(Base, TimestampMixin):
     conta: Mapped[PlanoConta] = relationship("PlanoConta")
     agencia: Mapped[AgenciaBancaria] = relationship("AgenciaBancaria")
 
-    __table_args__ = (Index("ix_registro_empresa_data", "empresa_id", "data_lancamento"),)
+    __table_args__ = (
+        Index("ix_registro_empresa_data", "empresa_id", "data_lancamento"),
+        Index("ix_registro_lancamento", "lancamento_id"),
+        Index(
+            "uq_registro_transacao_dc_ativo",
+            "transacao_id",
+            "dc",
+            unique=True,
+            postgresql_where=text("transacao_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("transacao_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────── Nota Fiscal (NF-e / NFS-e)
@@ -511,6 +546,13 @@ class NeoDecisao(Base):
     __table_args__ = (
         Index("ix_neo_empresa_resultado", "empresa_id", "resultado"),
         Index("ix_neo_transacao", "transacao_id"),
+        Index(
+            "uq_neo_sem_regra_transacao",
+            "transacao_id",
+            unique=True,
+            postgresql_where=text("resultado = 'sem_regra'"),
+            sqlite_where=text("resultado = 'sem_regra'"),
+        ),
     )
 
 
