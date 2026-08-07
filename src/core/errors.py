@@ -73,6 +73,20 @@ class PayloadTooLargeError(DomainError):
     http_status: int = 413
 
 
+@dataclass
+class RateLimitExceededError(DomainError):
+    message: str = "Muitas tentativas. Aguarde antes de tentar novamente."
+    code: str = "RATE_LIMIT_EXCEEDED"
+    http_status: int = 429
+
+
+@dataclass
+class RateLimitUnavailableError(AppError):
+    message: str = "Controle de tentativas temporariamente indisponível."
+    code: str = "RATE_LIMIT_UNAVAILABLE"
+    http_status: int = 503
+
+
 # ─────────────────────────────────────────────────────────────── Auth
 
 

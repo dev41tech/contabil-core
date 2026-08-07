@@ -15,6 +15,7 @@ import pytest
 
 from src.domain.concilpro.parser import detectar_formato_arquivo
 from src.domain.concilpro.planilha import (
+    _decimal,
     e_planilha,
     localizar_colunas,
     parsear_planilha_razao,
@@ -109,6 +110,21 @@ class TestLocalizarColunas:
 
     def test_sem_cabecalho_reconhecivel(self):
         assert localizar_colunas([("a", "b", "c")]) is None
+
+
+class TestDecimal:
+    @pytest.mark.parametrize(
+        ("texto", "esperado"),
+        [
+            ("1.234,56", Decimal("1234.56")),
+            ("1234,56", Decimal("1234.56")),
+            ("1234.56", Decimal("1234.56")),
+            ("1,234.56", Decimal("1234.56")),
+            ("(1.234,56)", Decimal("-1234.56")),
+        ],
+    )
+    def test_detecta_separador_decimal(self, texto, esperado):
+        assert _decimal(texto) == esperado
 
 
 class TestParsearPlanilha:

@@ -21,12 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.context import set_request_context
 from src.core.errors import AuthError, ForbiddenError, TenantAccessDeniedError
-from src.core.security import COOKIE_ACCESS, CSRF_HEADER, decode_access_token
-from src.db.models import Permissao, Usuario
+from src.core.security import COOKIE_ACCESS, decode_access_token
+from src.db.models import Empresa, Permissao, Tenant, Usuario
 from src.db.session import get_db
-
-logger = structlog.get_logger(__name__)
-
 
 @dataclass(frozen=True)
 class AuthContext:
@@ -48,8 +45,6 @@ async def _get_current_user(
 
     user_id = UUID(payload["sub"])
     tenant_id = UUID(payload["tenant_id"])
-    role = payload["role"]
-
     # Atualiza contexto de logs com user_id
     set_request_context(
         trace_id=structlog.contextvars.get_contextvars().get("trace_id", "-"),
@@ -58,7 +53,14 @@ async def _get_current_user(
 
     # Verifica se o usuário ainda existe e está ativo
     result = await db.execute(
-        select(Usuario).where(Usuario.id == user_id, Usuario.ativo == True)
+        select(Usuario)
+        .join(Tenant, Tenant.id == Usuario.tenant_id)
+        .where(
+            Usuario.id == user_id,
+            Usuario.tenant_id == tenant_id,
+            Usuario.ativo == True,
+            Tenant.ativo == True,
+        )
     )
     user = result.scalar_one_or_none()
     if not user:
@@ -66,8 +68,8 @@ async def _get_current_user(
 
     return AuthContext(
         user_id=user_id,
-        tenant_id=tenant_id,
-        role=role,
+        tenant_id=user.tenant_id,
+        role=user.role,
         email=user.email,
     )
 
@@ -102,6 +104,7 @@ async def require_csrf(
 
 
 async def get_company_context(
+    request: Request,
     empresa_id: UUID,
     ctx: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
@@ -111,7 +114,30 @@ async def get_company_context(
     O empresa_id é resolvido automaticamente pelo FastAPI a partir do path parameter
     `{empresa_id}` definido no router que usar esta dependência.
     """
-    # Admin tem acesso a todas as empresas do tenant
+    # A empresa sempre precisa pertencer ao tenant autenticado e estar ativa,
+    # inclusive quando o usuário é admin.
+    empresa = (
+        await db.execute(
+            select(Empresa).where(
+                Empresa.id == empresa_id,
+                Empresa.tenant_id == ctx.tenant_id,
+                Empresa.ativa == True,
+                Empresa.deleted_at == None,
+            )
+        )
+    ).scalar_one_or_none()
+    if not empresa:
+        raise TenantAccessDeniedError()
+
+    # O módulo é o primeiro segmento após /empresas/{empresa_id}. Manter a
+    # resolução aqui evita espalhar dependências distintas por todos os routers.
+    partes = request.url.path.strip("/").split("/")
+    try:
+        modulo = partes[partes.index("empresas") + 2].replace("-", "_")
+    except (ValueError, IndexError):
+        modulo = ""
+
+    # Admin tem acesso a todos os módulos, mas não cruza a fronteira do tenant.
     if ctx.role != "admin":
         result = await db.execute(
             select(Permissao).where(
@@ -119,7 +145,13 @@ async def get_company_context(
                 Permissao.empresa_id == empresa_id,
             )
         )
-        if not result.scalar_one_or_none():
+        permissao = result.scalar_one_or_none()
+        modulos = (
+            {m.strip().lower() for m in permissao.modulos.split(",") if m.strip()}
+            if permissao
+            else set()
+        )
+        if not permissao or ("*" not in modulos and modulo not in modulos):
             raise TenantAccessDeniedError()
 
     set_request_context(

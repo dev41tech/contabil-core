@@ -110,6 +110,34 @@ async def test_criar_regra_duplicada_rejeita(client, db, tenant, usuario, empres
 
 
 @pytest.mark.asyncio
+async def test_criar_regra_duplicada_por_caixa_rejeita(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    conta = await _criar_conta(db, empresa)
+
+    payload = {
+        "conta_id": str(conta.id),
+        "agencia_id": agencia["id"],
+        "descricao": "PIX ACME",
+        "historico": "PIX ACME",
+        "dc": "D",
+        "tipo": "automatica",
+    }
+    primeira = await client.post(
+        _url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf}
+    )
+    payload["historico"] = "pix acme"
+    segunda = await client.post(
+        _url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf}
+    )
+
+    assert primeira.status_code == 201
+    assert segunda.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_criar_regra_dc_invalido(client, db, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)

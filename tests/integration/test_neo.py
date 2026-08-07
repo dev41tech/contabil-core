@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import io
+from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from src.db.models import AgenciaBancaria, Empresa, PlanoConta, Tenant, Usuario
+from src.db.models import (
+    AgenciaBancaria,
+    Comprovante,
+    Empresa,
+    NeoDecisao,
+    NotaFiscal,
+    PlanoConta,
+    RegistroContabil,
+    Transacao,
+)
 
 _OFX_TED = """\
 OFXHEADER:100
@@ -219,6 +230,230 @@ async def test_neo_idempotente(client, db, tenant, usuario, empresa):
     # (sem_regra permanecem pendentes para poder ser recuperadas quando novas regras forem criadas.)
     assert r1.json()["associadas"] >= 1
     assert r2.json()["associadas"] == 0
+
+
+@pytest.mark.asyncio
+async def test_neo_cria_duas_partidas_balanceadas(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(
+        client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf
+    )
+
+    resposta = await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    assert resposta.status_code == 200
+
+    transacao = (
+        await db.execute(
+            select(Transacao).where(
+                Transacao.empresa_id == empresa.id,
+                Transacao.historico == "TED RECEBIDA CLIENTE ALFA",
+            )
+        )
+    ).scalar_one()
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id,
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    assert len(partidas) == 2
+    assert {p.dc for p in partidas} == {"D", "C"}
+    assert len({p.lancamento_id for p in partidas}) == 1
+    assert sum(float(p.valor) for p in partidas if p.dc == "D") == sum(
+        float(p.valor) for p in partidas if p.dc == "C"
+    )
+    agencia = await db.get(AgenciaBancaria, transacao.agencia_id)
+    assert agencia.conta_contabil_id in {p.conta_id for p in partidas}
+
+
+@pytest.mark.asyncio
+async def test_neo_sem_regra_nao_duplica_decisao(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+
+    for _ in range(3):
+        resposta = await client.post(
+            _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+        )
+        assert resposta.status_code == 200
+
+    transacao = (
+        await db.execute(
+            select(Transacao).where(
+                Transacao.empresa_id == empresa.id,
+                Transacao.historico == "DEPOSITO AVULSO DESCONHECIDO",
+            )
+        )
+    ).scalar_one()
+    decisoes = (
+        await db.execute(
+            select(NeoDecisao).where(
+                NeoDecisao.transacao_id == transacao.id,
+                NeoDecisao.resultado == "sem_regra",
+            )
+        )
+    ).scalars().all()
+    assert len(decisoes) == 1
+
+
+@pytest.mark.asyncio
+async def test_autoassociacao_nao_reutiliza_comprovante_e_exige_debito(
+    client, db, tenant, usuario, empresa
+):
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    credito = transacoes["TED RECEBIDA CLIENTE ALFA"]
+    outro_debito = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=debito.agencia_id,
+        data=debito.data,
+        valor=debito.valor,
+        historico="OUTRO PAGAMENTO MESMO VALOR",
+        dc="D",
+        hash_dedup="neo_outro_debito_200",
+    )
+    comprovante = Comprovante(
+        empresa_id=empresa.id,
+        agencia_id=debito.agencia_id,
+        data_pagamento=datetime(2024, 3, 1, tzinfo=UTC),
+        valor_pago=200,
+    )
+    db.add_all([outro_debito, comprovante])
+    await db.flush()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    assert await engine._tentar_associar_comprovante(credito) is False
+    assert await engine._tentar_associar_comprovante(debito) is True
+    assert await engine._tentar_associar_comprovante(outro_debito) is False
+    assert comprovante.transacao_id == debito.id
+
+
+@pytest.mark.asyncio
+async def test_associacao_manual_valida_empresa_e_nao_recontabiliza(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    _, conta_id = await _setup_base(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    decisoes = (
+        await client.get(
+            f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=sem_regra"
+        )
+    ).json()["items"]
+    decisao = next(
+        d for d in decisoes if d["transacao_descricao"] == "DEPOSITO AVULSO DESCONHECIDO"
+    )
+    url = (
+        f"/api/v1/empresas/{empresa.id}/neo/decisoes/"
+        f"{decisao['id']}/associar-manual"
+    )
+
+    outra_empresa = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA LTDA",
+        cnpj="98.765.432/0001-10",
+        regime_tributario="simples_nacional",
+    )
+    db.add(outra_empresa)
+    await db.flush()
+    conta_outra = PlanoConta(
+        empresa_id=outra_empresa.id,
+        codigo="3.1.1",
+        descricao="Receitas da outra empresa",
+        tipo="receita",
+    )
+    db.add(conta_outra)
+    await db.flush()
+
+    conta_invalida = await client.post(
+        url,
+        json={"conta_id": str(conta_outra.id), "descricao": "Depósito manual"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert conta_invalida.status_code == 422
+
+    associada = await client.post(
+        url,
+        json={"conta_id": conta_id, "descricao": "Depósito manual"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    repetida = await client.post(
+        url,
+        json={"conta_id": conta_id, "descricao": "Depósito manual"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert associada.status_code == 200
+    assert repetida.status_code == 422
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == UUID(decisao["transacao_id"]),
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(partidas) == 2
+
+
+@pytest.mark.asyncio
+async def test_autoassociacao_de_nota_respeita_direcao_financeira(
+    client, db, tenant, usuario, empresa
+):
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    recebida = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-RECEBIDA",
+        cnpj_emitente="11.111.111/0001-11",
+        cnpj_destinatario=empresa.cnpj,
+        valor=200,
+        data_emissao=debito.data,
+        dedup_key="teste-nota-recebida",
+    )
+    emitida_mesmo_valor = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-EMITIDA",
+        cnpj_emitente=empresa.cnpj,
+        cnpj_destinatario="22.222.222/0001-22",
+        valor=200,
+        data_emissao=debito.data,
+        dedup_key="teste-nota-emitida",
+    )
+    db.add_all([recebida, emitida_mesmo_valor])
+    await db.flush()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    engine._empresa_cnpj = empresa.cnpj
+    assert await engine._tentar_associar_nota_fiscal(debito) is True
+    assert recebida.transacao_id == debito.id
+    assert emitida_mesmo_valor.transacao_id is None
 
 
 # ── Listar decisões

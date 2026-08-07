@@ -1,23 +1,25 @@
 """Seed de desenvolvimento -- cria tenant, admin e empresa demo.
 
 Uso:
-    python scripts/seed.py
+    python scripts/seed.py --i-know-what-im-doing
 
 Variaveis necessarias (mesmo que para rodar o servidor):
-    DATABASE_URL  SECRET_KEY
+    DATABASE_URL  SECRET_KEY  ENVIRONMENT=development|test
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
+import secrets
 import sys
 import uuid
 
 # Garante que o src/ esta no path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.config import get_settings
 from src.core.security import hash_password
@@ -30,8 +32,18 @@ from src.db.models import (
 )
 
 
-async def seed() -> None:
+async def seed(*, confirmed: bool = False) -> None:
     settings = get_settings()
+    if settings.environment not in {"development", "test"}:
+        raise SystemExit(
+            "Seed recusado: ENVIRONMENT deve ser development ou test."
+        )
+    if not confirmed:
+        raise SystemExit(
+            "Seed recusado: confirme o destino com --i-know-what-im-doing."
+        )
+
+    admin_password = secrets.token_urlsafe(18)
     engine = create_async_engine(str(settings.database_url), echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -53,12 +65,12 @@ async def seed() -> None:
             tenant_id=tenant.id,
             email="admin@contabil.dev",
             nome="Administrador",
-            senha_hash=hash_password("Admin@1234"),
+            senha_hash=hash_password(admin_password),
             role="admin",
         )
         db.add(admin)
         await db.flush()
-        print(f"OK Usuario criado: {admin.email} / senha: Admin@1234")
+        print(f"OK Usuario criado: {admin.email}")
 
         # -- 3. Empresa demo
         empresa = Empresa(
@@ -137,7 +149,7 @@ async def seed() -> None:
     print("  SEED CONCLUIDO - dados para teste:")
     print("=" * 55)
     print(f"  Login:    admin@contabil.dev")
-    print(f"  Senha:    Admin@1234")
+    print(f"  Senha:    {admin_password}")
     print(f"  Tenant:   {tenant.id}")
     print(f"  Empresa:  {empresa.id}")
     print(f"  Agencia:  {agencia.id}")
@@ -146,4 +158,11 @@ async def seed() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    parser = argparse.ArgumentParser(description="Cria dados locais de desenvolvimento.")
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        action="store_true",
+        help="Confirma que DATABASE_URL aponta para um banco descartável.",
+    )
+    args = parser.parse_args()
+    asyncio.run(seed(confirmed=args.i_know_what_im_doing))

@@ -126,6 +126,20 @@ async def test_dre_calcula_resultado_liquido(
 
 
 @pytest.mark.asyncio
+async def test_dre_preserva_movimento_de_conta_legada_removida(
+    client, db, tenant, usuario, empresa, contas, movimento
+):
+    contas["receita"].deleted_at = datetime.now(UTC)
+    await db.flush()
+    await _login(client, tenant, usuario)
+
+    r = await client.get(_url(empresa.id, "dre"))
+
+    receitas = next(grupo for grupo in r.json()["grupos"] if grupo["tipo"] == "receita")
+    assert receitas["total"] == 10_000
+
+
+@pytest.mark.asyncio
 async def test_dre_respeita_natureza_da_conta(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, movimento
 ):
@@ -155,6 +169,47 @@ async def test_dre_filtra_por_periodo(
     )
     assert r.status_code == 200
     assert r.json()["resultado_liquido"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dre_ignora_contas_patrimoniais(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+    agencia: AgenciaBancaria,
+    movimento,
+):
+    passivo = PlanoConta(
+        empresa_id=empresa.id,
+        codigo="2.1.1",
+        descricao="Fornecedores",
+        tipo="passivo",
+    )
+    db.add(passivo)
+    await db.flush()
+    db.add(
+        RegistroContabil(
+            empresa_id=empresa.id,
+            conta_id=passivo.id,
+            agencia_id=agencia.id,
+            descricao="Compra a prazo",
+            historico="Compra a prazo",
+            historico_extrato="Compra a prazo",
+            dc="C",
+            tipo_regra="manual",
+            valor=9_999,
+            data_lancamento=datetime(2026, 3, 15, tzinfo=UTC),
+        )
+    )
+    await db.flush()
+
+    await _login(client, tenant, usuario)
+    body = (await client.get(_url(empresa.id, "dre"))).json()
+
+    assert "passivo" not in {grupo["tipo"] for grupo in body["grupos"]}
+    assert body["resultado_liquido"] == 5_000
 
 
 # ── Balancete ─────────────────────────────────────────────────────────────────

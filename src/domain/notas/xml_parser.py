@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from base64 import b64decode
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 NFE_NS = "http://www.portalfiscal.inf.br/nfe"
@@ -25,7 +27,7 @@ class NotaParseada:
     cnpj_emitente: str
     nome_emitente: Optional[str]
     cnpj_destinatario: Optional[str]
-    valor: float
+    valor: Decimal
     data_emissao: datetime
     chave_acesso: Optional[str]
     observacao: Optional[str]
@@ -111,6 +113,64 @@ def _parse_datetime(valor: Optional[str]) -> Optional[datetime]:
     return None
 
 
+def _parse_decimal(valor: Optional[str], campo: str) -> Decimal:
+    try:
+        parsed = Decimal(valor or "")
+    except InvalidOperation as exc:
+        raise ValueError(f"Campo {campo} ausente ou inválido.") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"Campo {campo} deve ser um valor positivo.")
+    return parsed
+
+
+def _validar_assinatura(conteudo: bytes, root: ET.Element, referencia: str) -> None:
+    """Valida matematicamente a assinatura XML usando o certificado embutido."""
+    signature = _find_by_local_tag(root, "Signature")
+    if signature is None:
+        raise ValueError("Documento fiscal sem assinatura XML.")
+
+    reference = _find_by_local_tag(signature, "Reference")
+    if reference is None or reference.get("URI") != f"#{referencia}":
+        raise ValueError("Assinatura XML não referencia a identificação do documento fiscal.")
+
+    cert_elem = _find_by_local_tag(signature, "X509Certificate")
+    cert_text = _safe_text(cert_elem)
+    if not cert_text:
+        raise ValueError("Assinatura XML sem certificado X.509.")
+
+    try:
+        # O certificado explícito impede que o verificador confie em uma chave
+        # indicada fora do próprio documento e valida digest + SignedInfo.
+        from cryptography import x509
+        from signxml import SignatureConfiguration, XMLVerifier
+
+        cert_b64 = re.sub(r"\s+", "", cert_text)
+        cert_der = b64decode(cert_b64, validate=True)
+        cert_pem = (
+            "-----BEGIN CERTIFICATE-----\n"
+            + "\n".join(
+                cert_b64[i:i + 64]
+                for i in range(0, len(cert_b64), 64)
+            )
+            + "\n-----END CERTIFICATE-----\n"
+        )
+
+        # Certificados expirados hoje ainda podem ter assinado validamente uma
+        # nota histórica; o protocolo de autorização fornece a temporalidade.
+        x509.load_der_x509_certificate(cert_der)
+        XMLVerifier().verify(
+            conteudo,
+            x509_cert=cert_pem,
+            expect_config=SignatureConfiguration(require_x509=True),
+        )
+    except ValueError:
+        raise
+    except ImportError as exc:
+        raise ValueError("Validação criptográfica de assinatura indisponível no servidor.") from exc
+    except Exception as exc:
+        raise ValueError("Assinatura XML inválida.") from exc
+
+
 def _detect_namespace(root: ET.Element) -> Optional[str]:
     """Detecta o namespace do elemento raiz."""
     tag = root.tag
@@ -187,8 +247,6 @@ def _find_path_local(root: ET.Element, *local_tags: str) -> Optional[ET.Element]
 
 def _parse_nfe(root: ET.Element) -> NotaParseada:
     """Extrai dados de uma NF-e 4.0."""
-    ns = _detect_namespace(root)
-
     # Localiza infNFe em qualquer nível
     inf_nfe = _find_by_local_tag(root, "infNFe")
     if inf_nfe is None:
@@ -196,7 +254,7 @@ def _parse_nfe(root: ET.Element) -> NotaParseada:
 
     # chave_acesso via atributo Id
     id_attr = inf_nfe.get("Id", "")
-    chave_acesso = id_attr.lstrip("NFe").strip() if id_attr else None
+    chave_acesso = id_attr[3:] if id_attr.startswith("NFe") else None
     if chave_acesso == "":
         chave_acesso = None
 
@@ -231,7 +289,27 @@ def _parse_nfe(root: ET.Element) -> NotaParseada:
     total = _find_path_local(inf_nfe, "total")
     icms_tot = _find_path_local(total, "ICMSTot") if total is not None else None
     vnf_text = _safe_text(_find_path_local(icms_tot, "vNF")) if icms_tot is not None else None
-    valor = float(vnf_text) if vnf_text else 0.0
+    valor = _parse_decimal(vnf_text, "vNF")
+
+    inf_prot = _find_by_local_tag(root, "infProt")
+    cstat = _safe_text(_find_path_local(inf_prot, "cStat")) if inf_prot is not None else None
+    protocolo = _safe_text(_find_path_local(inf_prot, "nProt")) if inf_prot is not None else None
+    recebimento = (
+        _parse_datetime(_safe_text(_find_path_local(inf_prot, "dhRecbto")))
+        if inf_prot is not None
+        else None
+    )
+    chave_protocolo = (
+        _safe_text(_find_path_local(inf_prot, "chNFe")) if inf_prot is not None else None
+    )
+    if cstat not in {"100", "150"} or not re.fullmatch(r"\d{15}", protocolo or ""):
+        raise ValueError("NF-e sem protocolo de autorização válido (cStat 100 ou 150).")
+    if recebimento is None:
+        raise ValueError("NF-e sem data válida de recebimento da autorização.")
+    if not chave_acesso or not re.fullmatch(r"\d{44}", chave_acesso):
+        raise ValueError("Chave de acesso da NF-e deve conter exatamente 44 dígitos.")
+    if chave_protocolo != chave_acesso:
+        raise ValueError("Chave de acesso diverge da chave informada no protocolo.")
 
     # observacao
     observacao = f"Destinatário: {nome_destinatario}" if nome_destinatario else None
@@ -276,7 +354,7 @@ def _parse_nfse(root: ET.Element) -> NotaParseada:
     valor_servicos_text = _safe_text(
         _find_by_local_tag(valores, "ValorServicos") if valores is not None else None
     )
-    valor = float(valor_servicos_text) if valor_servicos_text else 0.0
+    valor = _parse_decimal(valor_servicos_text, "ValorServicos")
 
     valor_iss_text = _safe_text(
         _find_by_local_tag(valores, "ValorIss") if valores is not None else None
@@ -311,6 +389,9 @@ def _parse_nfse(root: ET.Element) -> NotaParseada:
         raise ValueError("CNPJ do prestador não encontrado ou inválido na NFS-e.")
     if data_emissao is None:
         raise ValueError("Data de emissão não encontrada ou inválida na NFS-e.")
+    codigo_verificacao = _safe_text(_find_by_local_tag(inf_nfse, "CodigoVerificacao"))
+    if not codigo_verificacao:
+        raise ValueError("NFS-e sem código de verificação/autorização.")
 
     return NotaParseada(
         tipo="nfse",
@@ -332,15 +413,25 @@ def parse_nota_xml(conteudo: bytes) -> NotaParseada:
     Lança ValueError se o formato não for reconhecido ou campos obrigatórios
     estiverem ausentes.
     """
+    if re.search(br"<!DOCTYPE|<!ENTITY", conteudo, re.IGNORECASE):
+        raise ValueError("XML com DTD ou declaração de entidade não é permitido.")
     try:
         root = ET.fromstring(conteudo)
     except ET.ParseError as exc:
         raise ValueError(f"XML inválido: {exc}") from exc
 
     if _is_nfe(root):
-        return _parse_nfe(root)
+        nota = _parse_nfe(root)
+        _validar_assinatura(conteudo, root, f"NFe{nota.chave_acesso}")
+        return nota
 
     if _is_nfse(root):
-        return _parse_nfse(root)
+        nota = _parse_nfse(root)
+        inf_nfse = _find_by_local_tag(root, "InfNfse")
+        referencia = inf_nfse.get("Id", "") if inf_nfse is not None else ""
+        if not referencia:
+            raise ValueError("NFS-e sem identificador assinado.")
+        _validar_assinatura(conteudo, root, referencia)
+        return nota
 
     raise ValueError("Formato XML não reconhecido. Esperado NF-e 4.0 ou NFS-e ABRASF.")

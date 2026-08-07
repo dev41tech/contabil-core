@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError
-from src.db.models import Comprovante, Transacao
+from src.db.models import AgenciaBancaria, Comprovante, Transacao
 from src.schemas.comprovantes import (
     AssociarTransacaoRequest,
     ComprovanteCreate,
@@ -76,6 +76,19 @@ class ComprovanteService:
         return ComprovanteResponse.from_orm_custom(comprovante)
 
     async def criar(self, data: ComprovanteCreate) -> ComprovanteResponse:
+        if data.agencia_id:
+            agencia = (
+                await self._db.execute(
+                    select(AgenciaBancaria.id).where(
+                        AgenciaBancaria.id == data.agencia_id,
+                        AgenciaBancaria.empresa_id == self._empresa_id,
+                        AgenciaBancaria.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if not agencia:
+                raise NotFoundError(message="Agência bancária não encontrada nesta empresa.")
+
         # Valida que a transação pertence à empresa (se informada)
         if data.transacao_id:
             result = await self._db.execute(

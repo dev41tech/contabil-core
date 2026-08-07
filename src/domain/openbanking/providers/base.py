@@ -38,11 +38,20 @@ class IOpenBankingProvider(ABC):
     """Interface que todo provedor deve implementar."""
 
     @abstractmethod
-    async def criar_connect_token(self, item_id: str | None = None) -> str:
+    async def criar_connect_token(
+        self,
+        item_id: str | None = None,
+        client_user_id: str | None = None,
+    ) -> str:
         """Retorna token para abrir o widget de autenticação do banco.
 
         Se `item_id` é passado, cria um token para re-autenticar um item existente.
         """
+        ...
+
+    @abstractmethod
+    async def validar_item(self, item_id: str, client_user_id: str) -> bool:
+        """Confirma que o item foi criado para a sessão local informada."""
         ...
 
     @abstractmethod

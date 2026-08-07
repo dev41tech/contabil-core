@@ -8,7 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, SecretStr, field_validator
+from pydantic import Field, PostgresDsn, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # SHA do commit que gerou a imagem — injetado como build arg no Dockerfile.
     # app_version não muda entre deploys, então é isso que responde "meu deploy subiu?".
     git_commit: str = "unknown"
-    environment: Literal["development", "staging", "production"] = "development"
+    environment: Literal["development", "test", "staging", "production"] = "development"
     debug: bool = False
 
     # ------------------------------------------------------------------ Segurança
@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 7
     csrf_token_ttl_minutes: int = 60
+    enable_setup_endpoint: bool = False
+    setup_bootstrap_secret: SecretStr | None = None
 
     # ------------------------------------------------------------------ Banco
     database_url: PostgresDsn = Field(..., description="postgresql+asyncpg://user:pass@host/db")
@@ -76,6 +78,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ Rate limit
     rate_limit_per_ip: int = 100        # req/min
     rate_limit_per_tenant: int = 1000   # req/min
+    rate_limit_per_identity: int = 10   # tentativas de login/min
 
     # ------------------------------------------------------------------ Upload
     # Todos os parsers (Razão em PDF/XLSX, OFX, CSV) carregam o arquivo inteiro
@@ -83,6 +86,12 @@ class Settings(BaseSettings):
     # Manter abaixo do `client_max_body_size` do nginx do contabil-front (50M),
     # para que a recusa venha daqui com JSON tipado, não do nginx em HTML.
     max_upload_mb: int = 25
+
+    # PDF bancário: processamento síncrono pesado e, opcionalmente, envio a IA.
+    pdf_max_pages: int = 25
+    pdf_parse_timeout_seconds: int = 60
+    pdf_max_ai_calls: int = 10
+    allow_financial_data_to_openai: bool = False
 
     @property
     def max_upload_bytes(self) -> int:
@@ -99,6 +108,17 @@ class Settings(BaseSettings):
         if len(str(v)) < 32:
             raise ValueError("secret_key deve ter no mínimo 32 caracteres")
         return v
+
+    @model_validator(mode="after")
+    def setup_exige_segredo(self) -> Settings:
+        if self.enable_setup_endpoint and (
+            self.setup_bootstrap_secret is None
+            or not self.setup_bootstrap_secret.get_secret_value()
+        ):
+            raise ValueError(
+                "setup_bootstrap_secret é obrigatório quando enable_setup_endpoint=true"
+            )
+        return self
 
     @property
     def is_production(self) -> bool:

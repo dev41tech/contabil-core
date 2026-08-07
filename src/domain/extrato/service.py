@@ -2,7 +2,7 @@
 
 Responsabilidades:
 - Importar arquivo OFX e persistir as transações.
-- Deduplicação por SHA-256 de (empresa_id + agencia_id + data + valor + historico + dc).
+- Deduplicação de OFX por SHA-256 de (empresa_id + agencia_id + FITID).
 - Listar transações com filtros (status, agência, data).
 """
 
@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Transacao
-from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx
+from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx_detalhado
 from src.schemas.extrato import (
     ExtratoPendentesResponse,
     ImportacaoResult,
@@ -36,25 +36,33 @@ class ExtratoService:
 
     async def importar_ofx(self, conteudo: str, agencia_id: UUID) -> ImportacaoResult:
         """Parseia OFX, deduplica e persiste as transações novas."""
-        agencia = await self._get_agencia_or_400(agencia_id)
+        await self._get_agencia_or_400(agencia_id)
 
         try:
-            transacoes_ofx = parse_ofx(conteudo)
+            parse_result = parse_ofx_detalhado(conteudo)
         except OFXParseError as e:
             raise ValidationError(message=f"Arquivo OFX inválido: {e}")
 
-        if not transacoes_ofx:
+        if parse_result.total_blocos == 0:
             raise ValidationError(message="Nenhuma transação encontrada no arquivo OFX.")
 
-        importadas, duplicadas, erros = 0, 0, 0
+        transacoes_ofx = parse_result.transacoes
+        importadas, duplicadas, erros = 0, 0, len(parse_result.erros)
         novas: list[Transacao] = []
+        hashes_do_lote: set[str] = set()
+
+        for erro in parse_result.erros:
+            logger.warning("extrato.ofx.transacao_rejeitada", erro=erro)
 
         for t in transacoes_ofx:
             try:
                 dc = "C" if t.valor >= 0 else "D"
                 hash_dedup = _calcular_hash(self._empresa_id, agencia_id, t)
 
-                # Checa duplicata
+                if hash_dedup in hashes_do_lote:
+                    duplicadas += 1
+                    continue
+
                 existing = await self._db.execute(
                     select(Transacao).where(
                         Transacao.empresa_id == self._empresa_id,
@@ -77,6 +85,7 @@ class ExtratoService:
                 )
                 self._db.add(transacao)
                 novas.append(transacao)
+                hashes_do_lote.add(hash_dedup)
                 importadas += 1
             except Exception as exc:
                 logger.warning("extrato.transacao.erro", erro=str(exc))
@@ -88,7 +97,7 @@ class ExtratoService:
             "extrato.importado",
             empresa_id=str(self._empresa_id),
             agencia_id=str(agencia_id),
-            total=len(transacoes_ofx),
+            total=parse_result.total_blocos,
             importadas=importadas,
             duplicadas=duplicadas,
             erros=erros,
@@ -96,7 +105,7 @@ class ExtratoService:
 
         return ImportacaoResult(
             agencia_id=agencia_id,
-            total_no_arquivo=len(transacoes_ofx),
+            total_no_arquivo=parse_result.total_blocos,
             importadas=importadas,
             duplicadas=duplicadas,
             erros=erros,
@@ -247,7 +256,8 @@ def _calcular_hash(empresa_id: UUID, agencia_id: UUID, t: TransacaoOFX) -> str:
         temperature=0 são determinísticos: mesmo PDF → mesma sequência de fitids.
 
     OFX:
-        fitid vem do banco e é estável — usamos ele diretamente.
+        FITID vem do banco e é a identidade estável. Data, valor e histórico
+        podem mudar numa reexportação e não participam da deduplicação.
     """
     is_pdf = (t.fitid or "").startswith("PDF")
 
@@ -265,9 +275,6 @@ def _calcular_hash(empresa_id: UUID, agencia_id: UUID, t: TransacaoOFX) -> str:
             {
                 "empresa_id": str(empresa_id),
                 "agencia_id": str(agencia_id),
-                "data": t.data.isoformat(),
-                "valor": str(abs(t.valor)),
-                "historico": (t.historico or "").lower().strip(),
                 "fitid": t.fitid,
             },
             sort_keys=True,

@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 TIPOS_INCERTOS = {"DEBITO", "CREDITO", "OUTRO"}
 
+
+class VisionBatchError(RuntimeError):
+    """A extração Vision não produziu um batch completo e confiável."""
+
+
 # ---------------------------------------------------------------------------
 # Prompt de EXTRAÇÃO — usado pelo gpt-4o-mini no fallback de texto.
 # ---------------------------------------------------------------------------
@@ -288,7 +293,7 @@ def parsear_bloco_fornecedor_ia(bloco_texto: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Parsing via Vision — helper de um único batch (≤ 3 páginas)
 # ---------------------------------------------------------------------------
-def _visao_batch(client, png_bytes_list: list, bloco_texto: str = "") -> Optional[dict]:
+def _visao_batch(client, png_bytes_list: list, bloco_texto: str = "") -> dict:
     """Envia até 3 imagens PNG ao gpt-4o Vision e retorna o dict parseado."""
     import base64
 
@@ -326,8 +331,7 @@ def _visao_batch(client, png_bytes_list: list, bloco_texto: str = "") -> Optiona
 
         data = json.loads(response.choices[0].message.content)
         if not isinstance(data.get("lancamentos"), list):
-            logger.warning("⚠️ Vision batch retornou JSON sem 'lancamentos'.")
-            return None
+            raise VisionBatchError("Vision retornou um batch incompleto")
 
         usage = response.usage
         n_lanc = len(data.get("lancamentos", []))
@@ -341,9 +345,12 @@ def _visao_batch(client, png_bytes_list: list, bloco_texto: str = "") -> Optiona
             print(f"   Primeiro (vision): {data['lancamentos'][0]}")
         return data
 
+    except VisionBatchError:
+        logger.exception("Vision retornou batch inválido")
+        raise
     except Exception as exc:
-        logger.warning("⚠️ Vision batch falhou: %s", exc)
-        return None
+        logger.exception("Falha ao processar batch Vision")
+        raise VisionBatchError("Falha ao processar um batch Vision") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -382,17 +389,21 @@ def parsear_bloco_fornecedor_ia_visao(png_bytes_list: list, bloco_texto: str = "
         print(f"   📦 Batch {batch_idx + 1}/{n_batches} (págs {start}–{start + len(batch) - 1})...")
 
         ctx = bloco_texto if batch_idx == 0 else ""
-        resultado = _visao_batch(client, batch, ctx)
+        try:
+            resultado = _visao_batch(client, batch, ctx)
+        except VisionBatchError as exc:
+            raise VisionBatchError(
+                f"Falha no batch Vision {batch_idx + 1} de {n_batches}"
+            ) from exc
 
-        if resultado:
-            if batch_idx == 0:
-                saldo_anterior = resultado.get("saldo_anterior") or 0.0
-                saldo_anterior_tipo = resultado.get("saldo_anterior_tipo") or ""
-            todos_lancamentos.extend(resultado.get("lancamentos", []))
-            if resultado.get("total_debito"):
-                total_debito = resultado["total_debito"]
-            if resultado.get("total_credito"):
-                total_credito = resultado["total_credito"]
+        if batch_idx == 0:
+            saldo_anterior = resultado.get("saldo_anterior") or 0.0
+            saldo_anterior_tipo = resultado.get("saldo_anterior_tipo") or ""
+        todos_lancamentos.extend(resultado["lancamentos"])
+        if resultado.get("total_debito"):
+            total_debito = resultado["total_debito"]
+        if resultado.get("total_credito"):
+            total_credito = resultado["total_credito"]
 
     if not todos_lancamentos:
         return None

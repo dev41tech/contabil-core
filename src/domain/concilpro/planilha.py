@@ -73,7 +73,29 @@ def _decimal(valor) -> Decimal:
     if valor is None or valor == "":
         return Decimal("0")
     if isinstance(valor, str):
-        limpo = valor.strip().replace(".", "").replace(",", ".")
+        limpo = re.sub(r"[^\d,().+-]", "", valor.strip())
+        negativo_parenteses = limpo.startswith("(") and limpo.endswith(")")
+        limpo = limpo.strip("()")
+
+        if "," in limpo and "." in limpo:
+            # O separador mais à direita é o decimal; o outro é milhar.
+            if limpo.rfind(",") > limpo.rfind("."):
+                limpo = limpo.replace(".", "").replace(",", ".")
+            else:
+                limpo = limpo.replace(",", "")
+        elif "," in limpo:
+            partes = limpo.split(",")
+            if len(partes) == 2 and 1 <= len(partes[1]) <= 2:
+                limpo = ".".join(partes)
+            else:
+                limpo = "".join(partes)
+        elif "." in limpo:
+            partes = limpo.split(".")
+            if not (len(partes) == 2 and 1 <= len(partes[1]) <= 2):
+                limpo = "".join(partes)
+
+        if negativo_parenteses and not limpo.startswith("-"):
+            limpo = "-" + limpo
         try:
             return Decimal(limpo).quantize(Decimal("0.01"))
         except Exception:

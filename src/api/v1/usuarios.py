@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,8 +23,8 @@ router = APIRouter(prefix="/usuarios", tags=["usuarios"])
 
 @router.get("", response_model=UsuarioListResponse)
 async def listar_usuarios(
-    page: int = 1,
-    page_size: int = 50,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
     ctx: AuthContext = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> UsuarioListResponse:

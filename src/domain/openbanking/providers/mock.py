@@ -50,8 +50,16 @@ _HISTORICOS_CREDITO = [
 class MockProvider(IOpenBankingProvider):
     """Provedor mock — não faz nenhuma chamada de rede."""
 
-    async def criar_connect_token(self, item_id: str | None = None) -> str:
+    async def criar_connect_token(
+        self,
+        item_id: str | None = None,
+        client_user_id: str | None = None,
+    ) -> str:
         return f"mock_{secrets.token_hex(12)}"
+
+    async def validar_item(self, item_id: str, client_user_id: str) -> bool:
+        # O mock não possui backend externo; a sessão assinada é a fronteira de segurança.
+        return bool(item_id and client_user_id)
 
     async def obter_contas(self, item_id: str) -> list[ContaInfo]:
         banco = _banco_from_item(item_id)
@@ -61,7 +69,7 @@ class MockProvider(IOpenBankingProvider):
         numero = str(rng.randint(10000, 99999)) + "-" + str(rng.randint(0, 9))
         return [
             ContaInfo(
-                account_id=f"mock_acc_{item_id[:8]}",
+                account_id=f"mock_acc_{hashlib.sha1(item_id.encode()).hexdigest()[:12]}",
                 banco_sigla=sigla,
                 instituicao_nome=nome,
                 instituicao_codigo=codigo,

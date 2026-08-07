@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
 
 from src.core.cnpj import valido as cnpj_valido
 from src.core.errors import ConflictError, EmpresaNaoEncontradaError
-from src.db.models import Empresa
+from src.db.models import Empresa, Permissao
 from src.schemas.empresas import (
     CnpjInvalidoListResponse,
     EmpresaCnpjInvalidoResponse,
@@ -24,22 +26,47 @@ logger = structlog.get_logger(__name__)
 
 
 class EmpresaService:
-    def __init__(self, db: AsyncSession, tenant_id: UUID) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        tenant_id: UUID,
+        user_id: UUID,
+        role: str,
+    ) -> None:
         self._db = db
         self._tenant_id = tenant_id
+        self._user_id = user_id
+        self._role = role
+
+    def _com_escopo_usuario(self, query: Select[Any]) -> Select[Any]:
+        if self._role == "admin":
+            return query
+        return query.join(
+            Permissao,
+            Permissao.empresa_id == Empresa.id,
+        ).where(
+            Permissao.usuario_id == self._user_id,
+            Empresa.ativa == True,
+        )
 
     async def listar(self, page: int = 1, page_size: int = 50) -> EmpresaListResponse:
         offset = (page - 1) * page_size
 
-        count_q = select(func.count()).where(
-            Empresa.tenant_id == self._tenant_id,
-            Empresa.deleted_at == None,
+        count_q = self._com_escopo_usuario(
+            select(func.count()).select_from(Empresa).where(
+                Empresa.tenant_id == self._tenant_id,
+                Empresa.deleted_at == None,
+            )
         )
         total = (await self._db.execute(count_q)).scalar_one()
 
         rows_q = (
-            select(Empresa)
-            .where(Empresa.tenant_id == self._tenant_id, Empresa.deleted_at == None)
+            self._com_escopo_usuario(
+                select(Empresa).where(
+                    Empresa.tenant_id == self._tenant_id,
+                    Empresa.deleted_at == None,
+                )
+            )
             .order_by(Empresa.razao_social)
             .offset(offset)
             .limit(page_size)
@@ -66,8 +93,12 @@ class EmpresaService:
         """
         rows = (
             await self._db.execute(
-                select(Empresa)
-                .where(Empresa.tenant_id == self._tenant_id, Empresa.deleted_at == None)
+                self._com_escopo_usuario(
+                    select(Empresa).where(
+                        Empresa.tenant_id == self._tenant_id,
+                        Empresa.deleted_at == None,
+                    )
+                )
                 .order_by(Empresa.razao_social)
             )
         ).scalars().all()
@@ -144,11 +175,11 @@ class EmpresaService:
 
     async def _get_or_404(self, empresa_id: UUID) -> Empresa:
         result = await self._db.execute(
-            select(Empresa).where(
+            self._com_escopo_usuario(select(Empresa).where(
                 Empresa.id == empresa_id,
                 Empresa.tenant_id == self._tenant_id,
                 Empresa.deleted_at == None,
-            )
+            ))
         )
         empresa = result.scalar_one_or_none()
         if not empresa:

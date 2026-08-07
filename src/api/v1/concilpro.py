@@ -1,7 +1,7 @@
 """
 CONCILPRO — API de Conciliação de Razão de Fornecedores.
 
-Endpoints montados em /api/v1/concilpro/*.
+Endpoints montados em /api/v1/empresas/{empresa_id}/concilpro/*.
 
 Endpoints de query usam AsyncSession do FastAPI.
 O processamento pesado (parsing + conciliação) roda em BackgroundTasks com
@@ -11,17 +11,17 @@ from __future__ import annotations
 
 import io
 import logging
-import traceback
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, text
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import require_auth, require_csrf
+from src.api.deps import get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
 from src.core.errors import AppError
 from src.db.models import (
@@ -35,18 +35,11 @@ from src.db.session import SyncSessionLocal, get_db
 
 logger = logging.getLogger(__name__)
 
-# Autenticação no ROUTER, não rota a rota: assim é fail-closed — rota nova nasce
-# protegida em vez de depender de alguém lembrar de anotá-la. Até 2026-08-03 as
-# 9 rotas deste módulo estavam abertas na internet, incluindo o export em Excel
-# com nome, CNPJ e saldo de todos os fornecedores.
-#
-# `require_auth` (e não `get_company_context`) porque as tabelas cp_* ainda não
-# têm empresa_id — sem esse vínculo não há como filtrar por empresa. Assim que
-# o escopo por tenant existir, isto vira get_company_context.
+# Escopo no router, não rota a rota: toda rota nova exige acesso à empresa do path.
 router = APIRouter(
-    prefix="/concilpro",
+    prefix="/empresas/{empresa_id}/concilpro",
     tags=["concilpro"],
-    dependencies=[Depends(require_auth)],
+    dependencies=[Depends(get_company_context)],
 )
 
 # ============================================================================
@@ -65,11 +58,62 @@ def _converter_data_br(valor) -> Optional[datetime]:
         return None
 
 
+CENTAVO = Decimal("0.01")
+
+
+def _moeda(valor) -> Decimal:
+    """Normaliza um valor para a precisão persistida pelo schema."""
+    return Decimal(str(valor or "0")).quantize(CENTAVO)
+
+
+def _saldo_anterior_assinado(valor, tipo: str | None) -> Decimal:
+    """Fornecedor tem natureza credora: C aumenta a obrigação e D a reduz."""
+    modulo = abs(_moeda(valor))
+    return -modulo if (tipo or "").strip().upper() == "D" else modulo
+
+
+def _calcular_posicao_fornecedor(
+    saldo_anterior,
+    saldo_anterior_tipo: str | None,
+    total_debito,
+    total_credito,
+    tem_lancamentos: bool,
+) -> tuple[Decimal, str, str]:
+    """Retorna saldo assinado, tipo final e status pela mesma equação contábil."""
+    abertura = _saldo_anterior_assinado(saldo_anterior, saldo_anterior_tipo)
+    debitos = _moeda(total_debito)
+    creditos = _moeda(total_credito)
+    saldo = (abertura + creditos - debitos).quantize(CENTAVO)
+
+    if not tem_lancamentos and abertura == 0 and debitos == 0 and creditos == 0:
+        status = "SEM_MOVIMENTO"
+    elif saldo == 0:
+        status = "QUITADO"
+    elif saldo < 0:
+        status = "ADIANTADO"
+    else:
+        status = "EM_ABERTO"
+
+    saldo_tipo = "C" if saldo > 0 else ("D" if saldo < 0 else "")
+    return saldo, saldo_tipo, status
+
+
+def _celula_texto_segura(valor: str | None) -> str | None:
+    """Neutraliza texto que o Excel interpretaria como fórmula."""
+    if valor is None:
+        return None
+    texto = str(valor)
+    significativo = texto.lstrip()
+    if significativo.startswith(("=", "+", "-", "@")):
+        return "'" + texto
+    return texto
+
+
 # ============================================================================
 # BACKGROUND TASK (síncrono — usa psycopg2 via SyncSessionLocal)
 # ============================================================================
 
-def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
+def _processar_arquivo_background(arquivo_id: int, empresa_id: UUID, conteudo: bytes) -> None:
     """
     Processamento pesado em background — usa sessão própria (não a da request).
     Chamado pelo BackgroundTasks do FastAPI após o upload retornar ao cliente.
@@ -82,7 +126,10 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
     db = None
     try:
         db = SyncSessionLocal()
-        arquivo = db.query(ArquivoImportado).filter(ArquivoImportado.id == arquivo_id).first()
+        arquivo = db.query(ArquivoImportado).filter(
+            ArquivoImportado.id == arquivo_id,
+            ArquivoImportado.empresa_id == empresa_id,
+        ).first()
         if not arquivo:
             logger.error("❌ Background: arquivo_id=%d não encontrado", arquivo_id)
             return
@@ -154,8 +201,16 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 )
 
             saldo_ant_tipo = (forn_data.get("saldo_anterior_tipo") or "")[:1]
+            saldo_final, saldo_final_tipo, status_pagamento = _calcular_posicao_fornecedor(
+                saldo_anterior,
+                saldo_ant_tipo,
+                total_debito,
+                total_credito,
+                bool(lancamentos_raw),
+            )
 
             fornecedor = Fornecedor(
+                empresa_id          = empresa_id,
                 arquivo_origem_id   = arquivo.id,
                 codigo_conta        = forn_data["codigo_conta"][:10],
                 conta_contabil      = forn_data["conta_contabil"][:50],
@@ -164,7 +219,10 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 saldo_anterior_tipo = saldo_ant_tipo,
                 total_debito        = total_debito,
                 total_credito       = total_credito,
-                saldo_final         = saldo_anterior + total_credito - total_debito,
+                saldo_final         = saldo_final,
+                saldo_final_tipo    = saldo_final_tipo,
+                valor_a_pagar       = saldo_final,
+                status_pagamento    = status_pagamento,
                 divergencia_calculo = bool(divergencias),
                 mensagem_erro       = "; ".join(divergencias)[:2000] or None,
             )
@@ -183,6 +241,7 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                 tipo_op_val       = (lanc_data.get("tipo_operacao") or "OUTRO")[:20]
 
                 db.add(LancamentoFornecedor(
+                    empresa_id            = empresa_id,
                     fornecedor_id         = fornecedor.id,
                     data_lancamento       = lanc_data["data_lancamento"],
                     lote                  = lote_val,
@@ -199,46 +258,51 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
                     classificado_por_ia   = lanc_data.get("classificado_por_ia", False),
                 ))
 
-        db.commit()
-        logger.info("✅ Dados salvos no banco.")
-
         logger.info("🔄 Iniciando conciliação inteligente…")
-        conciliar_todos_fornecedores_inteligente(db, arquivo.id)
+        conciliar_todos_fornecedores_inteligente(db, arquivo.id, empresa_id)
 
-        for forn in db.query(Fornecedor).filter(Fornecedor.arquivo_origem_id == arquivo.id).all():
-            forn.valor_a_pagar = forn.total_credito - forn.total_debito
-            sem_movimento = (
-                forn.total_credito == 0
-                and forn.total_debito == 0
-                and not forn.lancamentos
+        for forn in db.query(Fornecedor).filter(
+            Fornecedor.arquivo_origem_id == arquivo.id,
+            Fornecedor.empresa_id == empresa_id,
+        ).all():
+            saldo_final, saldo_final_tipo, status_pagamento = _calcular_posicao_fornecedor(
+                forn.saldo_anterior,
+                forn.saldo_anterior_tipo,
+                forn.total_debito,
+                forn.total_credito,
+                bool(forn.lancamentos),
             )
-            if sem_movimento:
-                # Conta aberta no plano sem movimento no período. Não é QUITADO:
-                # contá-la ali inflaria a métrica de quitados com contas que
-                # nunca tiveram lançamento.
-                forn.status_pagamento = "SEM_MOVIMENTO"
-            elif abs(forn.valor_a_pagar) <= Decimal("0.01"):
-                forn.status_pagamento = "QUITADO"
-            elif forn.valor_a_pagar < 0:
-                forn.status_pagamento = "ADIANTADO"
-            else:
-                forn.status_pagamento = "EM_ABERTO"
+            forn.saldo_final = saldo_final
+            forn.saldo_final_tipo = saldo_final_tipo
+            forn.valor_a_pagar = saldo_final
+            forn.status_pagamento = status_pagamento
 
         arquivo.status = "CONCLUIDO"
         db.commit()
         logger.info("✅ Processamento concluído para arquivo_id=%d", arquivo_id)
 
-    except Exception as exc:
-        logger.error("❌ Background: erro no arquivo_id=%d:\n%s", arquivo_id, traceback.format_exc())
+    except Exception:
+        logger.exception("Background: erro no arquivo_id=%d empresa_id=%s", arquivo_id, empresa_id)
         if db is not None:
+            db.rollback()
             try:
-                arquivo = db.query(ArquivoImportado).filter(ArquivoImportado.id == arquivo_id).first()
+                arquivo = db.query(ArquivoImportado).filter(
+                    ArquivoImportado.id == arquivo_id,
+                    ArquivoImportado.empresa_id == empresa_id,
+                ).first()
                 if arquivo:
                     arquivo.status = "ERRO"
-                    arquivo.mensagem_erro = str(exc)
+                    arquivo.mensagem_erro = (
+                        "Não foi possível processar o arquivo. Tente novamente."
+                    )
                     db.commit()
             except Exception:
-                pass
+                db.rollback()
+                logger.exception(
+                    "Falha ao registrar ERRO no arquivo_id=%d empresa_id=%s",
+                    arquivo_id,
+                    empresa_id,
+                )
     finally:
         if db is not None:
             db.close()
@@ -251,6 +315,7 @@ def _processar_arquivo_background(arquivo_id: int, conteudo: bytes) -> None:
 @router.post("/upload", dependencies=[Depends(require_csrf)])
 async def upload_arquivo(
     background_tasks: BackgroundTasks,
+    empresa_id: UUID,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
@@ -271,7 +336,10 @@ async def upload_arquivo(
 
         # ── Verifica duplicata ──────────────────────────────────────────────────
         result = await db.execute(
-            select(ArquivoImportado).where(ArquivoImportado.hash_arquivo == hash_arquivo)
+            select(ArquivoImportado).where(
+                ArquivoImportado.empresa_id == empresa_id,
+                ArquivoImportado.hash_arquivo == hash_arquivo,
+            )
         )
         existente = result.scalar_one_or_none()
 
@@ -308,23 +376,37 @@ async def upload_arquivo(
 
             # Busca fornecedor IDs para cascade delete
             forn_result = await db.execute(
-                select(Fornecedor.id).where(Fornecedor.arquivo_origem_id == existente.id)
+                select(Fornecedor.id).where(
+                    Fornecedor.empresa_id == empresa_id,
+                    Fornecedor.arquivo_origem_id == existente.id,
+                )
             )
             forn_ids = [r[0] for r in forn_result.all()]
 
             if forn_ids:
-                from sqlalchemy import delete
                 await db.execute(
-                    delete(ConciliacaoInterna).where(ConciliacaoInterna.fornecedor_id.in_(forn_ids))
+                    delete(ConciliacaoInterna).where(
+                        ConciliacaoInterna.empresa_id == empresa_id,
+                        ConciliacaoInterna.fornecedor_id.in_(forn_ids),
+                    )
                 )
                 await db.execute(
-                    delete(Divergencia).where(Divergencia.fornecedor_id.in_(forn_ids))
+                    delete(Divergencia).where(
+                        Divergencia.empresa_id == empresa_id,
+                        Divergencia.fornecedor_id.in_(forn_ids),
+                    )
                 )
                 await db.execute(
-                    delete(LancamentoFornecedor).where(LancamentoFornecedor.fornecedor_id.in_(forn_ids))
+                    delete(LancamentoFornecedor).where(
+                        LancamentoFornecedor.empresa_id == empresa_id,
+                        LancamentoFornecedor.fornecedor_id.in_(forn_ids),
+                    )
                 )
                 await db.execute(
-                    delete(Fornecedor).where(Fornecedor.arquivo_origem_id == existente.id)
+                    delete(Fornecedor).where(
+                        Fornecedor.empresa_id == empresa_id,
+                        Fornecedor.arquivo_origem_id == existente.id,
+                    )
                 )
 
             existente.status             = "PROCESSANDO"
@@ -339,7 +421,12 @@ async def upload_arquivo(
             # (get_db faz commit apenas após a resposta ser enviada — race condition)
             await db.commit()
 
-            background_tasks.add_task(_processar_arquivo_background, existente.id, conteudo)
+            background_tasks.add_task(
+                _processar_arquivo_background,
+                existente.id,
+                empresa_id,
+                conteudo,
+            )
             return {
                 "success": True,
                 "arquivo_id": existente.id,
@@ -349,6 +436,7 @@ async def upload_arquivo(
 
         # ── Arquivo novo ────────────────────────────────────────────────────────
         arquivo = ArquivoImportado(
+            empresa_id=empresa_id,
             nome_arquivo=file.filename,
             hash_arquivo=hash_arquivo,
             status="PROCESSANDO",
@@ -361,7 +449,12 @@ async def upload_arquivo(
         # (get_db faz commit apenas após a resposta ser enviada — race condition)
         await db.commit()
 
-        background_tasks.add_task(_processar_arquivo_background, arquivo_id_novo, conteudo)
+        background_tasks.add_task(
+            _processar_arquivo_background,
+            arquivo_id_novo,
+            empresa_id,
+            conteudo,
+        )
 
         return {
             "success": True,
@@ -374,8 +467,12 @@ async def upload_arquivo(
         # AppError já carrega o status certo (413 no upload acima do limite) —
         # sem esta linha o `except Exception` abaixo o mascararia como 500.
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Falha no upload do ConcilPro para empresa_id=%s", empresa_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível receber o arquivo para processamento.",
+        )
 
 
 # ============================================================================
@@ -383,10 +480,17 @@ async def upload_arquivo(
 # ============================================================================
 
 @router.get("/arquivos/{arquivo_id}/status")
-async def status_arquivo(arquivo_id: int, db: AsyncSession = Depends(get_db)):
+async def status_arquivo(
+    empresa_id: UUID,
+    arquivo_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     """Retorna o status atual do processamento de um arquivo."""
     result = await db.execute(
-        select(ArquivoImportado).where(ArquivoImportado.id == arquivo_id)
+        select(ArquivoImportado).where(
+            ArquivoImportado.id == arquivo_id,
+            ArquivoImportado.empresa_id == empresa_id,
+        )
     )
     arquivo = result.scalar_one_or_none()
     if not arquivo:
@@ -401,9 +505,11 @@ async def status_arquivo(arquivo_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/arquivos")
-async def listar_arquivos(db: AsyncSession = Depends(get_db)):
+async def listar_arquivos(empresa_id: UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(ArquivoImportado).order_by(ArquivoImportado.created_at.desc())
+        select(ArquivoImportado)
+        .where(ArquivoImportado.empresa_id == empresa_id)
+        .order_by(ArquivoImportado.created_at.desc())
     )
     arquivos = result.scalars().all()
     return [
@@ -422,16 +528,26 @@ async def listar_arquivos(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/resumo/{arquivo_id}")
-async def obter_resumo(arquivo_id: int, db: AsyncSession = Depends(get_db)):
+async def obter_resumo(
+    empresa_id: UUID,
+    arquivo_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
-        select(ArquivoImportado).where(ArquivoImportado.id == arquivo_id)
+        select(ArquivoImportado).where(
+            ArquivoImportado.id == arquivo_id,
+            ArquivoImportado.empresa_id == empresa_id,
+        )
     )
     arquivo = result.scalar_one_or_none()
     if not arquivo:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado")
 
     forn_result = await db.execute(
-        select(Fornecedor).where(Fornecedor.arquivo_origem_id == arquivo_id)
+        select(Fornecedor).where(
+            Fornecedor.empresa_id == empresa_id,
+            Fornecedor.arquivo_origem_id == arquivo_id,
+        )
     )
     fornecedores = forn_result.scalars().all()
 
@@ -457,13 +573,17 @@ async def obter_resumo(arquivo_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/fornecedores")
 async def listar_fornecedores(
+    empresa_id: UUID,
     arquivo_id: int,
     status: Optional[str] = None,
     skip: int = 0,
     limit: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Fornecedor).where(Fornecedor.arquivo_origem_id == arquivo_id)
+    stmt = select(Fornecedor).where(
+        Fornecedor.empresa_id == empresa_id,
+        Fornecedor.arquivo_origem_id == arquivo_id,
+    )
 
     if status:
         stmt = stmt.where(Fornecedor.status_pagamento == status)
@@ -493,9 +613,16 @@ async def listar_fornecedores(
 
 
 @router.get("/fornecedores/{fornecedor_id}")
-async def obter_fornecedor_detalhado(fornecedor_id: int, db: AsyncSession = Depends(get_db)):
+async def obter_fornecedor_detalhado(
+    empresa_id: UUID,
+    fornecedor_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
-        select(Fornecedor).where(Fornecedor.id == fornecedor_id)
+        select(Fornecedor).where(
+            Fornecedor.id == fornecedor_id,
+            Fornecedor.empresa_id == empresa_id,
+        )
     )
     fornecedor = result.scalar_one_or_none()
     if not fornecedor:
@@ -503,7 +630,10 @@ async def obter_fornecedor_detalhado(fornecedor_id: int, db: AsyncSession = Depe
 
     lanc_result = await db.execute(
         select(LancamentoFornecedor)
-        .where(LancamentoFornecedor.fornecedor_id == fornecedor_id)
+        .where(
+            LancamentoFornecedor.fornecedor_id == fornecedor_id,
+            LancamentoFornecedor.empresa_id == empresa_id,
+        )
         .order_by(LancamentoFornecedor.data_lancamento)
     )
     lancamentos = lanc_result.scalars().all()
@@ -559,12 +689,26 @@ async def obter_fornecedor_detalhado(fornecedor_id: int, db: AsyncSession = Depe
 
 
 @router.get("/fornecedores/{fornecedor_id}/conciliacao-fifo")
-async def conciliacao_fifo_detalhada(fornecedor_id: int, db: AsyncSession = Depends(get_db)):
+async def conciliacao_fifo_detalhada(
+    empresa_id: UUID,
+    fornecedor_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     """Retorna compras com trace FIFO de pagamentos."""
+    fornecedor_result = await db.execute(
+        select(Fornecedor.id).where(
+            Fornecedor.id == fornecedor_id,
+            Fornecedor.empresa_id == empresa_id,
+        )
+    )
+    if fornecedor_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Fornecedor não encontrado")
+
     compras_result = await db.execute(
         select(LancamentoFornecedor)
         .where(
             LancamentoFornecedor.fornecedor_id == fornecedor_id,
+            LancamentoFornecedor.empresa_id == empresa_id,
             LancamentoFornecedor.tipo_operacao == "COMPRA",
         )
         .order_by(LancamentoFornecedor.data_lancamento)
@@ -575,21 +719,22 @@ async def conciliacao_fifo_detalhada(fornecedor_id: int, db: AsyncSession = Depe
         select(LancamentoFornecedor)
         .where(
             LancamentoFornecedor.fornecedor_id == fornecedor_id,
+            LancamentoFornecedor.empresa_id == empresa_id,
             LancamentoFornecedor.tipo_operacao == "PAGAMENTO",
         )
         .order_by(LancamentoFornecedor.data_lancamento)
     )
     pagamentos_db = pags_result.scalars().all()
 
-    saldo = {c.id: Decimal(str(c.valor_credito or 0)) for c in compras}
+    saldo = {c.id: _moeda(c.valor_credito) for c in compras}
     pags_por_nf: dict = {c.id: [] for c in compras}
 
     for pag in pagamentos_db:
-        restante = Decimal(str(pag.valor_debito or 0))
+        restante = _moeda(pag.valor_debito)
         for compra in compras:
-            if saldo[compra.id] <= Decimal("0.01"):
+            if saldo[compra.id] <= 0:
                 continue
-            if restante <= Decimal("0.01"):
+            if restante <= 0:
                 break
             aplicado = min(restante, saldo[compra.id])
             saldo[compra.id] -= aplicado
@@ -620,11 +765,17 @@ async def conciliacao_fifo_detalhada(fornecedor_id: int, db: AsyncSession = Depe
 
 
 @router.get("/divergencias")
-async def listar_divergencias(arquivo_id: int, db: AsyncSession = Depends(get_db)):
+async def listar_divergencias(
+    empresa_id: UUID,
+    arquivo_id: int,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(Divergencia)
         .join(Fornecedor, Divergencia.fornecedor_id == Fornecedor.id)
         .where(
+            Divergencia.empresa_id == empresa_id,
+            Fornecedor.empresa_id == empresa_id,
             Fornecedor.arquivo_origem_id == arquivo_id,
             Divergencia.resolvido.is_(False),
         )
@@ -650,6 +801,7 @@ async def listar_divergencias(arquivo_id: int, db: AsyncSession = Depends(get_db
 
 @router.get("/export/excel/{arquivo_id}")
 async def exportar_excel(
+    empresa_id: UUID,
     arquivo_id: int,
     tipo: str = Query("completo", pattern="^(completo|em_aberto|divergencias)$"),
     db: AsyncSession = Depends(get_db),
@@ -659,7 +811,10 @@ async def exportar_excel(
     from openpyxl.styles import Font, PatternFill
 
     result = await db.execute(
-        select(ArquivoImportado).where(ArquivoImportado.id == arquivo_id)
+        select(ArquivoImportado).where(
+            ArquivoImportado.id == arquivo_id,
+            ArquivoImportado.empresa_id == empresa_id,
+        )
     )
     arquivo = result.scalar_one_or_none()
     if not arquivo:
@@ -681,7 +836,10 @@ async def exportar_excel(
         cell.font = header_font
         cell.fill = header_fill
 
-    stmt = select(Fornecedor).where(Fornecedor.arquivo_origem_id == arquivo_id)
+    stmt = select(Fornecedor).where(
+        Fornecedor.empresa_id == empresa_id,
+        Fornecedor.arquivo_origem_id == arquivo_id,
+    )
     if tipo == "em_aberto":
         stmt = stmt.where(Fornecedor.status_pagamento == "EM_ABERTO")
     elif tipo == "divergencias":
@@ -692,14 +850,14 @@ async def exportar_excel(
     fornecedores_list = forn_result.scalars().all()
 
     for row, f in enumerate(fornecedores_list, 2):
-        ws.cell(row=row, column=1,  value=f.codigo_conta)
-        ws.cell(row=row, column=2,  value=f.conta_contabil)
-        ws.cell(row=row, column=3,  value=f.nome_fornecedor)
-        ws.cell(row=row, column=4,  value=f.cnpj)
+        ws.cell(row=row, column=1,  value=_celula_texto_segura(f.codigo_conta))
+        ws.cell(row=row, column=2,  value=_celula_texto_segura(f.conta_contabil))
+        ws.cell(row=row, column=3,  value=_celula_texto_segura(f.nome_fornecedor))
+        ws.cell(row=row, column=4,  value=_celula_texto_segura(f.cnpj))
         ws.cell(row=row, column=5,  value=float(f.total_credito or 0))
         ws.cell(row=row, column=6,  value=float(f.total_debito or 0))
         ws.cell(row=row, column=7,  value=float(f.valor_a_pagar or 0))
-        ws.cell(row=row, column=8,  value=f.status_pagamento)
+        ws.cell(row=row, column=8,  value=_celula_texto_segura(f.status_pagamento))
         ws.cell(row=row, column=9,  value=f.qtd_nfs_pendentes)
         ws.cell(row=row, column=10, value="Sim" if f.divergencia_calculo else "Não")
 

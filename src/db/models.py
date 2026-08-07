@@ -22,9 +22,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from src.db.session import Base
 
@@ -207,9 +208,13 @@ class AgenciaBancaria(Base, TimestampMixin):
     numero: Mapped[str] = mapped_column(String(20), nullable=False)
     digito: Mapped[str | None] = mapped_column(String(5), nullable=True)
     ativa: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    conta_contabil_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("plano_contas.id"), nullable=True, unique=True
+    )
 
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="agencias")
     regras: Mapped[list[Regra]] = relationship("Regra", back_populates="agencia")
+    conta_contabil: Mapped[PlanoConta | None] = relationship("PlanoConta")
 
     @property
     def descricao(self) -> str:
@@ -231,6 +236,7 @@ class Regra(Base, TimestampMixin):
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
+    historico_normalizado: Mapped[str] = mapped_column(String(500), nullable=False)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_enum"), nullable=False)
     tipo: Mapped[str] = mapped_column(
         Enum("automatica", "manual", name="tipo_regra_enum"), nullable=False
@@ -243,8 +249,21 @@ class Regra(Base, TimestampMixin):
     agencia: Mapped[AgenciaBancaria] = relationship("AgenciaBancaria", back_populates="regras")
 
     __table_args__ = (
-        UniqueConstraint("empresa_id", "agencia_id", "historico", name="uq_regra_empresa_agencia_historico"),
+        Index(
+            "uq_regra_empresa_agencia_historico_normalizado_ativa",
+            "empresa_id",
+            "agencia_id",
+            "historico_normalizado",
+            unique=True,
+            postgresql_where=text("ativa = true AND deleted_at IS NULL"),
+            sqlite_where=text("ativa = 1 AND deleted_at IS NULL"),
+        ),
     )
+
+    @validates("historico")
+    def _normalizar_historico(self, _key: str, value: str) -> str:
+        self.historico_normalizado = value.strip().lower()
+        return value
 
 
 # ─────────────────────────────────────────────────────────────── Extrato / Transação
@@ -281,7 +300,12 @@ class RegistroContabil(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
-    transacao_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("transacoes.id"), nullable=True)
+    transacao_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transacoes.id"), nullable=True
+    )
+    lancamento_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), default=uuid.uuid4, nullable=False
+    )
     conta_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("plano_contas.id"), nullable=False)
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -296,7 +320,18 @@ class RegistroContabil(Base, TimestampMixin):
     conta: Mapped[PlanoConta] = relationship("PlanoConta")
     agencia: Mapped[AgenciaBancaria] = relationship("AgenciaBancaria")
 
-    __table_args__ = (Index("ix_registro_empresa_data", "empresa_id", "data_lancamento"),)
+    __table_args__ = (
+        Index("ix_registro_empresa_data", "empresa_id", "data_lancamento"),
+        Index("ix_registro_lancamento", "lancamento_id"),
+        Index(
+            "uq_registro_transacao_dc_ativo",
+            "transacao_id",
+            "dc",
+            unique=True,
+            postgresql_where=text("transacao_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("transacao_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────── Nota Fiscal (NF-e / NFS-e)
@@ -327,10 +362,13 @@ class NotaFiscal(Base, TimestampMixin):
     transacao_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transacoes.id"), nullable=True
     )
-    chave_acesso: Mapped[str | None] = mapped_column(String(60), nullable=True, unique=True)
+    chave_acesso: Mapped[str | None] = mapped_column(String(44), nullable=True)
+    dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     __table_args__ = (
+        UniqueConstraint("empresa_id", "chave_acesso", name="uq_nota_empresa_chave"),
+        UniqueConstraint("empresa_id", "dedup_key", name="uq_nota_empresa_dedup"),
         Index("ix_nota_empresa_status", "empresa_id", "status"),
         Index("ix_nota_empresa_emissao", "empresa_id", "data_emissao"),
     )
@@ -416,6 +454,7 @@ class FaturaCartao(Base, TimestampMixin):
 
     __table_args__ = (
         UniqueConstraint("cartao_id", "competencia", name="uq_fatura_cartao_competencia"),
+        UniqueConstraint("transacao_id", name="uq_fatura_transacao"),
         Index("ix_fatura_empresa", "empresa_id"),
         Index("ix_fatura_status", "empresa_id", "status"),
     )
@@ -476,6 +515,19 @@ class ConexaoBancaria(Base, TimestampMixin):
     erro_msg: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     __table_args__ = (
+        Index(
+            "uq_conexao_empresa_provedor_conta",
+            "empresa_id",
+            "provedor",
+            "account_id_externo",
+            unique=True,
+            postgresql_where=text(
+                "deleted_at IS NULL AND account_id_externo IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "deleted_at IS NULL AND account_id_externo IS NOT NULL"
+            ),
+        ),
         Index("ix_conexao_empresa", "empresa_id"),
         Index("ix_conexao_status", "empresa_id", "status"),
     )
@@ -511,6 +563,13 @@ class NeoDecisao(Base):
     __table_args__ = (
         Index("ix_neo_empresa_resultado", "empresa_id", "resultado"),
         Index("ix_neo_transacao", "transacao_id"),
+        Index(
+            "uq_neo_sem_regra_transacao",
+            "transacao_id",
+            unique=True,
+            postgresql_where=text("resultado = 'sem_regra'"),
+            sqlite_where=text("resultado = 'sem_regra'"),
+        ),
     )
 
 
@@ -593,8 +652,9 @@ class CpArquivo(Base):
     __tablename__ = "cp_arquivo"
 
     id              = _Col(_Int, primary_key=True, index=True)
+    empresa_id      = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     nome_arquivo    = _Col(_Str(255), nullable=False)
-    hash_arquivo    = _Col(_Str(64), unique=True, nullable=False)
+    hash_arquivo    = _Col(_Str(64), nullable=False)
     empresa         = _Col(_Str(255))
     cnpj_empresa    = _Col(_Str(18))
     total_fornecedores = _Col(_Int, default=0)
@@ -607,12 +667,18 @@ class CpArquivo(Base):
 
     fornecedores    = _rel("CpFornecedor", back_populates="arquivo_origem")
 
+    __table_args__ = (
+        UniqueConstraint("empresa_id", "hash_arquivo", name="uq_cp_arquivo_empresa_hash"),
+        Index("ix_cp_arquivo_empresa", "empresa_id"),
+    )
+
 
 class CpFornecedor(Base):
     """CONCILPRO — conta de fornecedor extraída do Razão."""
     __tablename__ = "cp_fornecedor"
 
     id                  = _Col(_Int, primary_key=True, index=True)
+    empresa_id          = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     arquivo_origem_id   = _Col(_Int, _FK("cp_arquivo.id"))
     codigo_conta        = _Col(_Str(10), nullable=False)
     conta_contabil      = _Col(_Str(50), nullable=False)
@@ -638,6 +704,7 @@ class CpFornecedor(Base):
     conciliacoes    = _rel("CpConciliacao", back_populates="fornecedor", cascade="all, delete-orphan")
 
     __table_args__ = (
+        Index("ix_cp_fornecedor_empresa", "empresa_id"),
         Index("ix_cp_fornecedor_conta", "codigo_conta", "conta_contabil"),
         Index("ix_cp_fornecedor_status", "status_pagamento"),
     )
@@ -648,6 +715,7 @@ class CpLancamento(Base):
     __tablename__ = "cp_lancamento"
 
     id                    = _Col(_Int, primary_key=True, index=True)
+    empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     data_lancamento       = _Col(_Date, nullable=False)
     lote                  = _Col(_Str(50))
@@ -673,6 +741,7 @@ class CpLancamento(Base):
                                 back_populates="lancamento_debito")
 
     __table_args__ = (
+        Index("ix_cp_lancamento_empresa", "empresa_id"),
         Index("ix_cp_lancamento_forn_data", "fornecedor_id", "data_lancamento"),
         Index("ix_cp_lancamento_tipo", "tipo_operacao"),
         Index("ix_cp_lancamento_status", "status_pagamento"),
@@ -685,6 +754,7 @@ class CpConciliacao(Base):
     __tablename__ = "cp_conciliacao"
 
     id                    = _Col(_Int, primary_key=True, index=True)
+    empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     lancamento_credito_id = _Col(_Int, _FK("cp_lancamento.id"))
     lancamento_debito_id  = _Col(_Int, _FK("cp_lancamento.id"))
@@ -700,7 +770,10 @@ class CpConciliacao(Base):
     lancamento_debito  = _rel("CpLancamento", foreign_keys=[lancamento_debito_id],
                               back_populates="conciliacoes_debito")
 
-    __table_args__ = (Index("ix_cp_conciliacao_forn", "fornecedor_id"),)
+    __table_args__ = (
+        Index("ix_cp_conciliacao_empresa", "empresa_id"),
+        Index("ix_cp_conciliacao_forn", "fornecedor_id"),
+    )
 
 
 class CpDivergencia(Base):
@@ -708,6 +781,7 @@ class CpDivergencia(Base):
     __tablename__ = "cp_divergencia"
 
     id               = _Col(_Int, primary_key=True, index=True)
+    empresa_id       = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id    = _Col(_Int, _FK("cp_fornecedor.id"))
     lancamento_id    = _Col(_Int, _FK("cp_lancamento.id"))
     tipo             = _Col(_Str(50), nullable=False)
@@ -721,6 +795,7 @@ class CpDivergencia(Base):
     created_at       = _Col(_DT, default=_utcnow)
 
     __table_args__ = (
+        Index("ix_cp_divergencia_empresa", "empresa_id"),
         Index("ix_cp_divergencia_forn", "fornecedor_id"),
         Index("ix_cp_divergencia_resolvido", "resolvido"),
     )

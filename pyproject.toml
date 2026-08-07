@@ -24,6 +24,7 @@ dependencies = [
 
     # ── Auth / Segurança
     "python-jose[cryptography]>=3.3",
+    "signxml>=4.0",
     "bcrypt>=4.1",
     "pydantic[email]>=2.7",
     "pydantic-settings>=2.3",

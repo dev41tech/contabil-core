@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import io
+from datetime import UTC, datetime
+from uuid import UUID
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import AgenciaBancaria, Empresa, Regra, Tenant, Usuario
+from src.db.models import (
+    AgenciaBancaria,
+    Empresa,
+    RegistroContabil,
+    Regra,
+    Tenant,
+    Usuario,
+)
 
 
 # ── Helpers
@@ -116,6 +127,90 @@ async def test_atualizar_descricao(
     assert r.status_code == 200
     assert r.json()["descricao"] == "Receita Operacional Bruta"
     assert r.json()["codigo"] == "3"  # código imutável
+
+
+@pytest.mark.asyncio
+async def test_codigo_e_imutavel(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    conta = await _criar(client, empresa.id, csrf, "8", "Conta Imutável", "ativo")
+
+    r = await client.patch(
+        _url(empresa.id, conta["id"]),
+        json={"codigo": "9"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_conta_movimentada_nao_muda_tipo_nem_e_removida(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    conta = await _criar(client, empresa.id, csrf, "7", "Conta Movimentada", "receita")
+    agencia = AgenciaBancaria(
+        empresa_id=empresa.id,
+        banco_sigla="BB",
+        agencia="1234",
+        numero="99999",
+    )
+    db.add(agencia)
+    await db.flush()
+    db.add(
+        RegistroContabil(
+            empresa_id=empresa.id,
+            conta_id=UUID(conta["id"]),
+            agencia_id=agencia.id,
+            descricao="Movimento",
+            historico="Movimento",
+            historico_extrato="Movimento",
+            dc="C",
+            tipo_regra="manual",
+            valor=100,
+            data_lancamento=datetime.now(UTC),
+        )
+    )
+    await db.flush()
+
+    alteracao = await client.patch(
+        _url(empresa.id, conta["id"]),
+        json={"tipo": "despesa"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    remocao = await client.delete(
+        _url(empresa.id, conta["id"]), headers={"X-CSRF-Token": csrf}
+    )
+
+    assert alteracao.status_code == 409
+    assert remocao.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_importacao_infere_hierarquia_mesmo_com_filho_antes_do_pai(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    csv = (
+        "codigo,descricao,tipo\n"
+        "1.1.1,Caixa,ativo\n"
+        "1,Ativo,ativo\n"
+        "1.1,Ativo Circulante,ativo\n"
+    )
+
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    arvore = await client.get(_url(empresa.id, extra="/arvore"))
+
+    assert r.status_code == 200
+    assert r.json()["importadas"] == 3
+    raiz = arvore.json()["tree"][0]
+    assert raiz["codigo"] == "1"
+    assert raiz["filhos"][0]["codigo"] == "1.1"
+    assert raiz["filhos"][0]["filhos"][0]["codigo"] == "1.1.1"
 
 
 @pytest.mark.asyncio

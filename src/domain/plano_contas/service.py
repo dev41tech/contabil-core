@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
-from src.db.models import PlanoConta, Regra
+from src.db.models import LancamentoCartao, PlanoConta, RegistroContabil, Regra
 from src.schemas.plano_contas import (
     PlanoContaCreate,
     PlanoContaListResponse,
@@ -134,16 +134,38 @@ class PlanoContaService:
     async def atualizar(self, conta_id: UUID, data: PlanoContaUpdate) -> PlanoContaResponse:
         conta = await self._get_or_404(conta_id)
 
+        altera_natureza = (
+            (data.tipo is not None and data.tipo != conta.tipo)
+            or (data.tipo_sa is not None and data.tipo_sa != conta.tipo_sa)
+        )
+        if altera_natureza and await self._tem_movimentacao(conta_id):
+            raise ConflictError(
+                message=(
+                    "O tipo e a classificação sintética/analítica da conta não podem ser "
+                    "alterados após a existência de movimentações contábeis."
+                )
+            )
+
         if data.conta_numero is not None:
             conta.conta_numero = data.conta_numero
         if data.codigo is not None and data.codigo != conta.codigo:
-            await self._assert_codigo_livre(data.codigo)
-            conta.codigo = data.codigo
+            raise ConflictError(
+                message="O código da conta é imutável após a criação. Crie uma nova conta."
+            )
         if data.descricao is not None:
             conta.descricao = data.descricao
         if data.tipo is not None:
             conta.tipo = data.tipo
         if data.tipo_sa is not None:
+            if data.tipo_sa == "A":
+                filhos_q = select(func.count()).where(
+                    PlanoConta.pai_id == conta_id,
+                    PlanoConta.deleted_at == None,
+                )
+                if (await self._db.execute(filhos_q)).scalar_one() > 0:
+                    raise ConflictError(
+                        message="Conta com subcontas não pode ser alterada para Analítica."
+                    )
             conta.tipo_sa = data.tipo_sa
 
         await self._db.flush()
@@ -151,7 +173,7 @@ class PlanoContaService:
         return PlanoContaResponse.model_validate(conta)
 
     async def remover(self, conta_id: UUID) -> None:
-        """Soft delete — bloqueia se houver filhos ou referências em regras."""
+        """Soft delete — bloqueia se houver filhos ou referências financeiras."""
         conta = await self._get_or_404(conta_id)
 
         # Verifica filhos ativos
@@ -183,19 +205,28 @@ class PlanoContaService:
                 )
             )
 
+        if await self._tem_movimentacao(conta_id):
+            raise ConflictError(
+                message=(
+                    f"A conta '{conta.codigo} — {conta.descricao}' possui movimentações "
+                    "contábeis e não pode ser removida."
+                )
+            )
+
         from datetime import UTC, datetime
         conta.deleted_at = datetime.now(UTC)
         await self._db.flush()
         logger.info("plano_conta.removida", conta_id=str(conta_id), codigo=conta.codigo)
 
     async def importar_lote(self, rows: list[dict]) -> "ImportacaoPlanoResult":
-        """Importa contas em lote. Ignora duplicadas, coleta erros por linha."""
+        """Importa contas em duas fases, preservando hierarquia e isolando falhas por linha."""
         from src.api.v1.plano_contas import ImportacaoLinhaErro, ImportacaoPlanoResult
 
         importadas = 0
         duplicadas = 0
         erros: list[ImportacaoLinhaErro] = []
 
+        candidatos: dict[str, tuple[PlanoContaCreate, int]] = {}
         for row in rows:
             linha = row.get("_linha", 0)
             codigo = row.get("codigo", "").strip()
@@ -229,13 +260,102 @@ class PlanoContaService:
                 erros.append(ImportacaoLinhaErro(linha=linha, codigo=codigo, erro=str(e)))
                 continue
 
-            try:
-                await self.criar(data)
-                importadas += 1
-            except ConflictError:
+            if codigo in candidatos:
                 duplicadas += 1
-            except Exception as e:
-                erros.append(ImportacaoLinhaErro(linha=linha, codigo=codigo, erro=str(e)))
+                continue
+            candidatos[codigo] = (data, linha)
+
+        existentes_q = select(PlanoConta).where(
+            PlanoConta.empresa_id == self._empresa_id,
+            PlanoConta.deleted_at == None,
+        )
+        existentes = {
+            conta.codigo: conta
+            for conta in (await self._db.execute(existentes_q)).scalars().all()
+        }
+
+        # Valida previamente se todo código hierárquico tem seus ancestrais no
+        # banco ou no próprio lote. Assim nenhuma conta filha vira raiz por engano.
+        validos: dict[str, tuple[PlanoContaCreate, int]] = {}
+        codigos_disponiveis = set(existentes) | set(candidatos)
+        for codigo, item in candidatos.items():
+            if codigo in existentes:
+                duplicadas += 1
+                continue
+            partes = codigo.split(".")
+            if len(partes) > _NIVEL_MAXIMO:
+                erros.append(
+                    ImportacaoLinhaErro(
+                        linha=item[1],
+                        codigo=codigo,
+                        erro=f"Nível máximo de hierarquia excedido ({_NIVEL_MAXIMO}).",
+                    )
+                )
+                continue
+            ancestrais = [".".join(partes[:nivel]) for nivel in range(1, len(partes))]
+            ausente = next(
+                (ancestral for ancestral in ancestrais if ancestral not in codigos_disponiveis),
+                None,
+            )
+            if ausente:
+                erros.append(
+                    ImportacaoLinhaErro(
+                        linha=item[1],
+                        codigo=codigo,
+                        erro=f"Conta ancestral '{ausente}' não encontrada no plano ou no lote.",
+                    )
+                )
+                continue
+            validos[codigo] = item
+
+        criadas: dict[str, PlanoConta] = {}
+        for codigo in sorted(validos, key=lambda value: (value.count("."), value)):
+            data, linha = validos[codigo]
+            conta = PlanoConta(
+                empresa_id=self._empresa_id,
+                conta_numero=data.conta_numero,
+                codigo=data.codigo,
+                descricao=data.descricao,
+                tipo=data.tipo,
+                tipo_sa=data.tipo_sa,
+                pai_id=None,
+            )
+            try:
+                async with self._db.begin_nested():
+                    self._db.add(conta)
+                    await self._db.flush()
+                criadas[codigo] = conta
+                importadas += 1
+            except Exception as exc:
+                erros.append(
+                    ImportacaoLinhaErro(linha=linha, codigo=codigo, erro=str(exc))
+                )
+
+        # Segunda fase: agora todos os IDs existem e a relação pai/filho pode ser
+        # montada inclusive quando o pai apareceu depois do filho na planilha.
+        todas = existentes | criadas
+        for codigo in sorted(list(criadas), key=lambda value: (value.count("."), value)):
+            conta = criadas[codigo]
+            if "." not in codigo:
+                continue
+            pai = todas.get(codigo.rsplit(".", 1)[0])
+            if pai is None:  # pai pode ter falhado ao inserir no savepoint
+                erros.append(
+                    ImportacaoLinhaErro(
+                        linha=validos[codigo][1],
+                        codigo=codigo,
+                        erro="Conta pai não pôde ser importada; hierarquia não foi criada.",
+                    )
+                )
+                await self._db.delete(conta)
+                criadas.pop(codigo)
+                todas.pop(codigo)
+                importadas -= 1
+                continue
+            conta.pai_id = pai.id
+            pai.tipo_sa = "S"
+
+        await self._db.flush()
 
         return ImportacaoPlanoResult(importadas=importadas, duplicadas=duplicadas, erros=erros)
 
@@ -264,6 +384,19 @@ class PlanoContaService:
         )
         if existing.scalar_one_or_none():
             raise ConflictError(message=f"Já existe uma conta com o código '{codigo}'.")
+
+    async def _tem_movimentacao(self, conta_id: UUID) -> bool:
+        registros_q = select(func.count()).where(
+            RegistroContabil.empresa_id == self._empresa_id,
+            RegistroContabil.conta_id == conta_id,
+        )
+        if (await self._db.execute(registros_q)).scalar_one() > 0:
+            return True
+        cartoes_q = select(func.count()).where(
+            LancamentoCartao.empresa_id == self._empresa_id,
+            LancamentoCartao.conta_id == conta_id,
+        )
+        return (await self._db.execute(cartoes_q)).scalar_one() > 0
 
     def _assert_codigo_filho_valido(self, codigo_pai: str, codigo_filho: str) -> None:
         """O código do filho deve ter o código do pai como prefixo."""
