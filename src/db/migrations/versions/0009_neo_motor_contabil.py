@@ -155,7 +155,7 @@ def upgrade() -> None:
             descricao, historico, historico_extrato, dc, tipo_regra, valor,
             data_lancamento, created_at, updated_at, deleted_at
         )
-        SELECT md5(r.id::text || ':contrapartida')::uuid,
+        SELECT md5(r.id::text || '-contrapartida')::uuid,
                r.empresa_id,
                r.transacao_id,
                r.lancamento_id,
