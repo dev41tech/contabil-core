@@ -9,8 +9,10 @@ apontar para a prova errada.
 from __future__ import annotations
 
 import base64
+import io
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -384,3 +386,76 @@ async def test_baixar_arquivo_de_comprovante_sem_anexo_retorna_404(
 
     r = await client.get(_url(empresa.id, f"/{criado['id']}/arquivo"))
     assert r.status_code == 404
+
+
+# ── extração automática de PDF ──────────────────────────────────────────────
+
+
+async def _extrair_pdf(client, empresa, csrf) -> object:
+    return await client.post(
+        _url(empresa.id, "/extrair-pdf"),
+        files={"arquivo": ("comprovante.pdf", io.BytesIO(_PDF_BYTES), "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_devolve_campos_pre_preenchidos_sem_persistir(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    monkeypatch.setattr(
+        pdf_parser_module,
+        "parse_pdf",
+        lambda conteudo: pdf_parser_module.ComprovantePDF(
+            favorecido="ACME SERVICOS LTDA",
+            cpf_cnpj="12.345.678/0001-95",
+            valor_pago=Decimal("1500.00"),
+            data_pagamento=datetime(2026, 3, 10, tzinfo=UTC),
+            confianca="regex",
+        ),
+    )
+
+    csrf = await _login(client, tenant, usuario)
+    r = await _extrair_pdf(client, empresa, csrf)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["favorecido"] == "ACME SERVICOS LTDA"
+    assert body["cpf_cnpj"] == "12.345.678/0001-95"
+    assert body["confianca"] == "regex"
+
+    # nada foi persistido
+    lista = await client.get(_url(empresa.id))
+    assert lista.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_falha_de_extracao_retorna_422(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    def _raise(conteudo: bytes):
+        raise pdf_parser_module.PDFParseError(
+            "Não foi possível identificar o valor pago neste comprovante."
+        )
+
+    monkeypatch.setattr(pdf_parser_module, "parse_pdf", _raise)
+
+    csrf = await _login(client, tenant, usuario)
+    r = await _extrair_pdf(client, empresa, csrf)
+    assert r.status_code == 422
+    assert "PDF inválido" in r.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_sem_csrf_rejeita(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, "/extrair-pdf"),
+        files={"arquivo": ("c.pdf", io.BytesIO(_PDF_BYTES), "application/pdf")},
+    )
+    assert r.status_code == 403

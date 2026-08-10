@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.uploads import ler_upload_limitado
 from src.core.errors import NotFoundError
 from src.db.session import get_db
 from src.domain.comprovantes.service import ComprovanteService
 from src.schemas.comprovantes import (
     AssociarTransacaoRequest,
     ComprovanteCreate,
+    ComprovanteExtracaoResponse,
     ComprovanteListResponse,
     ComprovanteResponse,
 )
@@ -72,6 +76,53 @@ async def criar_comprovante(
     db: AsyncSession = Depends(get_db),
 ) -> ComprovanteResponse:
     return await _svc(empresa_id, db).criar(body)
+
+
+@router.post(
+    "/extrair-pdf",
+    response_model=ComprovanteExtracaoResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def extrair_dados_pdf(
+    empresa_id: UUID,
+    arquivo: UploadFile = File(..., description="PDF do comprovante de pagamento"),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> ComprovanteExtracaoResponse:
+    """Extrai os campos de um comprovante em PDF para pré-preencher o formulário.
+
+    Não persiste nada — envie os campos revisados via POST /comprovantes normal.
+    """
+    from src.core.config import get_settings
+    from src.core.errors import ValidationError as AppValidationError
+    from src.domain.comprovantes.pdf_parser import PDFParseError, parse_pdf
+
+    conteudo = await ler_upload_limitado(arquivo)
+    try:
+        timeout = get_settings().pdf_parse_timeout_seconds + 5
+        extraido = await asyncio.wait_for(
+            run_in_threadpool(parse_pdf, conteudo),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        raise AppValidationError(
+            message="Processamento do PDF excedeu o tempo limite."
+        ) from None
+    except PDFParseError as e:
+        raise AppValidationError(message=f"Arquivo PDF inválido: {e}") from e
+
+    return ComprovanteExtracaoResponse(
+        favorecido=extraido.favorecido,
+        cpf_cnpj=extraido.cpf_cnpj,
+        data_pagamento=extraido.data_pagamento,
+        data_vencimento=extraido.data_vencimento,
+        valor_documento=extraido.valor_documento,
+        valor_pago=extraido.valor_pago,
+        juros=extraido.juros,
+        multa=extraido.multa,
+        desconto=extraido.desconto,
+        confianca=extraido.confianca,
+    )
 
 
 @router.post(
