@@ -171,6 +171,40 @@ async def importar_csv(
     return await svc.importar_csv(cartao_id, fatura_id, conteudo)
 
 
+@router.post("/{cartao_id}/faturas/{fatura_id}/lancamentos/importar-pdf",
+             response_model=ImportCSVResponse, dependencies=[Depends(require_csrf)])
+async def importar_pdf(
+    cartao_id: UUID,
+    fatura_id: UUID,
+    arquivo: UploadFile = File(..., description="PDF da fatura do cartão"),
+    svc: CartaoService = Depends(_svc),
+) -> ImportCSVResponse:
+    """Importa lançamentos a partir do PDF da fatura (extração automática)."""
+    import asyncio
+
+    from starlette.concurrency import run_in_threadpool
+
+    from src.core.config import get_settings
+    from src.core.errors import ValidationError as AppValidationError
+    from src.domain.cartoes.pdf_parser import PDFParseError, parse_pdf
+
+    conteudo = await ler_upload_limitado(arquivo)
+    try:
+        timeout = get_settings().pdf_parse_timeout_seconds + 5
+        lancamentos = await asyncio.wait_for(
+            run_in_threadpool(parse_pdf, conteudo),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        raise AppValidationError(
+            message="Processamento do PDF excedeu o tempo limite."
+        ) from None
+    except PDFParseError as e:
+        raise AppValidationError(message=f"Arquivo PDF inválido: {e}") from e
+
+    return await svc.importar_lancamentos_pdf(cartao_id, fatura_id, lancamentos)
+
+
 @router.delete("/{cartao_id}/faturas/{fatura_id}/lancamentos/{lancamento_id}",
                status_code=204, dependencies=[Depends(require_csrf)])
 async def remover_lancamento(

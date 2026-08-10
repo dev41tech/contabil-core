@@ -735,3 +735,130 @@ async def test_fatura_de_outro_cartao_nao_e_acessivel(
         _url(empresa.id, f"/{cartao_b['id']}/faturas/{fatura_a['id']}/lancamentos")
     )
     assert r.status_code == 404
+
+
+# ── importação de PDF ─────────────────────────────────────────────────────────
+
+
+def _fake_lancamentos_pdf(*specs: tuple[str, str, float]) -> list:
+    from src.domain.cartoes.pdf_parser import LancamentoPDF
+
+    resultado = []
+    for data_str, descricao, valor in specs:
+        dia, mes, ano = (int(p) for p in data_str.split("/"))
+        resultado.append(
+            LancamentoPDF(
+                data_compra=datetime(ano, mes, dia, tzinfo=UTC),
+                descricao=descricao,
+                valor=Decimal(str(valor)),
+            )
+        )
+    return resultado
+
+
+async def _importar_pdf(client, empresa, cartao_id, fatura_id, csrf) -> dict:
+    r = await client.post(
+        _url(empresa.id, f"/{cartao_id}/faturas/{fatura_id}/lancamentos/importar-pdf"),
+        files={"arquivo": ("fatura.pdf", io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    return r
+
+
+@pytest.mark.asyncio
+async def test_importar_pdf_persiste_lancamentos_extraidos(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    from src.domain.cartoes import pdf_parser as pdf_parser_module
+
+    monkeypatch.setattr(
+        pdf_parser_module,
+        "parse_pdf",
+        lambda conteudo: _fake_lancamentos_pdf(
+            ("05/03/2026", "POSTO IPIRANGA", 150.00),
+            ("06/03/2026", "MERCADO LIVRE", 265.44),
+        ),
+    )
+
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+
+    r = await _importar_pdf(client, empresa, cartao["id"], fatura["id"], csrf)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["importados"] == 2
+    assert body["erros"] == []
+
+    faturas = (await client.get(_url(empresa.id, f"/{cartao['id']}/faturas"))).json()
+    assert _money(faturas["items"][0]["valor_total"]) == Decimal("415.44")
+
+
+@pytest.mark.asyncio
+async def test_reimportar_mesmo_pdf_nao_duplica_lancamentos(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    from src.domain.cartoes import pdf_parser as pdf_parser_module
+
+    monkeypatch.setattr(
+        pdf_parser_module,
+        "parse_pdf",
+        lambda conteudo: _fake_lancamentos_pdf(("05/03/2026", "POSTO IPIRANGA", 150.00)),
+    )
+
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+
+    primeira = (await _importar_pdf(client, empresa, cartao["id"], fatura["id"], csrf)).json()
+    segunda = (await _importar_pdf(client, empresa, cartao["id"], fatura["id"], csrf)).json()
+
+    assert primeira["importados"] == 1
+    assert segunda["importados"] == 0
+    assert segunda["duplicados"] == 1
+
+
+@pytest.mark.asyncio
+async def test_importar_pdf_layout_nao_reconhecido_retorna_422(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    from src.domain.cartoes import pdf_parser as pdf_parser_module
+
+    def _raise(conteudo: bytes):
+        raise pdf_parser_module.PDFParseError("Não foi possível extrair lançamentos desta fatura.")
+
+    monkeypatch.setattr(pdf_parser_module, "parse_pdf", _raise)
+
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+
+    r = await _importar_pdf(client, empresa, cartao["id"], fatura["id"], csrf)
+    assert r.status_code == 422
+    assert "PDF inválido" in r.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_importar_pdf_em_fatura_paga_rejeita(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, transacao: Transacao, monkeypatch
+):
+    from src.domain.cartoes import pdf_parser as pdf_parser_module
+
+    monkeypatch.setattr(
+        pdf_parser_module,
+        "parse_pdf",
+        lambda conteudo: _fake_lancamentos_pdf(("05/03/2026", "X", 10.00)),
+    )
+
+    csrf = await _login(client, tenant, usuario)
+    cartao = await _criar_cartao(client, empresa, csrf)
+    fatura = await _criar_fatura(client, empresa, cartao["id"], csrf)
+    await _add_lancamento(client, empresa, cartao["id"], fatura["id"], csrf, 2_500)
+    await client.post(
+        _url(empresa.id, f"/{cartao['id']}/faturas/{fatura['id']}/associar-transacao"),
+        json={"transacao_id": str(transacao.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await _importar_pdf(client, empresa, cartao["id"], fatura["id"], csrf)
+    assert r.status_code == 422
