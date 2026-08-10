@@ -191,13 +191,7 @@ def parsear_planilha_razao(arquivo_bytes: bytes) -> Dict:
     """
     Parseia o Razão em XLSX. Mesmo contrato de retorno de parsear_arquivo_razao.
     """
-    # import tardio: parser.py importa este módulo, então importar no topo
-    # criaria ciclo
-    from src.domain.concilpro.parser import (
-        calcular_hash_arquivo, extrair_cnpj, extrair_numero_nf,
-    )
-
-    print("📊 Planilha detectada — parsing determinístico, sem IA")
+    print("📊 Planilha XLSX detectada — parsing determinístico, sem IA")
 
     try:
         wb = openpyxl.load_workbook(BytesIO(arquivo_bytes), data_only=True, read_only=True)
@@ -209,6 +203,67 @@ def parsear_planilha_razao(arquivo_bytes: bytes) -> Dict:
         linhas = list(ws.iter_rows(values_only=True))
     finally:
         wb.close()
+
+    return _parsear_linhas_razao(arquivo_bytes, linhas)
+
+
+def parsear_xls_razao(arquivo_bytes: bytes) -> Dict:
+    """
+    Parseia o Razão no formato legado .xls (Excel 97-2003, binário/BIFF).
+
+    Mesmo contrato de retorno de `parsear_planilha_razao` — só a extração das
+    células muda (xlrd em vez de openpyxl), a lógica de negócio é a mesma.
+    """
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise ValueError(
+            "Suporte a .xls (formato antigo) não instalado. Execute: pip install xlrd"
+        ) from exc
+
+    print("📊 Planilha XLS (legado) detectada — parsing determinístico, sem IA")
+
+    try:
+        wb = xlrd.open_workbook(file_contents=arquivo_bytes)
+        ws = wb.sheet_by_index(0)
+    except Exception as exc:
+        raise ValueError(f"Não foi possível abrir a planilha .xls: {exc}")
+
+    linhas: List[tuple] = [
+        tuple(
+            _valor_celula_xls(ws.cell(linha_idx, col_idx), wb.datemode)
+            for col_idx in range(ws.ncols)
+        )
+        for linha_idx in range(ws.nrows)
+    ]
+
+    return _parsear_linhas_razao(arquivo_bytes, linhas)
+
+
+def _valor_celula_xls(cell, datemode: int):
+    """Converte uma célula xlrd para o mesmo formato que o openpyxl entrega
+    (datetime nativo para datas, str para texto, número para o resto)."""
+    import xlrd
+
+    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+        return None
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            return datetime(*xlrd.xldate_as_tuple(cell.value, datemode))
+        except (ValueError, xlrd.xldate.XLDateError):
+            return cell.value
+    return cell.value
+
+
+def _parsear_linhas_razao(arquivo_bytes: bytes, linhas: List[tuple]) -> Dict:
+    """Lógica de negócio comum às fontes XLSX e XLS: recebe as linhas já
+    extraídas (célula tipada, sem paginação) e monta o mesmo contrato de
+    retorno de `parsear_arquivo_razao`."""
+    # import tardio: parser.py importa este módulo, então importar no topo
+    # criaria ciclo
+    from src.domain.concilpro.parser import (
+        calcular_hash_arquivo, extrair_cnpj, extrair_numero_nf,
+    )
 
     if not linhas:
         raise ValueError("Planilha vazia")
