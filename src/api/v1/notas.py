@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
@@ -36,11 +37,31 @@ async def listar_notas(
     page_size: int = Query(default=50, ge=1, le=200),
     tipo: str | None = Query(default=None, description="nfe ou nfse"),
     status: str | None = Query(default=None, description="pendente | associada | cancelada"),
+    numero: str | None = Query(default=None, description="Busca parcial pelo número da nota"),
+    chave_acesso: str | None = Query(
+        default=None, description="Busca parcial pela chave de acesso (44 dígitos)"
+    ),
+    cnpj: str | None = Query(
+        default=None,
+        description="CNPJ do emitente ou destinatário — completo (exato) ou trecho (parcial)",
+    ),
+    emitente: str | None = Query(default=None, description="Busca parcial pelo nome do emitente"),
+    data_de: datetime | None = Query(default=None, description="Data de emissão inicial"),
+    data_ate: datetime | None = Query(default=None, description="Data de emissão final"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> NotaFiscalListResponse:
     return await _svc(empresa_id, db).listar(
-        page=page, page_size=page_size, tipo=tipo, status=status
+        page=page,
+        page_size=page_size,
+        tipo=tipo,
+        status=status,
+        numero=numero,
+        chave_acesso=chave_acesso,
+        cnpj=cnpj,
+        emitente=emitente,
+        data_de=data_de,
+        data_ate=data_ate,
     )
 
 

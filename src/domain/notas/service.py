@@ -20,10 +20,11 @@ from io import BytesIO
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.cnpj import formatar as formatar_cnpj, somente_digitos
 from src.core.errors import ConflictError, NotFoundError, ValidationError
 from src.db.models import Empresa, NotaFiscal, Transacao
 from src.domain.notas.xml_parser import parse_nota_xml
@@ -56,6 +57,12 @@ class NotaService:
         page_size: int = 50,
         tipo: str | None = None,
         status: str | None = None,
+        numero: str | None = None,
+        chave_acesso: str | None = None,
+        cnpj: str | None = None,
+        emitente: str | None = None,
+        data_de: datetime | None = None,
+        data_ate: datetime | None = None,
     ) -> NotaFiscalListResponse:
         q = select(NotaFiscal).where(
             NotaFiscal.empresa_id == self._empresa_id,
@@ -65,6 +72,38 @@ class NotaService:
             q = q.where(NotaFiscal.tipo == tipo)
         if status:
             q = q.where(NotaFiscal.status == status)
+        if numero:
+            q = q.where(NotaFiscal.numero.ilike(f"%{numero.strip()}%"))
+        if chave_acesso:
+            digitos_chave = somente_digitos(chave_acesso)
+            if digitos_chave:
+                q = q.where(NotaFiscal.chave_acesso.ilike(f"%{digitos_chave}%"))
+        if cnpj:
+            digitos_cnpj = somente_digitos(cnpj)
+            if len(digitos_cnpj) == 14:
+                # CNPJ completo: casa exato com o formato salvo (00.000.000/0000-00).
+                cnpj_norm = formatar_cnpj(digitos_cnpj)
+                q = q.where(
+                    or_(
+                        NotaFiscal.cnpj_emitente == cnpj_norm,
+                        NotaFiscal.cnpj_destinatario == cnpj_norm,
+                    )
+                )
+            else:
+                # Trecho parcial: casa como digitado (o CNPJ é salvo formatado).
+                termo = cnpj.strip()
+                q = q.where(
+                    or_(
+                        NotaFiscal.cnpj_emitente.ilike(f"%{termo}%"),
+                        NotaFiscal.cnpj_destinatario.ilike(f"%{termo}%"),
+                    )
+                )
+        if emitente:
+            q = q.where(NotaFiscal.nome_emitente.ilike(f"%{emitente.strip()}%"))
+        if data_de:
+            q = q.where(NotaFiscal.data_emissao >= data_de)
+        if data_ate:
+            q = q.where(NotaFiscal.data_emissao <= data_ate)
 
         count_q = select(func.count()).select_from(q.subquery())
         total = (await self._db.execute(count_q)).scalar_one()

@@ -163,6 +163,89 @@ async def test_listar_filtro_status(client, tenant, usuario, empresa):
         assert item["status"] == "pendente"
 
 
+@pytest.mark.asyncio
+async def test_listar_busca_por_numero_parcial(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await client.post(_url(empresa.id), json={**_NOTA_PAYLOAD, "numero": "BUSCA-12345"}, headers={"X-CSRF-Token": csrf})
+    await client.post(_url(empresa.id), json={**_NOTA_PAYLOAD, "numero": "OUTRO-99999"}, headers={"X-CSRF-Token": csrf})
+
+    r = await client.get(_url(empresa.id) + "?numero=12345")
+    assert r.status_code == 200
+    numeros = [item["numero"] for item in r.json()["items"]]
+    assert "BUSCA-12345" in numeros
+    assert "OUTRO-99999" not in numeros
+
+
+@pytest.mark.asyncio
+async def test_listar_busca_por_chave_acesso_parcial(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    chave = "".join(str(i % 10) for i in range(44))  # 44 dígitos determinísticos
+    await client.post(
+        _url(empresa.id),
+        json={**_NOTA_PAYLOAD, "numero": "CHV001", "chave_acesso": chave},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.get(_url(empresa.id) + f"?chave_acesso={chave[10:20]}")
+    assert r.status_code == 200
+    assert any(item["chave_acesso"] == chave for item in r.json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_listar_busca_por_cnpj_completo_e_parcial(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await client.post(
+        _url(empresa.id),
+        json={**_NOTA_PAYLOAD, "numero": "CNPJ001", "cnpj_emitente": "12345678000195"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    exato = await client.get(_url(empresa.id) + "?cnpj=12345678000195")
+    assert exato.status_code == 200
+    assert any(item["numero"] == "CNPJ001" for item in exato.json()["items"])
+
+    parcial = await client.get(_url(empresa.id) + "?cnpj=12.345.678")
+    assert parcial.status_code == 200
+    assert any(item["numero"] == "CNPJ001" for item in parcial.json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_listar_busca_por_emitente_parcial_case_insensitive(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await client.post(
+        _url(empresa.id),
+        json={**_NOTA_PAYLOAD, "numero": "EMIT001", "nome_emitente": "Distribuidora Sao Jose LTDA"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.get(_url(empresa.id) + "?emitente=sao jose")
+    assert r.status_code == 200
+    assert any(item["numero"] == "EMIT001" for item in r.json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_listar_filtro_periodo_data_emissao(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await client.post(
+        _url(empresa.id),
+        json={**_NOTA_PAYLOAD, "numero": "PER001", "data_emissao": "2024-05-15T00:00:00Z"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    await client.post(
+        _url(empresa.id),
+        json={**_NOTA_PAYLOAD, "numero": "PER002", "data_emissao": "2024-08-15T00:00:00Z"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.get(
+        _url(empresa.id) + "?data_de=2024-05-01T00:00:00Z&data_ate=2024-05-31T23:59:59Z"
+    )
+    assert r.status_code == 200
+    numeros = [item["numero"] for item in r.json()["items"]]
+    assert "PER001" in numeros
+    assert "PER002" not in numeros
+
+
 # ── Associar / Desassociar
 
 
