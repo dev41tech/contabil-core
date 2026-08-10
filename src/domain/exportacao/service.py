@@ -16,7 +16,7 @@ import csv
 import io
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -90,6 +90,18 @@ def _valor_assinado(value: Decimal, dc: str) -> Decimal:
     return -value if dc == "D" else value
 
 
+def _bounds_do_mes(mes: str) -> tuple[datetime, datetime]:
+    """Converte 'AAAA-MM' no intervalo [primeiro instante, último instante] do mês."""
+    ano, mes_num = int(mes[:4]), int(mes[5:7])
+    inicio = datetime(ano, mes_num, 1, tzinfo=UTC)
+    fim_exclusivo = (
+        datetime(ano + 1, 1, 1, tzinfo=UTC)
+        if mes_num == 12
+        else datetime(ano, mes_num + 1, 1, tzinfo=UTC)
+    )
+    return inicio, fim_exclusivo - timedelta(microseconds=1)
+
+
 def _celula_segura(value: object) -> object:
     """Neutraliza fórmulas em qualquer texto antes de cruzar a borda CSV/XLSX."""
     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
@@ -106,6 +118,10 @@ class ExportacaoService:
     # ── entrypoint ────────────────────────────────────────────────────────────
 
     async def exportar(self, data: ExportJobCreate) -> tuple[ExportJobResponse, bytes]:
+        if data.mes:
+            data_de, data_ate = _bounds_do_mes(data.mes)
+            data = data.model_copy(update={"data_de": data_de, "data_ate": data_ate})
+
         fmt = data.formato
         if fmt not in ("csv", "xlsx"):
             raise ValidationError(message="Formato deve ser 'csv' ou 'xlsx'.")
