@@ -278,6 +278,11 @@ async def test_encerrar_aplicacao_via_update(
     assert criada["id"] in [a["id"] for a in lista_todas.json()["items"]]
     assert criada["id"] not in [a["id"] for a in lista_ativas.json()["items"]]
 
+    # total precisa refletir o mesmo filtro dos items, senão a tela mostra
+    # "N total" com uma tabela vazia por baixo.
+    assert lista_ativas.json()["total"] == len(lista_ativas.json()["items"]) == 0
+    assert lista_todas.json()["total"] == len(lista_todas.json()["items"]) == 1
+
 
 # ── Remover
 
