@@ -42,7 +42,7 @@ def upgrade() -> None:
             id, empresa_id, codigo, descricao, tipo, tipo_sa,
             created_at, updated_at, deleted_at
         )
-        SELECT md5(a.id::text || ':conta-contabil')::uuid,
+        SELECT md5(a.id::text || '-conta-contabil')::uuid,
                a.empresa_id,
                '1.1.B.' || left(replace(a.id::text, '-', ''), 16),
                left(
