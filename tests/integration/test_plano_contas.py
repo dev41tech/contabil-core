@@ -456,3 +456,189 @@ async def test_conta_de_outra_empresa_nao_visivel(
     r = await client.get(_url(empresa2.id))
     assert r.status_code == 200
     assert r.json()["items"] == []
+
+
+# ── Auto-preenchimento de conta_numero
+
+
+@pytest.mark.asyncio
+async def test_criar_conta_auto_preenche_conta_numero(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    primeira = await _criar(client, empresa.id, csrf, "1", "Ativo", "ativo")
+    segunda = await _criar(client, empresa.id, csrf, "2", "Passivo", "passivo")
+
+    assert primeira["conta_numero"] == 1
+    assert segunda["conta_numero"] == 2
+
+
+@pytest.mark.asyncio
+async def test_criar_conta_respeita_conta_numero_explicito_e_continua_sequencia(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id),
+        json={"codigo": "1", "descricao": "Ativo", "tipo": "ativo", "conta_numero": 50},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 201
+    assert r.json()["conta_numero"] == 50
+
+    seguinte = await _criar(client, empresa.id, csrf, "2", "Passivo", "passivo")
+    assert seguinte["conta_numero"] == 51
+
+
+@pytest.mark.asyncio
+async def test_importacao_auto_preenche_conta_numero_quando_ausente(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    csv = "codigo,descricao,tipo\n1,Ativo,ativo\n2,Passivo,passivo\n"
+
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert r.json()["importadas"] == 2
+
+    lista = await client.get(_url(empresa.id))
+    numeros = {c["codigo"]: c["conta_numero"] for c in lista.json()["items"]}
+    assert numeros["1"] is not None
+    assert numeros["2"] is not None
+    assert numeros["1"] != numeros["2"]
+
+
+@pytest.mark.asyncio
+async def test_importacao_preserva_conta_numero_informado_no_arquivo(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    csv = "codigo,descricao,tipo,conta_numero\n1,Ativo,ativo,900\n"
+
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+
+    lista = await client.get(_url(empresa.id))
+    assert lista.json()["items"][0]["conta_numero"] == 900
+
+
+# ── Exclusão em lote
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_selecao_multipla(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    a = await _criar(client, empresa.id, csrf, "1", "Ativo", "ativo")
+    b = await _criar(client, empresa.id, csrf, "2", "Passivo", "passivo")
+    c = await _criar(client, empresa.id, csrf, "3", "Resultado", "resultado")
+
+    r = await client.post(
+        _url(empresa.id, extra="/excluir-lote"),
+        json={"ids": [a["id"], b["id"]]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["removidas"] == 2
+    assert body["bloqueadas"] == []
+
+    lista = await client.get(_url(empresa.id))
+    codigos = {item["codigo"] for item in lista.json()["items"]}
+    assert codigos == {"3"}
+    assert c["id"]  # sanity: conta c segue existindo
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_todas_remove_hierarquia_completa(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    pai = await _criar(client, empresa.id, csrf, "1", "Ativo", "ativo")
+    filho = await _criar(client, empresa.id, csrf, "1.1", "Ativo Circ.", "ativo", pai["id"])
+    await _criar(client, empresa.id, csrf, "1.1.1", "Caixa", "ativo", filho["id"])
+
+    r = await client.post(
+        _url(empresa.id, extra="/excluir-lote"),
+        json={"todas": True},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["removidas"] == 3
+    assert body["bloqueadas"] == []
+
+    lista = await client.get(_url(empresa.id))
+    assert lista.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_bloqueada_por_movimentacao_nao_impede_as_demais(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    csrf = await _login(client, tenant, usuario)
+    movimentada = await _criar(client, empresa.id, csrf, "7", "Conta Movimentada", "receita")
+    livre = await _criar(client, empresa.id, csrf, "8", "Conta Livre", "receita")
+
+    agencia = AgenciaBancaria(
+        empresa_id=empresa.id, banco_sigla="BB", agencia="1234", numero="99999"
+    )
+    db.add(agencia)
+    await db.flush()
+    db.add(
+        RegistroContabil(
+            empresa_id=empresa.id,
+            conta_id=UUID(movimentada["id"]),
+            agencia_id=agencia.id,
+            descricao="Movimento",
+            historico="Movimento",
+            historico_extrato="Movimento",
+            dc="C",
+            tipo_regra="manual",
+            valor=100,
+            data_lancamento=datetime.now(UTC),
+        )
+    )
+    await db.flush()
+
+    r = await client.post(
+        _url(empresa.id, extra="/excluir-lote"),
+        json={"ids": [movimentada["id"], livre["id"]]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["removidas"] == 1
+    assert len(body["bloqueadas"]) == 1
+    assert body["bloqueadas"][0]["codigo"] == "7"
+    assert "movimenta" in body["bloqueadas"][0]["erro"].lower()
+
+    lista = await client.get(_url(empresa.id))
+    codigos = {item["codigo"] for item in lista.json()["items"]}
+    assert codigos == {"7"}
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_exige_ids_ou_todas(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, extra="/excluir-lote"),
+        json={"ids": []},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422

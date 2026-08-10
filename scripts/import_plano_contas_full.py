@@ -179,9 +179,9 @@ async def importar_empresa(
 
     for conta in contas_mrc:
         classificacao = conta["classificacao"]
-        conta_numero = str(conta["conta"])
+        conta_numero_raw = str(conta["conta"])
         if classificacao in duplicadas:
-            codigo = conta_numero
+            codigo = conta_numero_raw
             colisoes += 1
         else:
             codigo = classificacao
@@ -191,9 +191,14 @@ async def importar_empresa(
             continue
 
         if aplicar:
+            try:
+                conta_numero = int(conta_numero_raw)
+            except (TypeError, ValueError):
+                conta_numero = None
             session.add(
                 PlanoConta(
                     empresa_id=empresa.id,
+                    conta_numero=conta_numero,
                     codigo=codigo,
                     descricao=conta["descricao"] or f"Conta {conta['conta']}",
                     tipo=_guess_tipo(classificacao),

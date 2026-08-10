@@ -15,6 +15,8 @@ from src.db.session import get_db
 from src.domain.plano_contas.service import PlanoContaService
 from src.schemas.plano_contas import (
     PlanoContaCreate,
+    PlanoContaExclusaoLoteRequest,
+    PlanoContaExclusaoLoteResultado,
     PlanoContaListResponse,
     PlanoContaResponse,
     PlanoContaTreeResponse,
@@ -118,6 +120,27 @@ async def remover_conta(
 ) -> None:
     """Remove a conta (soft delete). Bloqueado se houver filhos ou regras referenciando."""
     await _svc(empresa_id, db).remover(conta_id)
+
+
+@router.post(
+    "/excluir-lote",
+    response_model=PlanoContaExclusaoLoteResultado,
+    status_code=200,
+    dependencies=[Depends(require_csrf)],
+)
+async def excluir_contas_em_lote(
+    empresa_id: UUID,
+    body: PlanoContaExclusaoLoteRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> PlanoContaExclusaoLoteResultado:
+    """Remove várias contas de uma vez (soft delete), ou todo o plano com `todas=true`.
+
+    Cada conta passa pelas mesmas validações da remoção individual (filhos
+    ativos, regras, movimentações); contas bloqueadas não impedem a remoção
+    das demais — o resultado lista o que foi removido e o que ficou bloqueado.
+    """
+    return await _svc(empresa_id, db).remover_lote(body.ids, todas=body.todas)
 
 
 @router.post(
