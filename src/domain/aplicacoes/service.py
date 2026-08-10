@@ -54,6 +54,8 @@ class AplicacaoFinanceiraService:
             AplicacaoFinanceira.empresa_id == self._empresa_id,
             AplicacaoFinanceira.deleted_at == None,
         )
+        if apenas_ativas:
+            total_q = total_q.where(AplicacaoFinanceira.ativa == True)
         total = (await self._db.execute(total_q)).scalar_one()
 
         valor_total_aplicado = sum((r.valor_aplicado for r in rows), Decimal("0.00"))
