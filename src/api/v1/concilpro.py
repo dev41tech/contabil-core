@@ -320,13 +320,13 @@ async def upload_arquivo(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Recebe o Razão em PDF ou planilha XLSX e retorna IMEDIATAMENTE com
+    Recebe o Razão em PDF ou planilha XLSX/XLS e retorna IMEDIATAMENTE com
     arquivo_id e status=PROCESSANDO. O parsing roda em background; use
     GET /arquivos/{id}/status para polling.
 
-    Prefira XLSX quando o sistema contábil permitir: a planilha declara o que o
-    PDF obriga a inferir (célula tipada, coluna nomeada, sem paginação), então
-    o parsing é determinístico e não usa IA.
+    Prefira XLSX/XLS quando o sistema contábil permitir: a planilha declara o
+    que o PDF obriga a inferir (célula tipada, coluna nomeada, sem paginação),
+    então o parsing é determinístico e não usa IA.
     """
     from src.domain.concilpro.parser import calcular_hash_arquivo
 

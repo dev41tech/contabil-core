@@ -12,6 +12,7 @@ from io import BytesIO
 
 import openpyxl
 import pytest
+import xlwt
 
 from src.domain.concilpro.parser import detectar_formato_arquivo
 from src.domain.concilpro.planilha import (
@@ -19,6 +20,7 @@ from src.domain.concilpro.planilha import (
     e_planilha,
     localizar_colunas,
     parsear_planilha_razao,
+    parsear_xls_razao,
 )
 
 # Layout real do export: Data | Lote | Histórico | ... | Cta.C.Part. | Débito | Crédito | ... | Saldo
@@ -49,6 +51,34 @@ def _planilha(linhas: list[list], cabecalho: list | None = None) -> bytes:
     ws.append(cabecalho or _CABECALHO)
     for linha in linhas:
         ws.append(linha)
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _planilha_xls(linhas: list[list], cabecalho: list | None = None) -> bytes:
+    """Monta um XLS (Excel 97-2003, binário) em memória com o mesmo preâmbulo."""
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet("Razão")
+    data_fmt = xlwt.XFStyle()
+    data_fmt.num_format_str = "DD/MM/YYYY"
+
+    linhas_texto = [
+        ["Empresa:", "", "TRANSPORTES TESTE LTDA", "", "", "", "", "", "", "", "", "Folha:", "", 1],
+        ["C.N.P.J.:", "", "12.345.678/0001-90"],
+        ["Período:", "", "01/01/2025 - 31/12/2025"],
+        [],
+        ["RAZÃO"],
+        [],
+        cabecalho or _CABECALHO,
+        *linhas,
+    ]
+    for i, linha in enumerate(linhas_texto):
+        for j, valor in enumerate(linha):
+            if isinstance(valor, datetime):
+                ws.write(i, j, valor, data_fmt)
+            elif valor != "":
+                ws.write(i, j, valor)
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -85,6 +115,11 @@ class TestDeteccaoDeFormato:
         assert conteudo[:2] == b"PK"
         assert not e_planilha(conteudo)
         assert detectar_formato_arquivo(conteudo) == "ZIP"
+
+    def test_reconhece_xls_legado(self):
+        conteudo = _planilha_xls(_BLOCO_SIMPLES)
+        assert conteudo[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        assert detectar_formato_arquivo(conteudo) == "XLS"
 
 
 class TestLocalizarColunas:
@@ -225,3 +260,56 @@ class TestParsearPlanilha:
 
         with pytest.raises(ValueError, match="Débito"):
             parsear_planilha_razao(buf.getvalue())
+
+
+class TestParsearXlsLegado:
+    """Mesmo parser, mesma lógica de negócio — só a extração de célula muda
+    (xlrd em vez de openpyxl). Os testes cobrem o essencial já validado para
+    XLSX; a lógica de negócio compartilhada (_parsear_linhas_razao) já está
+    exercitada em profundidade por TestParsearPlanilha."""
+
+    def test_extrai_fornecedor_e_lancamentos(self):
+        r = parsear_xls_razao(_planilha_xls(_BLOCO_SIMPLES))
+
+        assert r["empresa"] == "TRANSPORTES TESTE LTDA"
+        assert r["cnpj"] == "12.345.678/0001-90"
+        assert r["periodo_inicio"] == datetime(2025, 1, 1)
+        assert r["total_fornecedores"] == 1
+
+        forn = r["fornecedores"][0]
+        assert forn["codigo_conta"] == "1670"
+        assert forn["nome_fornecedor"] == "NORDICA VEICULOS S/A"
+        assert len(forn["lancamentos"]) == 2
+
+    def test_debito_e_credito_vem_da_coluna(self):
+        forn = parsear_xls_razao(_planilha_xls(_BLOCO_SIMPLES))["fornecedores"][0]
+        pagamento, compra = forn["lancamentos"]
+
+        assert pagamento["valor_debito"] == Decimal("217.75")
+        assert pagamento["tipo_operacao"] == "PAGAMENTO"
+        assert compra["valor_credito"] == Decimal("350.26")
+        assert compra["tipo_operacao"] == "COMPRA"
+
+    def test_data_e_convertida_para_datetime(self):
+        """A data no XLS é um serial numérico (xlrd); precisa virar datetime nativo,
+        igual ao openpyxl, para o resto do parser (isinstance(data, datetime)) funcionar."""
+        forn = parsear_xls_razao(_planilha_xls(_BLOCO_SIMPLES))["fornecedores"][0]
+        assert forn["lancamentos"][0]["data_lancamento"] == datetime(2025, 2, 13)
+
+    def test_totais_batem_com_o_declarado(self):
+        forn = parsear_xls_razao(_planilha_xls(_BLOCO_SIMPLES))["fornecedores"][0]
+        soma_d = sum(l["valor_debito"] for l in forn["lancamentos"])
+        soma_c = sum(l["valor_credito"] for l in forn["lancamentos"])
+        assert soma_d == forn["total_debito"] == Decimal("217.75")
+        assert soma_c == forn["total_credito"] == Decimal("350.26")
+
+    def test_planilha_sem_cabecalho_reclama(self):
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("Razão")
+        ws.write(0, 0, "qualquer")
+        ws.write(0, 1, "coisa")
+        buf = BytesIO()
+        wb.save(buf)
+
+        with pytest.raises(ValueError, match="Débito"):
+            parsear_xls_razao(buf.getvalue())

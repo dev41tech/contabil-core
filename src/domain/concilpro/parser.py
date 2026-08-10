@@ -482,12 +482,17 @@ def extrair_texto_pdf(arquivo_bytes: bytes) -> str:
     return "\n\n".join(texto_completo)
 
 
+_XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # OLE2 Compound File (Excel 97-2003)
+
+
 def detectar_formato_arquivo(arquivo_bytes: bytes) -> str:
-    """Detecta se o arquivo é PDF, XLSX ou ZIP."""
+    """Detecta se o arquivo é PDF, XLSX, XLS (legado) ou ZIP."""
     from src.domain.concilpro.planilha import e_planilha
 
     if arquivo_bytes[:4] == b'%PDF':
         return 'PDF'
+    if arquivo_bytes[:8] == _XLS_MAGIC:
+        return 'XLS'
     # XLSX também começa com 'PK' — é um ZIP. Testar a planilha antes.
     if e_planilha(arquivo_bytes):
         return 'XLSX'
@@ -1186,10 +1191,15 @@ def parsear_arquivo_razao(arquivo_bytes: bytes) -> Dict:
         from src.domain.concilpro.planilha import parsear_planilha_razao
         return parsear_planilha_razao(arquivo_bytes)
 
+    if formato == 'XLS':
+        # Mesmo caminho determinístico da XLSX, só a extração de célula muda.
+        from src.domain.concilpro.planilha import parsear_xls_razao
+        return parsear_xls_razao(arquivo_bytes)
+
     if formato != 'PDF':
         raise ValueError(
             f"Formato '{formato}' não suportado. "
-            "Envie o Razão em PDF ou em planilha XLSX."
+            "Envie o Razão em PDF, XLSX ou XLS."
         )
 
     print("📖 Extraindo texto do PDF...")
