@@ -142,6 +142,9 @@ class Empresa(Base, TimestampMixin):
     regras: Mapped[list[Regra]] = relationship("Regra", back_populates="empresa")
     permissoes: Mapped[list[Permissao]] = relationship("Permissao", back_populates="empresa")
     contas: Mapped[list[PlanoConta]] = relationship("PlanoConta", back_populates="empresa")
+    aplicacoes_financeiras: Mapped[list[AplicacaoFinanceira]] = relationship(
+        "AplicacaoFinanceira", back_populates="empresa"
+    )
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "cnpj", name="uq_empresa_tenant_cnpj"),
@@ -233,6 +236,49 @@ class AgenciaBancaria(Base, TimestampMixin):
         if self.digito:
             parts.append(self.digito)
         return " ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────── Aplicação Financeira
+
+TIPOS_APLICACAO_FINANCEIRA = ("cdb", "poupanca", "fundo", "tesouro_direto", "lci_lca", "outros")
+
+
+class AplicacaoFinanceira(Base, TimestampMixin):
+    """Aplicação financeira da empresa (CDB, poupança, fundo, tesouro etc.).
+
+    Só o registro/acompanhamento do valor aplicado e do valor atual — sem
+    integração com extrato ou conciliação nesta primeira versão.
+    """
+
+    __tablename__ = "aplicacoes_financeiras"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
+    agencia_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agencias_bancarias.id"), nullable=True
+    )
+    instituicao: Mapped[str] = mapped_column(String(200), nullable=False)
+    tipo: Mapped[str] = mapped_column(String(30), nullable=False)
+    descricao: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    valor_aplicado: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    data_aplicacao: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valor_atual: Mapped[Decimal | None] = mapped_column(Numeric(15, 2), nullable=True)
+    data_atualizacao_valor: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    data_vencimento: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    ativa: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    empresa: Mapped[Empresa] = relationship("Empresa", back_populates="aplicacoes_financeiras")
+    agencia: Mapped[AgenciaBancaria | None] = relationship("AgenciaBancaria")
+
+    @property
+    def rendimento(self) -> Decimal | None:
+        """Diferença entre o valor atual (última atualização) e o valor aplicado."""
+        if self.valor_atual is None:
+            return None
+        return self.valor_atual - self.valor_aplicado
 
 
 # ─────────────────────────────────────────────────────────────── Regra

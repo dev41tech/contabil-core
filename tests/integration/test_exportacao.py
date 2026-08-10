@@ -402,6 +402,35 @@ async def test_exportar_extrato_respeita_o_periodo(client, tenant, usuario, empr
 
 
 @pytest.mark.asyncio
+async def test_exportar_extrato_filtra_por_mes(client, tenant, usuario, empresa):
+    """Atalho 'mes' (AAAA-MM) equivale a passar data_de/data_ate do mês inteiro."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_extrato(client, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "csv", "tipo": "extrato", "mes": "2024-06"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert r.headers.get("X-Total-Registros") == "1"
+    assert "PAGAMENTO ENERGIA" in r.text
+    assert "RECEBIMENTO CLIENTE ALFA" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_mes_com_formato_invalido_rejeita(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "csv", "tipo": "extrato", "mes": "junho/2024"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_exportar_extrato_respeita_o_filtro_de_agencia(client, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     agencia_id = await _setup_extrato(client, empresa, csrf)
