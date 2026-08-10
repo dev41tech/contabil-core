@@ -161,3 +161,29 @@ class PlanoContaTreeResponse(BaseModel):
     """Resposta em árvore — apenas contas raiz com seus filhos aninhados."""
     tree: list[PlanoContaNode]
     total: int
+
+
+class PlanoContaExclusaoLoteRequest(BaseModel):
+    """Exclui contas selecionadas (ids) ou todo o plano de contas (todas=True)."""
+    ids: list[UUID] = Field(default_factory=list)
+    todas: bool = Field(
+        default=False,
+        description="Se True, ignora 'ids' e tenta remover todas as contas ativas da empresa.",
+    )
+
+    @model_validator(mode="after")
+    def valida_selecao(self) -> "PlanoContaExclusaoLoteRequest":
+        if not self.todas and not self.ids:
+            raise ValueError("Informe 'ids' ou defina 'todas' como True.")
+        return self
+
+
+class PlanoContaExclusaoBloqueada(BaseModel):
+    id: UUID
+    codigo: str
+    erro: str
+
+
+class PlanoContaExclusaoLoteResultado(BaseModel):
+    removidas: int
+    bloqueadas: list[PlanoContaExclusaoBloqueada]

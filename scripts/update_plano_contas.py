@@ -228,6 +228,11 @@ async def main(aplicar: bool = False) -> None:
                     plano.descricao = conta_mrc["descricao"]
                     plano.tipo_sa = conta_mrc["tipo"]
                     plano.tipo = _guess_tipo(classificacao, conta_mrc["tipo"])
+                    if plano.conta_numero is None:
+                        try:
+                            plano.conta_numero = int(conta_mrc["conta"])
+                        except (TypeError, ValueError):
+                            pass
                 atualizados += 1
 
             if aplicar:

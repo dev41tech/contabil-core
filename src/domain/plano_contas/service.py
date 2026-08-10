@@ -25,6 +25,8 @@ from src.db.models import LancamentoCartao, PlanoConta, RegistroContabil, Regra
 from src.domain.auditoria import registrar_auditoria
 from src.schemas.plano_contas import (
     PlanoContaCreate,
+    PlanoContaExclusaoBloqueada,
+    PlanoContaExclusaoLoteResultado,
     PlanoContaListResponse,
     PlanoContaNode,
     PlanoContaResponse,
@@ -105,9 +107,13 @@ class PlanoContaService:
             self._assert_codigo_filho_valido(pai.codigo, data.codigo)
             self._assert_nivel_valido(pai.codigo)
 
+        conta_numero = data.conta_numero
+        if conta_numero is None:
+            conta_numero = await self._proximo_conta_numero()
+
         conta = PlanoConta(
             empresa_id=self._empresa_id,
-            conta_numero=data.conta_numero,
+            conta_numero=conta_numero,
             codigo=data.codigo,
             descricao=data.descricao,
             tipo=data.tipo,
@@ -248,6 +254,65 @@ class PlanoContaService:
         )
         logger.info("plano_conta.removida", conta_id=str(conta_id), codigo=conta.codigo)
 
+    async def remover_lote(
+        self, ids: list[UUID], *, todas: bool = False
+    ) -> PlanoContaExclusaoLoteResultado:
+        """Remove várias contas (soft delete), isolando falhas por conta.
+
+        Processa do nível mais profundo para o mais raso, para que a remoção de
+        uma conta pai selecionada junto com seus filhos funcione numa única
+        chamada. Cada conta passa pelas mesmas validações de `remover()`
+        (filhos ativos, regras, movimentações) — contas bloqueadas não
+        interrompem o restante do lote.
+        """
+        if todas:
+            q = select(PlanoConta.id, PlanoConta.codigo).where(
+                PlanoConta.empresa_id == self._empresa_id,
+                PlanoConta.deleted_at == None,
+            )
+            alvo = list((await self._db.execute(q)).all())
+        else:
+            q = select(PlanoConta.id, PlanoConta.codigo).where(
+                PlanoConta.empresa_id == self._empresa_id,
+                PlanoConta.deleted_at == None,
+                PlanoConta.id.in_(ids),
+            )
+            alvo = list((await self._db.execute(q)).all())
+
+        # Filhos antes de pais: ordena por profundidade do código, decrescente.
+        alvo.sort(key=lambda item: (item.codigo.count("."), item.codigo), reverse=True)
+
+        removidas = 0
+        bloqueadas: list[PlanoContaExclusaoBloqueada] = []
+        for conta_id, codigo in alvo:
+            try:
+                await self.remover(conta_id)
+                removidas += 1
+            except (ConflictError, NotFoundError) as exc:
+                bloqueadas.append(
+                    PlanoContaExclusaoBloqueada(id=conta_id, codigo=codigo, erro=exc.message)
+                )
+
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="plano_conta.exclusao_lote",
+            entidade="plano_conta",
+            entidade_id=self._empresa_id,
+            dados_depois={
+                "removidas": removidas,
+                "bloqueadas": [b.codigo for b in bloqueadas],
+                "todas": todas,
+            },
+        )
+        logger.info(
+            "plano_conta.exclusao_lote",
+            empresa_id=str(self._empresa_id),
+            removidas=removidas,
+            bloqueadas=len(bloqueadas),
+        )
+        return PlanoContaExclusaoLoteResultado(removidas=removidas, bloqueadas=bloqueadas)
+
     async def importar_lote(self, rows: list[dict]) -> "ImportacaoPlanoResult":
         """Importa contas em duas fases, preservando hierarquia e isolando falhas por linha."""
         from src.api.v1.plano_contas import ImportacaoLinhaErro, ImportacaoPlanoResult
@@ -338,12 +403,18 @@ class PlanoContaService:
                 continue
             validos[codigo] = item
 
+        proximo_numero = await self._proximo_conta_numero()
+
         criadas: dict[str, PlanoConta] = {}
         for codigo in sorted(validos, key=lambda value: (value.count("."), value)):
             data, linha = validos[codigo]
+            conta_numero = data.conta_numero
+            if conta_numero is None:
+                conta_numero = proximo_numero
+                proximo_numero += 1
             conta = PlanoConta(
                 empresa_id=self._empresa_id,
-                conta_numero=data.conta_numero,
+                conta_numero=conta_numero,
                 codigo=data.codigo,
                 descricao=data.descricao,
                 tipo=data.tipo,
@@ -430,6 +501,14 @@ class PlanoContaService:
         )
         if existing.scalar_one_or_none():
             raise ConflictError(message=f"Já existe uma conta com o código '{codigo}'.")
+
+    async def _proximo_conta_numero(self) -> int:
+        """Próximo número sequencial livre para `conta_numero` nesta empresa."""
+        q = select(func.max(PlanoConta.conta_numero)).where(
+            PlanoConta.empresa_id == self._empresa_id,
+        )
+        maximo = (await self._db.execute(q)).scalar_one_or_none()
+        return (maximo or 0) + 1
 
     async def _tem_movimentacao(self, conta_id: UUID) -> bool:
         registros_q = select(func.count()).where(
