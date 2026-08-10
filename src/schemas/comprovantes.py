@@ -62,3 +62,22 @@ class ComprovanteListResponse(BaseModel):
 
 class AssociarTransacaoRequest(BaseModel):
     transacao_id: UUID
+
+
+class ComprovanteExtracaoResponse(BaseModel):
+    """Pré-preenchimento a partir de um PDF — não persiste nada.
+
+    O front deve deixar o usuário revisar/corrigir e então enviar via
+    POST /comprovantes normal.
+    """
+
+    favorecido: str | None = None
+    cpf_cnpj: str | None = None
+    data_pagamento: datetime | None = None
+    data_vencimento: datetime | None = None
+    valor_documento: Decimal | None = None
+    valor_pago: Decimal | None = None
+    juros: Decimal | None = None
+    multa: Decimal | None = None
+    desconto: Decimal | None = None
+    confianca: str = Field(description="regex (determinístico) ou ia (fallback)")
