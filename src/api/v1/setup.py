@@ -11,7 +11,7 @@ import secrets
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,7 @@ from src.core.config import get_settings
 from src.core.security import hash_password
 from src.db.models import Tenant, Usuario
 from src.db.session import get_db
+from src.schemas.types import CNPJ
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 
@@ -30,19 +31,10 @@ _SETUP_ADVISORY_LOCK_ID = 41004100
 
 class SetupRequest(BaseModel):
     tenant_nome: str = Field(..., min_length=3, max_length=200)
-    tenant_cnpj: str = Field(..., description="14 dígitos ou formatado")
+    tenant_cnpj: CNPJ = Field(..., description="14 dígitos ou formatado")
     admin_nome: str = Field(..., min_length=2, max_length=200)
     admin_email: EmailStr
     admin_senha: str = Field(..., min_length=8)
-
-    @field_validator("tenant_cnpj", mode="before")
-    @classmethod
-    def normaliza_cnpj(cls, v: str) -> str:
-        digits = "".join(c for c in v if c.isdigit())
-        if len(digits) != 14:
-            raise ValueError("CNPJ deve ter 14 dígitos.")
-        return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
-
 
 class SetupResponse(BaseModel):
     tenant_id: uuid.UUID

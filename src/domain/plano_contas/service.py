@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
 from src.db.models import LancamentoCartao, PlanoConta, RegistroContabil, Regra
+from src.domain.auditoria import registrar_auditoria
 from src.schemas.plano_contas import (
     PlanoContaCreate,
     PlanoContaListResponse,
@@ -123,6 +124,15 @@ class PlanoContaService:
                 pai.tipo_sa = "S"
                 await self._db.flush()
 
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="plano_conta.criada",
+            entidade="plano_conta",
+            entidade_id=conta.id,
+            dados_depois=_snapshot_conta(conta),
+        )
+
         logger.info(
             "plano_conta.criada",
             conta_id=str(conta.id),
@@ -133,6 +143,7 @@ class PlanoContaService:
 
     async def atualizar(self, conta_id: UUID, data: PlanoContaUpdate) -> PlanoContaResponse:
         conta = await self._get_or_404(conta_id)
+        antes = _snapshot_conta(conta)
 
         altera_natureza = (
             (data.tipo is not None and data.tipo != conta.tipo)
@@ -169,12 +180,22 @@ class PlanoContaService:
             conta.tipo_sa = data.tipo_sa
 
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="plano_conta.atualizada",
+            entidade="plano_conta",
+            entidade_id=conta.id,
+            dados_antes=antes,
+            dados_depois=_snapshot_conta(conta),
+        )
         logger.info("plano_conta.atualizada", conta_id=str(conta_id))
         return PlanoContaResponse.model_validate(conta)
 
     async def remover(self, conta_id: UUID) -> None:
         """Soft delete — bloqueia se houver filhos ou referências financeiras."""
         conta = await self._get_or_404(conta_id)
+        antes = _snapshot_conta(conta)
 
         # Verifica filhos ativos
         filhos_q = select(func.count()).where(
@@ -216,6 +237,15 @@ class PlanoContaService:
         from datetime import UTC, datetime
         conta.deleted_at = datetime.now(UTC)
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="plano_conta.removida",
+            entidade="plano_conta",
+            entidade_id=conta.id,
+            dados_antes=antes,
+            dados_depois=_snapshot_conta(conta),
+        )
         logger.info("plano_conta.removida", conta_id=str(conta_id), codigo=conta.codigo)
 
     async def importar_lote(self, rows: list[dict]) -> "ImportacaoPlanoResult":
@@ -357,6 +387,22 @@ class PlanoContaService:
 
         await self._db.flush()
 
+        if criadas:
+            await registrar_auditoria(
+                self._db,
+                empresa_id=self._empresa_id,
+                acao="plano_conta.importacao",
+                entidade="plano_conta",
+                entidade_id=self._empresa_id,
+                dados_depois={
+                    "quantidade": len(criadas),
+                    "contas": [
+                        {"id": conta.id, "codigo": conta.codigo}
+                        for conta in criadas.values()
+                    ],
+                },
+            )
+
         return ImportacaoPlanoResult(importadas=importadas, duplicadas=duplicadas, erros=erros)
 
     # ── Validações privadas ───────────────────────────────────────────────────
@@ -440,3 +486,15 @@ def _to_node(conta: PlanoConta) -> PlanoContaNode:
         nivel=conta.nivel,
         filhos=[_to_node(f) for f in filhos_ordenados],
     )
+
+
+def _snapshot_conta(conta: PlanoConta) -> dict[str, object]:
+    return {
+        "conta_numero": conta.conta_numero,
+        "codigo": conta.codigo,
+        "descricao": conta.descricao,
+        "tipo": conta.tipo,
+        "tipo_sa": conta.tipo_sa,
+        "pai_id": conta.pai_id,
+        "deleted_at": conta.deleted_at,
+    }

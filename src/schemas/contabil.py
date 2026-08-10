@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -20,7 +21,7 @@ class RegistroContabilResponse(BaseModel):
     historico_extrato: str
     dc: str
     tipo_regra: str
-    valor: float
+    valor: Decimal
     data_lancamento: datetime
     # Expandidos
     conta_codigo: str | None = None

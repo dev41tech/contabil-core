@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
@@ -17,9 +18,9 @@ class DRELinha(BaseModel):
     codigo: str
     descricao: str
     tipo: str
-    debitos: float
-    creditos: float
-    saldo: float  # positivo = favor da conta, negativo = contra
+    debitos: Decimal
+    creditos: Decimal
+    saldo: Decimal  # positivo = favor da conta, negativo = contra
 
 
 class DREGrupo(BaseModel):
@@ -28,7 +29,7 @@ class DREGrupo(BaseModel):
     tipo: str  # receita | custo | despesa | ativo | passivo | patrimonio_liquido
     label: str
     linhas: list[DRELinha]
-    total: float
+    total: Decimal
 
 
 class DREResponse(BaseModel):
@@ -37,10 +38,10 @@ class DREResponse(BaseModel):
     data_ate: datetime | None
     grupos: list[DREGrupo]
     # Resultado Líquido = Receitas − Custos − Despesas
-    total_receitas: float
-    total_custos: float
-    total_despesas: float
-    resultado_liquido: float
+    total_receitas: Decimal
+    total_custos: Decimal
+    total_despesas: Decimal
+    resultado_liquido: Decimal
 
 
 # ─────────────────────────────────────────────────────────────── Balancete
@@ -54,10 +55,10 @@ class BalanceteLinha(BaseModel):
     descricao: str
     tipo: str
     nivel: int
-    debitos: float
-    creditos: float
-    saldo_devedor: float   # positivo somente quando D > C
-    saldo_credor: float    # positivo somente quando C > D
+    debitos: Decimal
+    creditos: Decimal
+    saldo_devedor: Decimal   # positivo somente quando D > C
+    saldo_credor: Decimal    # positivo somente quando C > D
 
 
 class BalanceteResponse(BaseModel):
@@ -65,10 +66,10 @@ class BalanceteResponse(BaseModel):
     data_de: datetime | None
     data_ate: datetime | None
     linhas: list[BalanceteLinha]
-    total_debitos: float
-    total_creditos: float
-    total_saldo_devedor: float
-    total_saldo_credor: float
+    total_debitos: Decimal
+    total_creditos: Decimal
+    total_saldo_devedor: Decimal
+    total_saldo_credor: Decimal
 
 
 # ─────────────────────────────────────────────────────────────── Livro Caixa
@@ -80,8 +81,8 @@ class LivroCaixaLancamento(BaseModel):
     data: datetime
     historico: str
     dc: str
-    valor: float
-    saldo_acumulado: float
+    valor: Decimal
+    saldo_acumulado: Decimal
 
 
 class LivroCaixaAgencia(BaseModel):
@@ -89,11 +90,11 @@ class LivroCaixaAgencia(BaseModel):
 
     agencia_id: str
     descricao: str
-    saldo_inicial: float
+    saldo_inicial: Decimal
     lancamentos: list[LivroCaixaLancamento]
-    saldo_final: float
-    total_debitos: float
-    total_creditos: float
+    saldo_final: Decimal
+    total_debitos: Decimal
+    total_creditos: Decimal
 
 
 class LivroCaixaResponse(BaseModel):

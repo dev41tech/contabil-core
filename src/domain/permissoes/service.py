@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError
 from src.db.models import Empresa, Permissao, Usuario
+from src.domain.auditoria import registrar_auditoria
 from src.schemas.permissoes import (
     PermissaoCreate,
     PermissaoListResponse,
@@ -96,6 +97,15 @@ class PermissaoService:
         )
         self._db.add(p)
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            empresa_id=self._empresa_id,
+            acao="permissao.concedida",
+            entidade="permissao",
+            entidade_id=p.usuario_id,
+            dados_depois=_snapshot_permissao(p),
+        )
 
         logger.info(
             "permissao.concedida",
@@ -117,8 +127,19 @@ class PermissaoService:
         self, usuario_id: UUID, data: PermissaoUpdate
     ) -> PermissaoResponse:
         p, usuario = await self._get_or_404(usuario_id)
+        antes = _snapshot_permissao(p)
         p.modulos = data.modulos
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            empresa_id=self._empresa_id,
+            acao="permissao.atualizada",
+            entidade="permissao",
+            entidade_id=p.usuario_id,
+            dados_antes=antes,
+            dados_depois=_snapshot_permissao(p),
+        )
 
         logger.info(
             "permissao.atualizada",
@@ -138,8 +159,18 @@ class PermissaoService:
 
     async def revogar(self, usuario_id: UUID) -> None:
         p, usuario = await self._get_or_404(usuario_id)
+        antes = _snapshot_permissao(p)
         await self._db.delete(p)
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            tenant_id=self._tenant_id,
+            empresa_id=self._empresa_id,
+            acao="permissao.revogada",
+            entidade="permissao",
+            entidade_id=usuario_id,
+            dados_antes=antes,
+        )
         logger.info(
             "permissao.revogada",
             usuario_id=str(usuario_id),
@@ -199,3 +230,11 @@ class PermissaoService:
                 message="Usuário não encontrado neste escritório."
             )
         return usuario
+
+
+def _snapshot_permissao(permissao: Permissao) -> dict[str, object]:
+    return {
+        "usuario_id": permissao.usuario_id,
+        "empresa_id": permissao.empresa_id,
+        "modulos": permissao.modulos,
+    }

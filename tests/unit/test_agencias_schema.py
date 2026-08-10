@@ -4,8 +4,30 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import UniqueConstraint
 
+from src.db.models import AgenciaBancaria
 from src.schemas.agencias import AgenciaCreate, AgenciaUpdate
+
+
+def test_model_declara_mesma_unicidade_da_migration_inicial():
+    constraint = next(
+        (
+            item
+            for item in AgenciaBancaria.__table__.constraints
+            if isinstance(item, UniqueConstraint)
+            and item.name == "uq_agencia_empresa_banco_agencia_numero"
+        ),
+        None,
+    )
+
+    assert constraint is not None
+    assert [coluna.name for coluna in constraint.columns] == [
+        "empresa_id",
+        "banco_sigla",
+        "agencia",
+        "numero",
+    ]
 
 
 # ── AgenciaCreate
@@ -105,6 +127,16 @@ def test_update_ativa_false():
 def test_update_agencia_invalida_rejeita():
     with pytest.raises(ValidationError):
         AgenciaUpdate(agencia="ABC")
+
+
+def test_update_numero_reutiliza_normalizacao_da_criacao():
+    assert AgenciaUpdate(numero="  CONTA-123 ").numero == "CONTA-123"
+
+
+@pytest.mark.parametrize("numero", ["conta com espaço", "123/456", "X" * 21])
+def test_update_numero_invalido_rejeita(numero: str):
+    with pytest.raises(ValidationError):
+        AgenciaUpdate(numero=numero)
 
 
 @pytest.mark.parametrize("codigo,sigla", [

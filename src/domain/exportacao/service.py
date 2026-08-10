@@ -17,6 +17,7 @@ import io
 import re
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import structlog
@@ -54,7 +55,8 @@ _COLUNAS_NOTAS = [
 _COLUNAS_CONFERENCIA = [
     "data_transacao", "historico_extrato", "dc", "valor_transacao",
     "status_transacao", "nota_numero", "tipo_nota", "valor_nota",
-    "favorecido_comprovante", "valor_pago_comprovante", "status_conciliacao",
+    "favorecido_comprovante", "valor_pago_comprovante", "total_documentos",
+    "divergencia_residual", "status_conciliacao",
 ]
 
 _COLUNAS_EXTRATO = [
@@ -66,9 +68,33 @@ _VALID_TIPOS = {
     "nfse_tomado", "nfse_prestado", "conferencia",
 }
 
+# Os valores persistidos têm escala de centavos. Exigir igualdade exata evita
+# esconder uma divergência real de R$ 0,01 sob uma tolerância implícita.
+_TOLERANCIA_CONCILIACAO = Decimal("0.00")
+
 
 def _sanitize_cnpj(cnpj: str | None) -> str:
     return re.sub(r"\D", "", cnpj or "")
+
+
+def _as_decimal(value: Decimal | int | float | str | None) -> Decimal:
+    """Converte entradas legadas sem materializar a representação binária do float."""
+    if value is None:
+        return Decimal("0.00")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _valor_assinado(value: Decimal, dc: str) -> Decimal:
+    return -value if dc == "D" else value
+
+
+def _celula_segura(value: object) -> object:
+    """Neutraliza fórmulas em qualquer texto antes de cruzar a borda CSV/XLSX."""
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
 
 
 class ExportacaoService:
@@ -161,30 +187,31 @@ class ExportacaoService:
         w = csv.DictWriter(buf, fieldnames=_COLUNAS_LANCAMENTOS, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({
+            linha = {
                 "id": str(r.id),
                 "data_lancamento": r.data_lancamento.isoformat(),
                 "historico": r.historico,
                 "historico_extrato": r.historico_extrato,
                 "dc": r.dc,
-                "valor": float(r.valor),
+                "valor": _as_decimal(r.valor),
                 "tipo_regra": r.tipo_regra,
                 "conta_id": str(r.conta_id),
                 "agencia_id": str(r.agencia_id),
                 "transacao_id": str(r.transacao_id) if r.transacao_id else "",
-            })
+            }
+            w.writerow({chave: _celula_segura(valor) for chave, valor in linha.items()})
         return buf.getvalue().encode("utf-8-sig")
 
     def _lancamentos_xlsx(self, rows: list) -> bytes:
         wb, ws = self._new_workbook("Lançamentos Contábeis", _COLUNAS_LANCAMENTOS)
         for r in rows:
-            ws.append([
+            ws.append([_celula_segura(valor) for valor in [
                 str(r.id), r.data_lancamento.isoformat(),
                 r.historico, r.historico_extrato,
-                r.dc, float(r.valor), r.tipo_regra,
+                r.dc, _as_decimal(r.valor), r.tipo_regra,
                 str(r.conta_id), str(r.agencia_id),
                 str(r.transacao_id) if r.transacao_id else "",
-            ])
+            ]])
         return self._save_workbook(wb)
 
     # ── extrato bancário ──────────────────────────────────────────────────────
@@ -233,7 +260,7 @@ class ExportacaoService:
                 "agencia": agencias.get(t.agencia_id, ""),
                 "historico": t.historico,
                 "dc": t.dc,
-                "valor": float(t.valor),
+                "valor": _as_decimal(t.valor),
                 "status": t.status,
             }
             for t in transacoes
@@ -331,11 +358,11 @@ class ExportacaoService:
                 "cnpj_emitente": n.cnpj_emitente or "",
                 "nome_emitente": n.nome_emitente or "",
                 "cnpj_destinatario": n.cnpj_destinatario or "",
-                "valor": float(n.valor),
+                "valor": _as_decimal(n.valor),
                 "chave_acesso": n.chave_acesso or "",
                 "status": n.status or "",
                 "data_transacao": t.data.date().isoformat() if t else "",
-                "valor_transacao": float(t.valor) if t else "",
+                "valor_transacao": _as_decimal(t.valor) if t else "",
             })
 
         if fmt == "csv":
@@ -356,7 +383,10 @@ class ExportacaoService:
     async def _exportar_conferencia(
         self, data: ExportJobCreate, fmt: str
     ) -> tuple[list, bytes]:
-        q = select(Transacao).where(Transacao.empresa_id == self._empresa_id)
+        q = select(Transacao).where(
+            Transacao.empresa_id == self._empresa_id,
+            Transacao.deleted_at.is_(None),
+        )
         if data.data_de:
             q = q.where(Transacao.data >= data.data_de)
         if data.data_ate:
@@ -404,27 +434,40 @@ class ExportacaoService:
             notas_padded = notas + [None] * (max_rows - len(notas))
             comps_padded = comps + [None] * (max_rows - len(comps))
 
-            tem_nota = bool(notas_map.get(t.id))
-            tem_comp = bool(comp_map.get(t.id))
-            if tem_nota and tem_comp:
-                status_conc = "Conciliado"
-            elif tem_nota or tem_comp:
-                status_conc = "Parcial"
-            else:
+            tem_documento = bool(notas_map.get(t.id) or comp_map.get(t.id))
+            total_notas = sum((_as_decimal(n.valor) for n in notas if n), Decimal("0.00"))
+            total_comprovantes = sum(
+                (_as_decimal(c.valor_pago) for c in comps if c), Decimal("0.00")
+            )
+            total_documentos = total_notas + total_comprovantes
+
+            # Notas e comprovantes vinculados herdam a direção da transação. O
+            # residual fica assinado: positivo aumenta o saldo, negativo reduz.
+            valor_transacao = _valor_assinado(_as_decimal(t.valor), t.dc)
+            valor_documentos = _valor_assinado(total_documentos, t.dc)
+            divergencia = valor_documentos - valor_transacao
+
+            if not tem_documento:
                 status_conc = "Pendente"
+            elif abs(divergencia) <= _TOLERANCIA_CONCILIACAO:
+                status_conc = "Conciliado"
+            else:
+                status_conc = "Divergente"
 
             for idx, (n, c) in enumerate(zip(notas_padded, comps_padded)):
                 row: dict = {
                     "data_transacao": t.data.date().isoformat() if idx == 0 else "",
                     "historico_extrato": t.historico if idx == 0 else "",
                     "dc": t.dc if idx == 0 else "",
-                    "valor_transacao": float(t.valor) if idx == 0 else "",
+                    "valor_transacao": _as_decimal(t.valor) if idx == 0 else "",
                     "status_transacao": t.status if idx == 0 else "",
                     "nota_numero": n.numero if n else "",
                     "tipo_nota": n.tipo if n else "",
-                    "valor_nota": float(n.valor) if n else "",
+                    "valor_nota": _as_decimal(n.valor) if n else "",
                     "favorecido_comprovante": c.favorecido if c else "",
-                    "valor_pago_comprovante": float(c.valor_pago) if c else "",
+                    "valor_pago_comprovante": _as_decimal(c.valor_pago) if c else "",
+                    "total_documentos": total_documentos if idx == 0 else "",
+                    "divergencia_residual": divergencia if idx == 0 else "",
                     "status_conciliacao": status_conc if idx == 0 else "",
                 }
                 linhas.append(row)
@@ -462,7 +505,10 @@ class ExportacaoService:
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=colunas, extrasaction="ignore")
         w.writeheader()
-        w.writerows(linhas)
+        w.writerows(
+            {chave: _celula_segura(valor) for chave, valor in linha.items()}
+            for linha in linhas
+        )
         return buf.getvalue().encode("utf-8-sig")
 
     def _dicts_to_xlsx(
@@ -470,5 +516,5 @@ class ExportacaoService:
     ) -> bytes:
         wb, ws = self._new_workbook(sheet_name, colunas)
         for linha in linhas:
-            ws.append([linha.get(col, "") for col in colunas])
+            ws.append([_celula_segura(linha.get(col, "")) for col in colunas])
         return self._save_workbook(wb)

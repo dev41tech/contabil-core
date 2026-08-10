@@ -8,6 +8,7 @@ sinal de saldo por natureza da conta, identidade do balancete, saldo acumulado.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -15,6 +16,10 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import AgenciaBancaria, Empresa, PlanoConta, RegistroContabil, Tenant, Transacao, Usuario
+
+
+def _money(value: object) -> Decimal:
+    return Decimal(str(value))
 
 
 async def _login(client: AsyncClient, tenant: Tenant, usuario: Usuario) -> str:
@@ -106,7 +111,7 @@ async def test_dre_vazio_zera_totais(
     assert r.status_code == 200
     body = r.json()
     assert body["grupos"] == []
-    assert body["resultado_liquido"] == 0
+    assert _money(body["resultado_liquido"]) == Decimal("0.00")
 
 
 @pytest.mark.asyncio
@@ -119,10 +124,10 @@ async def test_dre_calcula_resultado_liquido(
     assert r.status_code == 200
 
     body = r.json()
-    assert body["total_receitas"] == 10_000
-    assert body["total_custos"] == 2_000
-    assert body["total_despesas"] == 3_000
-    assert body["resultado_liquido"] == 5_000
+    assert _money(body["total_receitas"]) == Decimal("10000.00")
+    assert _money(body["total_custos"]) == Decimal("2000.00")
+    assert _money(body["total_despesas"]) == Decimal("3000.00")
+    assert _money(body["resultado_liquido"]) == Decimal("5000.00")
 
 
 @pytest.mark.asyncio
@@ -136,7 +141,7 @@ async def test_dre_preserva_movimento_de_conta_legada_removida(
     r = await client.get(_url(empresa.id, "dre"))
 
     receitas = next(grupo for grupo in r.json()["grupos"] if grupo["tipo"] == "receita")
-    assert receitas["total"] == 10_000
+    assert _money(receitas["total"]) == Decimal("10000.00")
 
 
 @pytest.mark.asyncio
@@ -148,13 +153,13 @@ async def test_dre_respeita_natureza_da_conta(
     grupos = {g["tipo"]: g for g in (await client.get(_url(empresa.id, "dre"))).json()["grupos"]}
 
     receita = grupos["receita"]["linhas"][0]
-    assert receita["creditos"] == 10_000
-    assert receita["debitos"] == 0
-    assert receita["saldo"] == 10_000  # C − D
+    assert _money(receita["creditos"]) == Decimal("10000.00")
+    assert _money(receita["debitos"]) == Decimal("0.00")
+    assert _money(receita["saldo"]) == Decimal("10000.00")  # C − D
 
     despesa = grupos["despesa"]["linhas"][0]
-    assert despesa["debitos"] == 3_000
-    assert despesa["saldo"] == 3_000  # D − C
+    assert _money(despesa["debitos"]) == Decimal("3000.00")
+    assert _money(despesa["saldo"]) == Decimal("3000.00")  # D − C
 
 
 @pytest.mark.asyncio
@@ -168,7 +173,7 @@ async def test_dre_filtra_por_periodo(
         params={"data_de": "2026-01-01T00:00:00Z", "data_ate": "2026-01-31T23:59:59Z"},
     )
     assert r.status_code == 200
-    assert r.json()["resultado_liquido"] == 0
+    assert _money(r.json()["resultado_liquido"]) == Decimal("0.00")
 
 
 @pytest.mark.asyncio
@@ -209,7 +214,7 @@ async def test_dre_ignora_contas_patrimoniais(
     body = (await client.get(_url(empresa.id, "dre"))).json()
 
     assert "passivo" not in {grupo["tipo"] for grupo in body["grupos"]}
-    assert body["resultado_liquido"] == 5_000
+    assert _money(body["resultado_liquido"]) == Decimal("5000.00")
 
 
 # ── Balancete ─────────────────────────────────────────────────────────────────
@@ -223,10 +228,10 @@ async def test_balancete_fecha_debitos_e_creditos(
     await _login(client, tenant, usuario)
     body = (await client.get(_url(empresa.id, "balancete"))).json()
 
-    assert body["total_debitos"] == 5_000     # 3.000 despesa + 2.000 custo
-    assert body["total_creditos"] == 10_000   # receita
-    assert body["total_saldo_devedor"] == 5_000
-    assert body["total_saldo_credor"] == 10_000
+    assert _money(body["total_debitos"]) == Decimal("5000.00")
+    assert _money(body["total_creditos"]) == Decimal("10000.00")
+    assert _money(body["total_saldo_devedor"]) == Decimal("5000.00")
+    assert _money(body["total_saldo_credor"]) == Decimal("10000.00")
 
 
 @pytest.mark.asyncio
@@ -238,7 +243,10 @@ async def test_balancete_saldos_sao_mutuamente_exclusivos(
     linhas = (await client.get(_url(empresa.id, "balancete"))).json()["linhas"]
 
     for linha in linhas:
-        assert linha["saldo_devedor"] == 0 or linha["saldo_credor"] == 0, linha["codigo"]
+        assert (
+            _money(linha["saldo_devedor"]) == Decimal("0.00")
+            or _money(linha["saldo_credor"]) == Decimal("0.00")
+        ), linha["codigo"]
 
 
 @pytest.mark.asyncio
@@ -251,8 +259,8 @@ async def test_balancete_inclui_conta_sem_movimento(
 
     caixa = [l for l in linhas if l["codigo"] == "1.1.1"]
     assert len(caixa) == 1
-    assert caixa[0]["debitos"] == 0
-    assert caixa[0]["creditos"] == 0
+    assert _money(caixa[0]["debitos"]) == Decimal("0.00")
+    assert _money(caixa[0]["creditos"]) == Decimal("0.00")
 
 
 @pytest.mark.asyncio
@@ -312,10 +320,14 @@ async def test_livro_caixa_acumula_saldo_na_ordem_das_datas(
     assert len(body["agencias"]) == 1
     ag = body["agencias"][0]
     assert ag["descricao"] == "ITAU 1234 56789 0"
-    assert [l["saldo_acumulado"] for l in ag["lancamentos"]] == [1_000, 600, 850]
-    assert ag["saldo_final"] == 850
-    assert ag["total_creditos"] == 1_250
-    assert ag["total_debitos"] == 400
+    assert [_money(l["saldo_acumulado"]) for l in ag["lancamentos"]] == [
+        Decimal("1000.00"),
+        Decimal("600.00"),
+        Decimal("850.00"),
+    ]
+    assert _money(ag["saldo_final"]) == Decimal("850.00")
+    assert _money(ag["total_creditos"]) == Decimal("1250.00")
+    assert _money(ag["total_debitos"]) == Decimal("400.00")
 
 
 @pytest.mark.asyncio
@@ -353,6 +365,6 @@ async def test_livro_caixa_saldo_inicial_vem_do_que_antecede_o_periodo(
     ).json()
 
     ag = body["agencias"][0]
-    assert ag["saldo_inicial"] == 5_000
+    assert _money(ag["saldo_inicial"]) == Decimal("5000.00")
     assert len(ag["lancamentos"]) == 1, "a transação de fevereiro não pode entrar no período"
-    assert ag["saldo_final"] == 4_000
+    assert _money(ag["saldo_final"]) == Decimal("4000.00")

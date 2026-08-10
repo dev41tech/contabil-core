@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -216,6 +217,16 @@ class AgenciaBancaria(Base, TimestampMixin):
     regras: Mapped[list[Regra]] = relationship("Regra", back_populates="agencia")
     conta_contabil: Mapped[PlanoConta | None] = relationship("PlanoConta")
 
+    __table_args__ = (
+        UniqueConstraint(
+            "empresa_id",
+            "banco_sigla",
+            "agencia",
+            "numero",
+            name="uq_agencia_empresa_banco_agencia_numero",
+        ),
+    )
+
     @property
     def descricao(self) -> str:
         parts = [self.banco_sigla, self.agencia, self.numero]
@@ -276,7 +287,7 @@ class Transacao(Base, TimestampMixin):
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     data: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    valor: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
+    valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_transacao_enum"), nullable=False)
     status: Mapped[str] = mapped_column(
@@ -313,7 +324,7 @@ class RegistroContabil(Base, TimestampMixin):
     historico_extrato: Mapped[str] = mapped_column(String(500), nullable=False)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_registro_enum"), nullable=False)
     tipo_regra: Mapped[str] = mapped_column(String(50), nullable=False)
-    valor: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
+    valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     data_lancamento: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     transacao: Mapped[Transacao | None] = relationship("Transacao")
@@ -352,7 +363,7 @@ class NotaFiscal(Base, TimestampMixin):
     cnpj_emitente: Mapped[str] = mapped_column(String(18), nullable=False)
     nome_emitente: Mapped[str | None] = mapped_column(String(300), nullable=True)
     cnpj_destinatario: Mapped[str | None] = mapped_column(String(18), nullable=True)
-    valor: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
+    valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     data_emissao: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(
         Enum("pendente", "associada", "cancelada", name="status_nota_enum"),
@@ -390,11 +401,21 @@ class Comprovante(Base, TimestampMixin):
     cpf_cnpj: Mapped[str | None] = mapped_column(String(18), nullable=True)
     data_pagamento: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     data_vencimento: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    valor_documento: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
-    valor_pago: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
-    juros: Mapped[float] = mapped_column(Numeric(15, 2), default=0, nullable=False)
-    multa: Mapped[float] = mapped_column(Numeric(15, 2), default=0, nullable=False)
-    desconto: Mapped[float] = mapped_column(Numeric(15, 2), default=0, nullable=False)
+    valor_documento: Mapped[Decimal | None] = mapped_column(
+        Numeric(15, 2, asdecimal=True), nullable=True
+    )
+    valor_pago: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2, asdecimal=True), nullable=False
+    )
+    juros: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2, asdecimal=True), default=Decimal("0.00"), nullable=False
+    )
+    multa: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2, asdecimal=True), default=Decimal("0.00"), nullable=False
+    )
+    desconto: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2, asdecimal=True), default=Decimal("0.00"), nullable=False
+    )
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
     arquivo_nome: Mapped[str | None] = mapped_column(String(255), nullable=True)
     arquivo_base64: Mapped[str | None] = mapped_column(Text, nullable=True)  # PDF/imagem em base64
@@ -420,7 +441,9 @@ class CartaoCredito(Base, TimestampMixin):
     ultimos_digitos: Mapped[str | None] = mapped_column(String(4), nullable=True)
     dia_fechamento: Mapped[int] = mapped_column(Integer, nullable=False)   # 1-28
     dia_vencimento: Mapped[int] = mapped_column(Integer, nullable=False)   # 1-28
-    limite: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
+    limite: Mapped[Decimal | None] = mapped_column(
+        Numeric(15, 2, asdecimal=True), nullable=True
+    )
     ativo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     faturas: Mapped[list[FaturaCartao]] = relationship("FaturaCartao", back_populates="cartao")
@@ -439,7 +462,9 @@ class FaturaCartao(Base, TimestampMixin):
     competencia: Mapped[str] = mapped_column(String(7), nullable=False)   # "2024-01"
     data_fechamento: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     data_vencimento: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    valor_total: Mapped[float] = mapped_column(Numeric(15, 2), default=0, nullable=False)
+    valor_total: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2, asdecimal=True), default=Decimal("0.00"), nullable=False
+    )
     status: Mapped[str] = mapped_column(
         Enum("aberta", "fechada", "paga", name="status_fatura_enum"),
         nullable=False,
@@ -470,7 +495,7 @@ class LancamentoCartao(Base, TimestampMixin):
     fatura_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("faturas_cartao.id"), nullable=False)
     data_compra: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
-    valor: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
+    valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     # Conta contábil opcional (para classificação)
     conta_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("plano_contas.id"), nullable=True)
     parcela_atual: Mapped[int | None] = mapped_column(Integer, nullable=True)   # ex: 1
@@ -684,14 +709,14 @@ class CpFornecedor(Base):
     conta_contabil      = _Col(_Str(50), nullable=False)
     nome_fornecedor     = _Col(_Txt, nullable=False)
     cnpj                = _Col(_Str(18))
-    saldo_anterior      = _Col(_Num(15, 2), default=0)
+    saldo_anterior      = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
     saldo_anterior_tipo = _Col(_Str(1))
-    total_debito        = _Col(_Num(15, 2), default=0)
-    total_credito       = _Col(_Num(15, 2), default=0)
-    saldo_final         = _Col(_Num(15, 2), default=0)
+    total_debito        = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
+    total_credito       = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
+    saldo_final         = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
     saldo_final_tipo    = _Col(_Str(1))
     status_pagamento    = _Col(_Str(20))   # QUITADO | EM_ABERTO | ADIANTADO | SEM_MOVIMENTO
-    valor_a_pagar       = _Col(_Num(15, 2), default=0)
+    valor_a_pagar       = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
     qtd_nfs_pendentes   = _Col(_Int, default=0)
     qtd_nfs_parciais    = _Col(_Int, default=0)
     divergencia_calculo = _Col(_Bool, default=False)
@@ -721,15 +746,15 @@ class CpLancamento(Base):
     lote                  = _Col(_Str(50))
     historico             = _Col(_Txt, nullable=False)
     conta_partida         = _Col(_Str(20))
-    valor_debito          = _Col(_Num(15, 2), default=0)
-    valor_credito         = _Col(_Num(15, 2), default=0)
-    saldo_apos_lancamento = _Col(_Num(15, 2))
+    valor_debito          = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
+    valor_credito         = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
+    saldo_apos_lancamento = _Col(_Num(15, 2, asdecimal=True))
     saldo_tipo            = _Col(_Str(1))
     tipo_operacao         = _Col(_Str(20))   # COMPRA | PAGAMENTO | DEVOLUCAO
     numero_nf             = _Col(_Str(50))
     cnpj_historico        = _Col(_Str(18))
-    valor_pago_parcial    = _Col(_Num(15, 2), default=0)
-    valor_saldo           = _Col(_Num(15, 2), default=0)
+    valor_pago_parcial    = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
+    valor_saldo           = _Col(_Num(15, 2, asdecimal=True), default=Decimal("0.00"))
     status_pagamento      = _Col(_Str(20))   # PAGO | PARCIAL | PENDENTE
     classificado_por_ia   = _Col(_Bool, default=False)
     created_at            = _Col(_DT, default=_utcnow)
@@ -758,7 +783,7 @@ class CpConciliacao(Base):
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     lancamento_credito_id = _Col(_Int, _FK("cp_lancamento.id"))
     lancamento_debito_id  = _Col(_Int, _FK("cp_lancamento.id"))
-    valor_conciliado      = _Col(_Num(15, 2), nullable=False)
+    valor_conciliado      = _Col(_Num(15, 2, asdecimal=True), nullable=False)
     metodo_match          = _Col(_Str(20))   # AUTO_NF | AUTO_VALOR_EXATO | AUTO_FIFO | MANUAL
     confianca             = _Col(_Int)       # 0-100
     observacao            = _Col(_Txt)
@@ -787,9 +812,9 @@ class CpDivergencia(Base):
     tipo             = _Col(_Str(50), nullable=False)
     severidade       = _Col(_Str(20))   # CRITICA | ALTA | MEDIA | BAIXA
     descricao        = _Col(_Txt, nullable=False)
-    valor_esperado   = _Col(_Num(15, 2))
-    valor_encontrado = _Col(_Num(15, 2))
-    diferenca        = _Col(_Num(15, 2))
+    valor_esperado   = _Col(_Num(15, 2, asdecimal=True))
+    valor_encontrado = _Col(_Num(15, 2, asdecimal=True))
+    diferenca        = _Col(_Num(15, 2, asdecimal=True))
     resolvido        = _Col(_Bool, default=False)
     observacao_resolucao = _Col(_Txt)
     created_at       = _Col(_DT, default=_utcnow)

@@ -37,6 +37,7 @@ from src.core.errors import (
     ValidationError,
 )
 from src.db.models import AgenciaBancaria, ConexaoBancaria, Transacao
+from src.domain.auditoria import registrar_auditoria
 from src.domain.openbanking.providers.base import IOpenBankingProvider
 from src.domain.openbanking.providers.mock import MockProvider
 from src.domain.openbanking.providers.pluggy import PluggyProvider
@@ -135,8 +136,14 @@ class OpenBankingService:
         except ValidationError:
             raise
         except Exception as exc:
+            logger.exception(
+                "openbanking.validacao_item_falhou",
+                empresa_id=str(self._empresa_id),
+                provedor=self._provedor_nome,
+                item_id=data.item_id,
+            )
             raise ValidationError(
-                message=f"Não foi possível obter informações do banco: {exc}"
+                message="Não foi possível validar a conexão bancária no momento."
             ) from exc
 
         if not contas:
@@ -170,6 +177,16 @@ class OpenBankingService:
             self._db.add(conexao)
             conexoes.append(conexao)
         await self._db.flush()
+
+        for conexao in conexoes:
+            await registrar_auditoria(
+                self._db,
+                empresa_id=self._empresa_id,
+                acao="openbanking.conexao_criada",
+                entidade="conexao_bancaria",
+                entidade_id=conexao.id,
+                dados_depois=_snapshot_conexao(conexao),
+            )
 
         logger.info(
             "openbanking.conexao_criada",
@@ -205,6 +222,7 @@ class OpenBankingService:
         self, conexao_id: UUID, req: SincronizarRequest
     ) -> SincronizarResponse:
         conexao = await self._get_or_404(conexao_id)
+        conexao_antes = _snapshot_conexao(conexao)
 
         data_fim = date.today()
         data_inicio = data_fim - timedelta(days=req.dias)
@@ -221,10 +239,16 @@ class OpenBankingService:
             )
         except Exception as exc:
             conexao.status = "erro"
-            conexao.erro_msg = str(exc)[:500]
+            conexao.erro_msg = "Falha temporária ao sincronizar transações."
             await self._db.flush()
+            logger.exception(
+                "openbanking.sincronizacao_falhou",
+                empresa_id=str(self._empresa_id),
+                conexao_id=str(conexao_id),
+                provedor=self._provedor_nome,
+            )
             raise ValidationError(
-                message=f"Erro ao buscar transações: {exc}"
+                message="Não foi possível sincronizar as transações bancárias no momento."
             ) from exc
 
         importadas = 0
@@ -275,6 +299,15 @@ class OpenBankingService:
         conexao.erro_msg = None
         conexao.total_transacoes_sync += importadas
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="openbanking.conexao_sincronizada",
+            entidade="conexao_bancaria",
+            entidade_id=conexao.id,
+            dados_antes=conexao_antes,
+            dados_depois=_snapshot_conexao(conexao),
+        )
 
         logger.info(
             "openbanking.sincronizado",
@@ -300,6 +333,15 @@ class OpenBankingService:
         """Token para re-autenticar uma conexão expirada."""
         conexao = await self._get_or_404(conexao_id)
         token = await self._provider.criar_connect_token(conexao.item_id)
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="openbanking.reconexao_iniciada",
+            entidade="conexao_bancaria",
+            entidade_id=conexao.id,
+            dados_antes=_snapshot_conexao(conexao),
+            dados_depois={"reautenticacao_solicitada": True},
+        )
         return ConnectTokenResponse(
             access_token=token,
             provedor=self._provedor_nome,
@@ -310,8 +352,18 @@ class OpenBankingService:
 
     async def remover(self, conexao_id: UUID) -> None:
         conexao = await self._get_or_404(conexao_id)
+        antes = _snapshot_conexao(conexao)
         conexao.deleted_at = datetime.now(UTC)
         await self._db.flush()
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao="openbanking.conexao_removida",
+            entidade="conexao_bancaria",
+            entidade_id=conexao.id,
+            dados_antes=antes,
+            dados_depois=_snapshot_conexao(conexao),
+        )
         logger.info("openbanking.conexao_removida", conexao_id=str(conexao_id))
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -435,3 +487,19 @@ def _to_response(c: ConexaoBancaria) -> ConexaoResponse:
         total_transacoes_sync=c.total_transacoes_sync,
         erro_msg=c.erro_msg,
     )
+
+
+def _snapshot_conexao(conexao: ConexaoBancaria) -> dict[str, object]:
+    # Tokens e segredos do provedor nunca entram no snapshot.
+    return {
+        "provedor": conexao.provedor,
+        "item_id": conexao.item_id,
+        "account_id_externo": conexao.account_id_externo,
+        "agencia_id": conexao.agencia_id,
+        "status": conexao.status,
+        "last_sync_at": conexao.last_sync_at,
+        "next_sync_at": conexao.next_sync_at,
+        "total_transacoes_sync": conexao.total_transacoes_sync,
+        "erro_msg": conexao.erro_msg,
+        "deleted_at": conexao.deleted_at,
+    }

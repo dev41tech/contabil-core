@@ -126,7 +126,7 @@ class ContabilService:
             historico_extrato=r.historico_extrato,
             dc=r.dc,
             tipo_regra=r.tipo_regra,
-            valor=float(r.valor),
+            valor=r.valor,
             data_lancamento=r.data_lancamento,
             conta_codigo=conta.codigo if conta else None,
             conta_descricao=conta.descricao if conta else None,

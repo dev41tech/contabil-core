@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
 from src.db.session import get_db
+from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.engine import NeoEngine
 from src.schemas.neo import (
     NeoAssociarManualRequest,
@@ -171,6 +172,12 @@ async def associar_manual(
             detail="Conta contábil não encontrada nesta empresa.",
         )
 
+    antes = {
+        "resultado": decisao.resultado,
+        "estrategia": decisao.estrategia,
+        "motivo": decisao.motivo,
+        "transacao_status": transacao.status,
+    }
     engine = NeoEngine(db=db, empresa_id=empresa_id)
     await engine.registrar_partidas_manuais(transacao, conta.id, body.descricao)
 
@@ -182,7 +189,24 @@ async def associar_manual(
     # Atualiza o status da transação
     transacao.status = "processada"
 
-    await db.flush()
+    await registrar_auditoria(
+        db,
+        tenant_id=ctx.tenant_id,
+        usuario_id=ctx.user_id,
+        empresa_id=empresa_id,
+        acao="neo.associacao_manual",
+        entidade="neo_decisao",
+        entidade_id=decisao.id,
+        dados_antes=antes,
+        dados_depois={
+            "resultado": decisao.resultado,
+            "estrategia": decisao.estrategia,
+            "motivo": decisao.motivo,
+            "transacao_id": transacao.id,
+            "transacao_status": transacao.status,
+            "conta_id": conta.id,
+        },
+    )
 
     resp = NeoDecisaoResponse.model_validate(decisao)
     resp.transacao_descricao = transacao.historico

@@ -60,7 +60,11 @@ class StatsService:
     # ── resumo global ─────────────────────────────────────────────────────────
 
     async def _resumo(self) -> ResumoStats:
-        total_t = await self._count(Transacao, Transacao.empresa_id == self._empresa_id)
+        total_t = await self._count(
+            Transacao,
+            Transacao.empresa_id == self._empresa_id,
+            Transacao.deleted_at.is_(None),
+        )
         total_r = await self._count(
             RegistroContabil,
             RegistroContabil.empresa_id == self._empresa_id,
@@ -83,6 +87,7 @@ class StatsService:
             .where(
                 RegistroContabil.empresa_id == self._empresa_id,
                 RegistroContabil.transacao_id.is_not(None),
+                RegistroContabil.deleted_at.is_(None),
             )
             .distinct()
             .subquery()
@@ -94,6 +99,7 @@ class StatsService:
                 .where(
                     Transacao.empresa_id == self._empresa_id,
                     Transacao.id.in_(select(conc_subq)),
+                    Transacao.deleted_at.is_(None),
                 )
             )
         ).scalar_one()
@@ -130,6 +136,7 @@ class StatsService:
                 ).where(
                     Transacao.empresa_id == self._empresa_id,
                     Transacao.data >= inicio,
+                    Transacao.deleted_at.is_(None),
                 ).group_by("mes")
             )
         ).all()
@@ -208,6 +215,7 @@ class StatsService:
                 Transacao,
                 Transacao.empresa_id == self._empresa_id,
                 Transacao.agencia_id == ag.id,
+                Transacao.deleted_at.is_(None),
             )
             conc_ag = (
                 await self._db.execute(
@@ -216,10 +224,12 @@ class StatsService:
                     .where(
                         Transacao.empresa_id == self._empresa_id,
                         Transacao.agencia_id == ag.id,
+                        Transacao.deleted_at.is_(None),
                         Transacao.id.in_(
                             select(RegistroContabil.transacao_id).where(
                                 RegistroContabil.empresa_id == self._empresa_id,
                                 RegistroContabil.transacao_id.is_not(None),
+                                RegistroContabil.deleted_at.is_(None),
                             ).distinct()
                         ),
                     )

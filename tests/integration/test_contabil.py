@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from decimal import Decimal
 
 import pytest
 from httpx import AsyncClient
@@ -88,7 +89,7 @@ async def test_listar_registros_contabeis(client, db, tenant, usuario, empresa):
     body = r.json()
     assert body["total"] == 2
     assert {item["dc"] for item in body["items"]} == {"D", "C"}
-    assert all(item["valor"] == 3000.0 for item in body["items"])
+    assert all(Decimal(str(item["valor"])) == Decimal("3000.00") for item in body["items"])
     assert len({item["lancamento_id"] for item in body["items"]}) == 1
 
 

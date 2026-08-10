@@ -113,13 +113,13 @@ def consolidar_todos_fornecedores(dados_parser: Dict) -> Dict:
             parsed_credito = sum(
                 Decimal(str(l.get('valor_credito', 0))) for l in lancamentos_consolidados
             )
-            fornecedor['total_credito'] = float(parsed_credito)
+            fornecedor['total_credito'] = parsed_credito
 
         if parsed_debito == 0:
             parsed_debito = sum(
                 Decimal(str(l.get('valor_debito', 0))) for l in lancamentos_consolidados
             )
-            fornecedor['total_debito'] = float(parsed_debito)
+            fornecedor['total_debito'] = parsed_debito
 
         qtd_original = len(lancamentos_originais)
         qtd_consolidado = len(lancamentos_consolidados)

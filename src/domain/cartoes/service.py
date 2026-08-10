@@ -32,6 +32,7 @@ from src.db.models import (
     PlanoConta,
     Transacao,
 )
+from src.domain.auditoria import registrar_auditoria
 from src.schemas.cartoes import (
     AssociarTransacaoFaturaRequest,
     CartaoCreate,
@@ -122,11 +123,11 @@ class CartaoService:
                     ultimos_digitos=c.ultimos_digitos,
                     dia_fechamento=c.dia_fechamento,
                     dia_vencimento=c.dia_vencimento,
-                    limite=float(c.limite) if c.limite else None,
+                    limite=c.limite if c.limite is not None else None,
                     ativo=c.ativo,
                     total_faturas=len(faturas),
                     fatura_aberta_valor=(
-                        float(fat_aberta) if fat_aberta is not None else None
+                        _valor_monetario(fat_aberta) if fat_aberta is not None else None
                     ),
                 )
             )
@@ -150,7 +151,7 @@ class CartaoService:
             id=cartao.id, empresa_id=cartao.empresa_id, nome=cartao.nome,
             bandeira=cartao.bandeira, ultimos_digitos=cartao.ultimos_digitos,
             dia_fechamento=cartao.dia_fechamento, dia_vencimento=cartao.dia_vencimento,
-            limite=float(cartao.limite) if cartao.limite else None, ativo=cartao.ativo,
+            limite=cartao.limite if cartao.limite is not None else None, ativo=cartao.ativo,
         )
 
     async def atualizar_cartao(self, cartao_id: UUID, data: CartaoUpdate) -> CartaoResponse:
@@ -170,7 +171,7 @@ class CartaoService:
             id=cartao.id, empresa_id=cartao.empresa_id, nome=cartao.nome,
             bandeira=cartao.bandeira, ultimos_digitos=cartao.ultimos_digitos,
             dia_fechamento=cartao.dia_fechamento, dia_vencimento=cartao.dia_vencimento,
-            limite=float(cartao.limite) if cartao.limite else None, ativo=cartao.ativo,
+            limite=cartao.limite if cartao.limite is not None else None, ativo=cartao.ativo,
         )
 
     async def remover_cartao(self, cartao_id: UUID) -> None:
@@ -251,7 +252,7 @@ class CartaoService:
             competencia=data.competencia,
             data_fechamento=data.data_fechamento,
             data_vencimento=data.data_vencimento,
-            valor_total=0,
+            valor_total=Decimal("0.00"),
             status="aberta",
             observacao=data.observacao,
         )
@@ -273,6 +274,7 @@ class CartaoService:
                 message="Uma fatura só pode ser paga pela associação de uma transação válida."
             )
 
+        status_antes = fatura.status
         if data.status is not None:
             fatura.status = data.status
         if data.data_vencimento is not None:
@@ -280,6 +282,8 @@ class CartaoService:
         if data.observacao is not None:
             fatura.observacao = data.observacao
         await self._db.flush()
+        if fatura.status != status_antes:
+            await self._auditar_status_fatura(fatura, status_antes, "fatura.status_atualizado")
 
         total_lanc, valor_total = await self._totais_fatura(fatura_id)
         return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
@@ -325,13 +329,21 @@ class CartaoService:
             raise ValidationError(
                 message=(
                     "O valor da transação deve ser igual ao total da fatura "
-                    f"({float(valor_total):.2f})."
+                    f"({valor_total:.2f})."
                 )
             )
 
+        status_antes = fatura.status
+        transacao_antes = fatura.transacao_id
         fatura.transacao_id = data.transacao_id
         fatura.status = "paga"
         await self._db.flush()
+        await self._auditar_status_fatura(
+            fatura,
+            status_antes,
+            "fatura.paga",
+            transacao_id_antes=transacao_antes,
+        )
         logger.info("fatura.paga", fatura_id=str(fatura_id), transacao_id=str(data.transacao_id))
 
         return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
@@ -342,9 +354,17 @@ class CartaoService:
         fatura, cartao = await self._get_fatura_or_404(
             cartao_id, fatura_id, for_update=True
         )
+        status_antes = fatura.status
+        transacao_antes = fatura.transacao_id
         fatura.transacao_id = None
         fatura.status = "fechada"
         await self._db.flush()
+        await self._auditar_status_fatura(
+            fatura,
+            status_antes,
+            "fatura.pagamento_desassociado",
+            transacao_id_antes=transacao_antes,
+        )
         total_lanc, valor_total = await self._totais_fatura(fatura_id)
         return _fatura_to_response(fatura, cartao, total_lanc, valor_total)
 
@@ -366,7 +386,7 @@ class CartaoService:
             )
         ).scalars().all()
 
-        valor_total = sum(float(r.valor) for r in rows)
+        valor_total = sum((_valor_monetario(r.valor) for r in rows), Decimal("0.00"))
         items = [_lancamento_to_response(r) for r in rows]
         return LancamentoListResponse(items=items, total=len(items), valor_total=valor_total)
 
@@ -575,7 +595,7 @@ class CartaoService:
                 )
             )
         ).one()
-        return total_lanc, Decimal(valor_total)
+        return total_lanc, _valor_monetario(valor_total)
 
     async def _validar_conta(self, conta_id: UUID | None) -> None:
         if conta_id is None:
@@ -591,6 +611,30 @@ class CartaoService:
         ).scalar_one_or_none()
         if not existe:
             raise NotFoundError(message="Conta contábil não encontrada para esta empresa.")
+
+    async def _auditar_status_fatura(
+        self,
+        fatura: FaturaCartao,
+        status_antes: str,
+        acao: str,
+        *,
+        transacao_id_antes: UUID | None = None,
+    ) -> None:
+        await registrar_auditoria(
+            self._db,
+            empresa_id=self._empresa_id,
+            acao=acao,
+            entidade="fatura_cartao",
+            entidade_id=fatura.id,
+            dados_antes={
+                "status": status_antes,
+                "transacao_id": transacao_id_antes,
+            },
+            dados_depois={
+                "status": fatura.status,
+                "transacao_id": fatura.transacao_id,
+            },
+        )
 
 
 # ── helpers de conversão ──────────────────────────────────────────────────────
@@ -611,7 +655,7 @@ def _fatura_to_response(
         competencia=f.competencia,
         data_fechamento=f.data_fechamento,
         data_vencimento=f.data_vencimento,
-        valor_total=float(valor_total),
+        valor_total=_valor_monetario(valor_total),
         status=f.status,
         transacao_id=f.transacao_id,
         observacao=f.observacao,
@@ -624,7 +668,7 @@ def _valor_monetario(valor: object) -> Decimal:
 
 
 def _identificador_compra(
-    row: dict[str, str], data_compra: datetime, descricao: str, valor: float
+    row: dict[str, str], data_compra: datetime, descricao: str, valor: Decimal
 ) -> str:
     id_externo = next(
         (
@@ -663,7 +707,7 @@ def _lancamento_to_response(l: LancamentoCartao) -> LancamentoResponse:
         empresa_id=l.empresa_id,
         data_compra=l.data_compra,
         descricao=l.descricao,
-        valor=float(l.valor),
+        valor=_valor_monetario(l.valor),
         conta_id=l.conta_id,
         parcela_atual=l.parcela_atual,
         parcela_total=l.parcela_total,
@@ -681,7 +725,7 @@ def _parse_data(s: str) -> datetime:
     raise ValueError(f"Data inválida: '{s}'. Use dd/mm/yyyy ou yyyy-mm-dd.")
 
 
-def _parse_valor(s: str) -> float:
+def _parse_valor(s: str) -> Decimal:
     """Trata separadores BR (1.234,56) e EN (1,234.56)."""
     s = s.replace(" ", "").replace("R$", "").strip()
     # Se contém vírgula como decimal (BR): 1.234,56
@@ -689,4 +733,4 @@ def _parse_valor(s: str) -> float:
         s = s.replace(".", "").replace(",", ".")
     else:
         s = s.replace(",", "")
-    return float(s)
+    return Decimal(s)

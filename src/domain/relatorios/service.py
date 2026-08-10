@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -41,6 +42,16 @@ _DRE_NATUREZA: dict[str, str] = {
     "despesa": "D",
 }
 
+_ZERO = Decimal("0.00")
+
+
+def _decimal(value: object) -> Decimal:
+    if value is None:
+        return _ZERO
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
 
 class RelatoriosService:
     def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
@@ -74,11 +85,11 @@ class RelatoriosService:
         rows = (await self._db.execute(q)).all()
 
         # Organiza por conta_id
-        totais: dict[UUID, dict[str, float]] = {}
+        totais: dict[UUID, dict[str, Decimal]] = {}
         for conta_id, dc, total in rows:
             if conta_id not in totais:
-                totais[conta_id] = {"D": 0.0, "C": 0.0}
-            totais[conta_id][dc] += float(total or 0)
+                totais[conta_id] = {"D": _ZERO, "C": _ZERO}
+            totais[conta_id][dc] += _decimal(total)
 
         if not totais:
             return DREResponse(
@@ -86,10 +97,10 @@ class RelatoriosService:
                 data_de=data_de,
                 data_ate=data_ate,
                 grupos=[],
-                total_receitas=0,
-                total_custos=0,
-                total_despesas=0,
-                resultado_liquido=0,
+                total_receitas=_ZERO,
+                total_custos=_ZERO,
+                total_despesas=_ZERO,
+                resultado_liquido=_ZERO,
             )
 
         # Busca metadados das contas
@@ -126,7 +137,7 @@ class RelatoriosService:
         grupos: list[DREGrupo] = []
         for tipo, linhas in grupos_map.items():
             linhas.sort(key=lambda l: l.codigo)
-            total = sum(l.saldo for l in linhas)
+            total = sum((l.saldo for l in linhas), _ZERO)
             grupos.append(
                 DREGrupo(
                     tipo=tipo,
@@ -137,9 +148,9 @@ class RelatoriosService:
             )
         grupos.sort(key=lambda g: _TIPO_ORDEM.get(g.tipo, 99))
 
-        total_receitas = next((g.total for g in grupos if g.tipo == "receita"), 0.0)
-        total_custos = next((g.total for g in grupos if g.tipo == "custo"), 0.0)
-        total_despesas = next((g.total for g in grupos if g.tipo == "despesa"), 0.0)
+        total_receitas = next((g.total for g in grupos if g.tipo == "receita"), _ZERO)
+        total_custos = next((g.total for g in grupos if g.tipo == "custo"), _ZERO)
+        total_despesas = next((g.total for g in grupos if g.tipo == "despesa"), _ZERO)
         resultado_liquido = total_receitas - total_custos - total_despesas
 
         return DREResponse(
@@ -147,10 +158,10 @@ class RelatoriosService:
             data_de=data_de,
             data_ate=data_ate,
             grupos=grupos,
-            total_receitas=round(total_receitas, 2),
-            total_custos=round(total_custos, 2),
-            total_despesas=round(total_despesas, 2),
-            resultado_liquido=round(resultado_liquido, 2),
+            total_receitas=total_receitas,
+            total_custos=total_custos,
+            total_despesas=total_despesas,
+            resultado_liquido=resultado_liquido,
         )
 
     # ─────────────────────────────────────────────── Balancete
@@ -178,11 +189,11 @@ class RelatoriosService:
 
         rows = (await self._db.execute(q)).all()
 
-        totais: dict[UUID, dict[str, float]] = {}
+        totais: dict[UUID, dict[str, Decimal]] = {}
         for conta_id, dc, total in rows:
             if conta_id not in totais:
-                totais[conta_id] = {"D": 0.0, "C": 0.0}
-            totais[conta_id][dc] += float(total or 0)
+                totais[conta_id] = {"D": _ZERO, "C": _ZERO}
+            totais[conta_id][dc] += _decimal(total)
 
         # Inclui contas ativas mesmo sem movimento e contas removidas que ainda
         # tenham histórico (dados legados anteriores ao bloqueio de remoção).
@@ -193,18 +204,18 @@ class RelatoriosService:
         contas = (await self._db.execute(contas_q)).scalars().all()
 
         linhas: list[BalanceteLinha] = []
-        total_debitos = 0.0
-        total_creditos = 0.0
-        total_saldo_devedor = 0.0
-        total_saldo_credor = 0.0
+        total_debitos = _ZERO
+        total_creditos = _ZERO
+        total_saldo_devedor = _ZERO
+        total_saldo_credor = _ZERO
 
         for conta in sorted(contas, key=lambda c: c.codigo):
-            dc_map = totais.get(conta.id, {"D": 0.0, "C": 0.0})
+            dc_map = totais.get(conta.id, {"D": _ZERO, "C": _ZERO})
             d = dc_map["D"]
             c = dc_map["C"]
             diff = d - c
-            saldo_devedor = diff if diff > 0 else 0.0
-            saldo_credor = (-diff) if diff < 0 else 0.0
+            saldo_devedor = diff if diff > 0 else _ZERO
+            saldo_credor = (-diff) if diff < 0 else _ZERO
 
             total_debitos += d
             total_creditos += c
@@ -218,10 +229,10 @@ class RelatoriosService:
                     descricao=conta.descricao,
                     tipo=conta.tipo,
                     nivel=conta.nivel,
-                    debitos=round(d, 2),
-                    creditos=round(c, 2),
-                    saldo_devedor=round(saldo_devedor, 2),
-                    saldo_credor=round(saldo_credor, 2),
+                    debitos=d,
+                    creditos=c,
+                    saldo_devedor=saldo_devedor,
+                    saldo_credor=saldo_credor,
                 )
             )
 
@@ -230,10 +241,10 @@ class RelatoriosService:
             data_de=data_de,
             data_ate=data_ate,
             linhas=linhas,
-            total_debitos=round(total_debitos, 2),
-            total_creditos=round(total_creditos, 2),
-            total_saldo_devedor=round(total_saldo_devedor, 2),
-            total_saldo_credor=round(total_saldo_credor, 2),
+            total_debitos=total_debitos,
+            total_creditos=total_creditos,
+            total_saldo_devedor=total_saldo_devedor,
+            total_saldo_credor=total_saldo_credor,
         )
 
     # ─────────────────────────────────────────────── Livro Caixa
@@ -260,7 +271,9 @@ class RelatoriosService:
             )
 
         agencia_ids = [agencia.id for agencia in agencias]
-        saldos_iniciais: dict[UUID, float] = {agencia_id: 0.0 for agencia_id in agencia_ids}
+        saldos_iniciais: dict[UUID, Decimal] = {
+            agencia_id: _ZERO for agencia_id in agencia_ids
+        }
         if data_de:
             sq = (
                 select(
@@ -277,7 +290,7 @@ class RelatoriosService:
                 .group_by(Transacao.agencia_id, Transacao.dc)
             )
             for agencia_id, dc, total in (await self._db.execute(sq)).all():
-                valor = float(total or 0)
+                valor = _decimal(total)
                 saldos_iniciais[agencia_id] += valor if dc == "C" else -valor
 
         tq = select(Transacao).where(
@@ -304,11 +317,11 @@ class RelatoriosService:
 
             lancamentos: list[LivroCaixaLancamento] = []
             saldo_acc = saldo_inicial
-            total_debitos = 0.0
-            total_creditos = 0.0
+            total_debitos = _ZERO
+            total_creditos = _ZERO
 
             for t in transacoes:
-                valor = float(t.valor)
+                valor = _decimal(t.valor)
                 if t.dc == "C":
                     saldo_acc += valor
                     total_creditos += valor
@@ -320,8 +333,8 @@ class RelatoriosService:
                         data=t.data,
                         historico=t.historico,
                         dc=t.dc,
-                        valor=round(valor, 2),
-                        saldo_acumulado=round(saldo_acc, 2),
+                        valor=valor,
+                        saldo_acumulado=saldo_acc,
                     )
                 )
 
@@ -329,11 +342,11 @@ class RelatoriosService:
                 LivroCaixaAgencia(
                     agencia_id=str(agencia.id),
                     descricao=agencia.descricao,
-                    saldo_inicial=round(saldo_inicial, 2),
+                    saldo_inicial=saldo_inicial,
                     lancamentos=lancamentos,
-                    saldo_final=round(saldo_acc, 2),
-                    total_debitos=round(total_debitos, 2),
-                    total_creditos=round(total_creditos, 2),
+                    saldo_final=saldo_acc,
+                    total_debitos=total_debitos,
+                    total_creditos=total_creditos,
                 )
             )
 

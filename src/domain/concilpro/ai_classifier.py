@@ -9,6 +9,7 @@ Responsabilidades:
 import json
 import logging
 import os
+from decimal import Decimal
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -267,7 +268,7 @@ def parsear_bloco_fornecedor_ia(bloco_texto: str) -> Optional[dict]:
             timeout=90,  # 90s máximo por bloco
         )
 
-        data = json.loads(response.choices[0].message.content)
+        data = json.loads(response.choices[0].message.content, parse_float=Decimal)
 
         if not isinstance(data.get("lancamentos"), list):
             logger.warning("⚠️ IA retornou JSON sem lista 'lancamentos'.")
@@ -329,7 +330,7 @@ def _visao_batch(client, png_bytes_list: list, bloco_texto: str = "") -> dict:
             timeout=120,  # 120s máximo para Vision
         )
 
-        data = json.loads(response.choices[0].message.content)
+        data = json.loads(response.choices[0].message.content, parse_float=Decimal)
         if not isinstance(data.get("lancamentos"), list):
             raise VisionBatchError("Vision retornou um batch incompleto")
 
@@ -378,10 +379,10 @@ def parsear_bloco_fornecedor_ia_visao(png_bytes_list: list, bloco_texto: str = "
     print(f"   📦 {len(png_bytes_list)} páginas → {n_batches} batches Vision (gpt-4o)...")
 
     todos_lancamentos: list = []
-    saldo_anterior = 0.0
+    saldo_anterior = Decimal("0.00")
     saldo_anterior_tipo = ""
-    total_debito = 0.0
-    total_credito = 0.0
+    total_debito = Decimal("0.00")
+    total_credito = Decimal("0.00")
 
     for batch_idx in range(n_batches):
         start = batch_idx * BATCH_SIZE
@@ -397,7 +398,7 @@ def parsear_bloco_fornecedor_ia_visao(png_bytes_list: list, bloco_texto: str = "
             ) from exc
 
         if batch_idx == 0:
-            saldo_anterior = resultado.get("saldo_anterior") or 0.0
+            saldo_anterior = resultado.get("saldo_anterior") or Decimal("0.00")
             saldo_anterior_tipo = resultado.get("saldo_anterior_tipo") or ""
         todos_lancamentos.extend(resultado["lancamentos"])
         if resultado.get("total_debito"):
@@ -435,8 +436,8 @@ def classificar_lancamentos_incertos(lancamentos: list) -> None:
 
     itens = []
     for i, lanc in enumerate(incertos):
-        debito = float(lanc.get("valor_debito", 0))
-        credito = float(lanc.get("valor_credito", 0))
+        debito = Decimal(str(lanc.get("valor_debito", 0)))
+        credito = Decimal(str(lanc.get("valor_credito", 0)))
         historico = (lanc.get("historico") or "").strip()
         itens.append(
             f'{i}. Histórico: "{historico}" | Débito: {debito:.2f} | Crédito: {credito:.2f}'
@@ -456,7 +457,7 @@ def classificar_lancamentos_incertos(lancamentos: list) -> None:
             temperature=0,
         )
 
-        data = json.loads(response.choices[0].message.content)
+        data = json.loads(response.choices[0].message.content, parse_float=Decimal)
         for item in data.get("resultados", []):
             idx = item.get("index")
             if idx is None or idx >= len(incertos):

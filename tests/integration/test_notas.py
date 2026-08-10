@@ -67,7 +67,7 @@ def _url(empresa_id, nota_id=None, extra="") -> str:
 _NOTA_PAYLOAD = {
     "tipo": "nfe",
     "numero": "000001",
-    "cnpj_emitente": "12345678000190",
+    "cnpj_emitente": "12345678000195",
     "valor": 800.00,
     "data_emissao": "2024-02-01T00:00:00Z",
 }

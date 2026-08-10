@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from src.api.v1.setup import SetupRequest
 from src.schemas.empresas import EmpresaCreate
+from src.schemas.notas import NotaFiscalCreate
 
 
 def test_cnpj_formatado_aceito():
@@ -55,6 +57,30 @@ def test_cnpj_de_digito_repetido_rejeita():
             cnpj="00.000.000/0000-00",
             regime_tributario="simples_nacional",
         )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda cnpj: NotaFiscalCreate(
+            tipo="nfe",
+            numero="1",
+            cnpj_emitente=cnpj,
+            valor="1.00",
+            data_emissao="2026-01-01T00:00:00Z",
+        ),
+        lambda cnpj: SetupRequest(
+            tenant_nome="Escritório",
+            tenant_cnpj=cnpj,
+            admin_nome="Admin",
+            admin_email="admin@example.com",
+            admin_senha="senha-segura",
+        ),
+    ],
+)
+def test_cnpj_com_dv_errado_rejeitado_tambem_em_notas_e_setup(factory):
+    with pytest.raises(ValidationError):
+        factory("12.345.678/0001-90")
 
 
 def test_regime_invalido_rejeita():

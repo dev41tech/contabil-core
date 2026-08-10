@@ -2,13 +2,29 @@
 
 from __future__ import annotations
 
+import csv
 import io
+from datetime import UTC, datetime
+from decimal import Decimal
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Empresa, PlanoConta, Tenant, Usuario
+from src.db.models import (
+    AgenciaBancaria,
+    Comprovante,
+    Empresa,
+    NotaFiscal,
+    PlanoConta,
+    Tenant,
+    Transacao,
+    Usuario,
+)
+from src.domain.exportacao.service import ExportacaoService
+from src.schemas.contabil import ExportJobCreate
 
 _OFX_MINI = """\
 OFXHEADER:100
@@ -205,6 +221,142 @@ async def _setup_extrato(client, empresa, csrf) -> str:
 
 def _linhas_csv(resposta) -> list[str]:
     return resposta.content.decode("utf-8-sig").strip().split("\n")
+
+
+@pytest.mark.asyncio
+async def test_conferencia_compara_somas_e_expoe_divergencia_com_direcao(
+    db, empresa, usuario
+):
+    agencia = AgenciaBancaria(
+        empresa_id=empresa.id,
+        banco_sigla="ITAU",
+        agencia="0001",
+        numero="12345",
+    )
+    db.add(agencia)
+    await db.flush()
+
+    debito = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=agencia.id,
+        data=datetime(2024, 8, 1, tzinfo=UTC),
+        valor=Decimal("10.00"),
+        historico="PAGAMENTO DIVERGENTE",
+        dc="D",
+        hash_dedup="conferencia-debito",
+    )
+    credito = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=agencia.id,
+        data=datetime(2024, 8, 2, tzinfo=UTC),
+        valor=Decimal("125.00"),
+        historico="RECEBIMENTO CONCILIADO",
+        dc="C",
+        hash_dedup="conferencia-credito",
+    )
+    db.add_all([debito, credito])
+    await db.flush()
+
+    db.add_all(
+        [
+            NotaFiscal(
+                empresa_id=empresa.id,
+                tipo="nfe",
+                numero="DIVERGENTE",
+                cnpj_emitente="11.111.111/0001-11",
+                valor=Decimal("100000.00"),
+                data_emissao=datetime(2024, 8, 1, tzinfo=UTC),
+                status="associada",
+                transacao_id=debito.id,
+                dedup_key="nota-conferencia-debito",
+            ),
+            Comprovante(
+                empresa_id=empresa.id,
+                agencia_id=agencia.id,
+                transacao_id=debito.id,
+                favorecido="FORNECEDOR",
+                valor_pago=Decimal("1.00"),
+            ),
+            NotaFiscal(
+                empresa_id=empresa.id,
+                tipo="nfse",
+                numero="PARTE-1",
+                cnpj_emitente=empresa.cnpj,
+                valor=Decimal("100.00"),
+                data_emissao=datetime(2024, 8, 2, tzinfo=UTC),
+                status="associada",
+                transacao_id=credito.id,
+                dedup_key="nota-conferencia-credito",
+            ),
+            Comprovante(
+                empresa_id=empresa.id,
+                agencia_id=agencia.id,
+                transacao_id=credito.id,
+                favorecido="CLIENTE",
+                valor_pago=Decimal("25.00"),
+            ),
+        ]
+    )
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    _, conteudo = await service._exportar_conferencia(ExportJobCreate(formato="csv"), "csv")
+    linhas = list(csv.DictReader(io.StringIO(conteudo.decode("utf-8-sig"))))
+    principais = {linha["historico_extrato"]: linha for linha in linhas if linha["historico_extrato"]}
+
+    divergente = principais["PAGAMENTO DIVERGENTE"]
+    assert divergente["status_conciliacao"] == "Divergente"
+    assert Decimal(divergente["total_documentos"]) == Decimal("100001.00")
+    assert Decimal(divergente["divergencia_residual"]) == Decimal("-99991.00")
+
+    conciliado = principais["RECEBIMENTO CONCILIADO"]
+    assert conciliado["status_conciliacao"] == "Conciliado"
+    assert Decimal(conciliado["total_documentos"]) == Decimal("125.00")
+    assert Decimal(conciliado["divergencia_residual"]) == Decimal("0.00")
+
+
+@pytest.mark.parametrize("gatilho", ["=", "+", "-", "@"])
+@pytest.mark.asyncio
+async def test_exportacao_neutraliza_formula_em_csv_e_xlsx(gatilho, db, empresa, usuario):
+    from openpyxl import load_workbook
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    historico = f"{gatilho}SOMA(A1:A2)"
+    linhas = [{"historico": historico}]
+
+    csv_bytes = service._dicts_to_csv(linhas, ["historico"])
+    csv_row = next(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig"))))
+    assert csv_row["historico"] == "'" + historico
+
+    xlsx_bytes = service._dicts_to_xlsx(linhas, ["historico"], "Teste")
+    workbook = load_workbook(io.BytesIO(xlsx_bytes), data_only=False)
+    assert workbook.active["A2"].value == "'" + historico
+
+    lancamento = SimpleNamespace(
+        id=uuid4(),
+        data_lancamento=datetime(2026, 8, 1, tzinfo=UTC),
+        historico=historico,
+        historico_extrato=historico,
+        dc="D",
+        valor=Decimal("10.00"),
+        tipo_regra="manual",
+        conta_id=uuid4(),
+        agencia_id=uuid4(),
+        transacao_id=uuid4(),
+    )
+    csv_lancamento = next(
+        csv.DictReader(
+            io.StringIO(service._lancamentos_csv([lancamento]).decode("utf-8-sig"))
+        )
+    )
+    assert csv_lancamento["historico"] == "'" + historico
+    assert csv_lancamento["historico_extrato"] == "'" + historico
+
+    workbook = load_workbook(
+        io.BytesIO(service._lancamentos_xlsx([lancamento])), data_only=False
+    )
+    assert workbook.active["C2"].value == "'" + historico
+    assert workbook.active["D2"].value == "'" + historico
 
 
 @pytest.mark.asyncio

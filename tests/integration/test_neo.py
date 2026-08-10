@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -11,6 +12,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from src.db.models import (
+    AuditLog,
     AgenciaBancaria,
     Comprovante,
     Empresa,
@@ -265,8 +267,8 @@ async def test_neo_cria_duas_partidas_balanceadas(client, db, tenant, usuario, e
     assert len(partidas) == 2
     assert {p.dc for p in partidas} == {"D", "C"}
     assert len({p.lancamento_id for p in partidas}) == 1
-    assert sum(float(p.valor) for p in partidas if p.dc == "D") == sum(
-        float(p.valor) for p in partidas if p.dc == "C"
+    assert sum((p.valor for p in partidas if p.dc == "D"), Decimal("0")) == sum(
+        (p.valor for p in partidas if p.dc == "C"), Decimal("0")
     )
     agencia = await db.get(AgenciaBancaria, transacao.agencia_id)
     assert agencia.conta_contabil_id in {p.conta_id for p in partidas}
@@ -409,6 +411,16 @@ async def test_associacao_manual_valida_empresa_e_nao_recontabiliza(
         )
     ).scalars().all()
     assert len(partidas) == 2
+    audit = (
+        await db.execute(
+            select(AuditLog).where(
+                AuditLog.acao == "neo.associacao_manual",
+                AuditLog.entidade_id == decisao["id"],
+            )
+        )
+    ).scalar_one()
+    assert audit.usuario_id == usuario.id
+    assert audit.empresa_id == empresa.id
 
 
 @pytest.mark.asyncio
