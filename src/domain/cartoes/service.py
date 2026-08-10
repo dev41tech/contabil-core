@@ -33,6 +33,7 @@ from src.db.models import (
     Transacao,
 )
 from src.domain.auditoria import registrar_auditoria
+from src.domain.cartoes.pdf_parser import LancamentoPDF
 from src.schemas.cartoes import (
     AssociarTransacaoFaturaRequest,
     CartaoCreate,
@@ -514,6 +515,82 @@ class CartaoService:
 
         logger.info(
             "fatura.csv_importado",
+            fatura_id=str(fatura_id),
+            importados=importados,
+            duplicados=duplicados,
+            erros=len(erros),
+        )
+        return ImportCSVResponse(
+            importados=importados, duplicados=duplicados, erros=erros
+        )
+
+    async def importar_lancamentos_pdf(
+        self, cartao_id: UUID, fatura_id: UUID, lancamentos: list[LancamentoPDF]
+    ) -> ImportCSVResponse:
+        """Persiste lançamentos já extraídos de uma fatura em PDF.
+
+        O parsing do PDF acontece na camada de API (assim como no extrato
+        bancário) para manter esta camada livre de I/O bloqueante; aqui só
+        cuidamos de status/dedup/persistência, reaproveitando a mesma
+        identificação de duplicata usada por `importar_csv`.
+        """
+        fatura, _ = await self._get_fatura_or_404(
+            cartao_id, fatura_id, for_update=True
+        )
+        if fatura.status == "paga":
+            raise ValidationError(message="Não é possível importar lançamentos em fatura paga.")
+
+        importados = 0
+        duplicados = 0
+        erros: list[str] = []
+        ids_existentes = set(
+            (
+                await self._db.execute(
+                    select(LancamentoCartao.id).where(
+                        LancamentoCartao.fatura_id == fatura_id,
+                        LancamentoCartao.deleted_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+        ids_no_arquivo: set[UUID] = set()
+
+        for idx, item in enumerate(lancamentos, start=1):
+            try:
+                if item.valor <= 0:
+                    erros.append(f"Lançamento {idx}: valor deve ser positivo ({item.valor}).")
+                    continue
+
+                identificador = _identificador_compra(
+                    {}, item.data_compra, item.descricao, item.valor
+                )
+                lancamento_id = uuid.uuid5(fatura_id, identificador)
+                if lancamento_id in ids_existentes or lancamento_id in ids_no_arquivo:
+                    duplicados += 1
+                    continue
+                ids_no_arquivo.add(lancamento_id)
+
+                lanc = LancamentoCartao(
+                    id=lancamento_id,
+                    empresa_id=self._empresa_id,
+                    fatura_id=fatura_id,
+                    data_compra=item.data_compra,
+                    descricao=item.descricao,
+                    valor=item.valor,
+                    parcela_atual=item.parcela_atual,
+                    parcela_total=item.parcela_total,
+                )
+                self._db.add(lanc)
+                importados += 1
+
+            except Exception as exc:
+                erros.append(f"Lançamento {idx}: {exc}")
+
+        if importados > 0:
+            await self._db.flush()
+
+        logger.info(
+            "fatura.pdf_importado",
             fatura_id=str(fatura_id),
             importados=importados,
             duplicados=duplicados,
