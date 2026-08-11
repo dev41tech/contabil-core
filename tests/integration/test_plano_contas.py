@@ -582,6 +582,32 @@ async def test_excluir_lote_todas_remove_hierarquia_completa(
 
 
 @pytest.mark.asyncio
+async def test_criar_conta_com_codigo_de_conta_excluida_nao_colide(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """"Excluir Todas" é soft delete — o código não pode ficar soterrado.
+
+    Constraint original era global (empresa_id, codigo), sem excluir
+    deleted_at; reimportar o mesmo plano depois de uma exclusão em massa
+    esbarrava em "duplicate key" pra cada código que já existiu.
+    """
+    csrf = await _login(client, tenant, usuario)
+    original = await _criar(client, empresa.id, csrf, "9", "Conta Original", "ativo")
+
+    r = await client.post(
+        _url(empresa.id, extra="/excluir-lote"),
+        json={"ids": [original["id"]]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert r.json()["removidas"] == 1
+
+    recriada = await _criar(client, empresa.id, csrf, "9", "Conta Recriada", "passivo")
+    assert recriada["id"] != original["id"]
+    assert recriada["codigo"] == "9"
+
+
+@pytest.mark.asyncio
 async def test_excluir_lote_bloqueada_por_movimentacao_nao_impede_as_demais(
     client: AsyncClient,
     db: AsyncSession,
