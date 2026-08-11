@@ -167,6 +167,47 @@ async def importar_plano_contas(
     return await svc.importar_lote(rows)
 
 
+# Normaliza nomes de coluna (aceita variantes).
+_ALIAS_COLUNA = {
+    "classificacao": "codigo", "classificação": "codigo",
+    "code": "codigo", "cod": "codigo",
+    "description": "descricao", "descrição": "descricao", "nome": "descricao",
+    "type": "tipo",
+    "sa": "tipo_sa", "s/a": "tipo_sa",
+    "id": "conta_numero", "conta": "conta_numero",
+}
+
+# Relatórios reais de razão trazem linhas de empresa/CNPJ/página/emissão
+# antes do cabeçalho de verdade — sem isso, a primeira linha (quase sempre
+# vazia ou metadado) vira "cabeçalho" e toda linha de dado cai como
+# "completamente vazia" silenciosamente. Ver relato de 08/2026: usuário
+# precisou apagar as primeiras linhas manualmente pra importar.
+_MAX_LINHAS_BUSCA_CABECALHO = 30
+
+
+def _normaliza_linha_cabecalho(linha) -> list[str]:
+    """Normaliza os rótulos de uma linha de cabeçalho candidata.
+
+    "código" (acentuado) é ambíguo: em planilhas tipo MrContador que também
+    têm "Classificação" separada, "Código" é o ID numérico de origem — vira
+    conta_numero. Sem "Classificação" na mesma linha, "Código" é a própria
+    hierarquia — vira codigo, igual à variante sem acento.
+    """
+    raw = [str(c).strip().lower() if c else "" for c in linha]
+    tem_classificacao = any(v in ("classificacao", "classificação") for v in raw)
+    header = []
+    for v in raw:
+        if v == "código":
+            header.append("conta_numero" if tem_classificacao else "codigo")
+        else:
+            header.append(_ALIAS_COLUNA.get(v, v))
+    return header
+
+
+def _parece_cabecalho(header_normalizado: list[str]) -> bool:
+    return "codigo" in header_normalizado and "descricao" in header_normalizado
+
+
 def _parse_planilha(conteudo: bytes, nome: str) -> list[dict]:
     """Parseia XLSX ou CSV e retorna lista de dicts com {linha, codigo, descricao, tipo, tipo_sa}."""
     if nome.endswith(".xlsx") or nome.endswith(".xls"):
@@ -177,6 +218,7 @@ def _parse_planilha(conteudo: bytes, nome: str) -> list[dict]:
 
 def _parse_xlsx(conteudo: bytes) -> list[dict]:
     from io import BytesIO
+    from itertools import chain, islice
 
     from src.core.errors import ValidationError as AppValidationError
 
@@ -186,15 +228,32 @@ def _parse_xlsx(conteudo: bytes) -> list[dict]:
         wb = openpyxl.load_workbook(BytesIO(conteudo), read_only=True, data_only=True)
         ws = wb.active
         rows = ws.iter_rows(values_only=True)
-        primeira = next(rows, None)
     except Exception as e:
         raise AppValidationError(message=f"Erro ao ler XLSX: {e}")
 
-    if primeira is None:
-        wb.close()
-        raise AppValidationError(message="Planilha vazia.")
+    buffer = list(islice(rows, _MAX_LINHAS_BUSCA_CABECALHO))
+    header = None
+    start_line = 2
+    for i, linha in enumerate(buffer):
+        if not linha:
+            continue
+        candidato = _normaliza_linha_cabecalho(linha)
+        if _parece_cabecalho(candidato):
+            header = candidato
+            resto_buffer = buffer[i + 1:]
+            start_line = i + 2
+            break
 
-    header = [str(c).strip().lower() if c else "" for c in primeira]
+    if header is None:
+        wb.close()
+        raise AppValidationError(
+            message=(
+                f"Cabeçalho não encontrado nas primeiras {_MAX_LINHAS_BUSCA_CABECALHO} "
+                'linhas — a planilha precisa ter uma linha com as colunas '
+                '"Código"/"Classificação" e "Descrição".'
+            )
+        )
+
     if len(header) > _MAX_XLSX_COLUNAS:
         wb.close()
         raise AppValidationError(
@@ -203,8 +262,8 @@ def _parse_xlsx(conteudo: bytes) -> list[dict]:
     try:
         return _rows_to_dicts(
             header,
-            rows,
-            start_line=2,
+            chain(resto_buffer, rows),
+            start_line=start_line,
             max_rows=_MAX_XLSX_LINHAS,
             max_cells=_MAX_XLSX_CELULAS,
         )
@@ -251,7 +310,12 @@ def _parse_csv(conteudo: bytes) -> list[dict]:
     except UnicodeDecodeError:
         text = conteudo.decode("latin-1")
 
-    dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        # Linhas de metadados sem vírgula/ponto-e-vírgula suficiente antes do
+        # cabeçalho real confundem o sniffer — vírgula é a aposta mais segura.
+        dialect = csv.excel
     reader = csv.reader(StringIO(text), dialect)
     rows = list(reader)
 
@@ -259,28 +323,40 @@ def _parse_csv(conteudo: bytes) -> list[dict]:
         from src.core.errors import ValidationError as AppValidationError
         raise AppValidationError(message="CSV vazio.")
 
-    header = [c.strip().lower() for c in rows[0]]
-    data_rows = [[c for c in row] for row in rows[1:]]
-    return _rows_to_dicts(header, data_rows, start_line=2)
+    header = None
+    start_line = 2
+    for i, linha in enumerate(rows[:_MAX_LINHAS_BUSCA_CABECALHO]):
+        if not any(c.strip() for c in linha):
+            continue
+        candidato = _normaliza_linha_cabecalho(linha)
+        if _parece_cabecalho(candidato):
+            header = candidato
+            data_rows = rows[i + 1:]
+            start_line = i + 2
+            break
+
+    if header is None:
+        from src.core.errors import ValidationError as AppValidationError
+        raise AppValidationError(
+            message=(
+                f"Cabeçalho não encontrado nas primeiras {_MAX_LINHAS_BUSCA_CABECALHO} "
+                'linhas — o CSV precisa ter uma linha com as colunas '
+                '"Código"/"Classificação" e "Descrição".'
+            )
+        )
+
+    return _rows_to_dicts(header, data_rows, start_line=start_line)
 
 
 def _rows_to_dicts(
-    header: list[str],
+    normalized: list[str],
     data_rows,
     start_line: int,
     max_rows: int | None = None,
     max_cells: int | None = None,
 ) -> list[dict]:
-    # Normaliza nomes de coluna (aceita variantes)
-    _alias = {
-        "classificacao": "codigo", "classificação": "codigo",
-        "code": "codigo", "cod": "codigo",
-        "description": "descricao", "descrição": "descricao", "nome": "descricao",
-        "type": "tipo",
-        "sa": "tipo_sa", "s/a": "tipo_sa",
-    }
-    normalized = [_alias.get(h, h) for h in header]
-
+    """`normalized` já passou por `_normaliza_linha_cabecalho` — não renormaliza aqui."""
+    header = normalized
     result = []
     for i, row in enumerate(data_rows, start=start_line):
         if max_rows is not None and i - start_line >= max_rows:

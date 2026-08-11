@@ -214,6 +214,92 @@ async def test_importacao_infere_hierarquia_mesmo_com_filho_antes_do_pai(
 
 
 @pytest.mark.asyncio
+async def test_importacao_xlsx_ignora_linhas_de_metadados_antes_do_cabecalho(
+    client, tenant, usuario, empresa
+):
+    """Relatórios reais de razão (ex: MrContador) trazem empresa/CNPJ/página
+    antes da linha de cabeçalho de verdade — antes disso a primeira linha
+    virava "cabeçalho" e tudo caía como linha vazia, silenciosamente."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([None])
+    ws.append([None, "Empresa: 455 - SINDICATO TESTE", None, None, None, "Página:", "1/1"])
+    ws.append([None, "CNPJ: 76.682.236/0001-17"])
+    ws.append([None])
+    ws.append([None, "PLANO DE CONTAS"])
+    ws.append([None])
+    ws.append([None, "Classificação", "Código", "T", "Descrição", "CNPJ", "Grau", "Tipo"])
+    ws.append([None, "1", 1575, "S", "ATIVO", None, 1, "Ativo"])
+    ws.append([None, "1.1", 1579, "A", "ATIVO CIRCULANTE", None, 2, "Ativo"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.xlsx", buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    assert body["importadas"] == 2
+    assert body["erros"] == []
+
+    lista = await client.get(_url(empresa.id))
+    items = {c["codigo"]: c for c in lista.json()["items"]}
+    assert items["1"]["descricao"] == "ATIVO"
+    assert items["1"]["conta_numero"] == 1575
+    assert items["1.1"]["conta_numero"] == 1579
+
+
+@pytest.mark.asyncio
+async def test_importacao_xlsx_sem_cabecalho_reconhecivel_da_erro_claro(
+    client, tenant, usuario, empresa
+):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["não", "é", "um", "cabeçalho", "válido"])
+    ws.append(["1", "algo", "ativo"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.xlsx", buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+    assert "cabeçalho não encontrado" in r.json()["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_importacao_csv_ignora_linhas_de_metadados_antes_do_cabecalho(
+    client, tenant, usuario, empresa
+):
+    csv = (
+        "Empresa: 455 - SINDICATO TESTE\n"
+        "\n"
+        "codigo,descricao,tipo\n"
+        "1,Ativo,ativo\n"
+    )
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    assert r.json()["importadas"] == 1
+
+
+@pytest.mark.asyncio
 async def test_importacao_sem_coluna_tipo_rejeita_em_vez_de_assumir_despesa(
     client, tenant, usuario, empresa
 ):
