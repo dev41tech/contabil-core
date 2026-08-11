@@ -876,3 +876,103 @@ async def exportar_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename=conciliacao_{tipo}.xlsx"},
     )
+
+
+# Layout padrão de importação de lançamentos contábeis (débito e crédito
+# pareados na mesma linha). Cabeçalhos e grafia espelham exatamente
+# `_COLUNAS_LANCAMENTOS_IMPORTACAO` em src/domain/exportacao/service.py — os
+# dois exports geram o mesmo layout de destino a partir de fontes de dados
+# diferentes (aqui, o Razão de Fornecedores do ConciliaPro). Mudar aqui sem
+# mudar lá quebra essa equivalência.
+_COLUNAS_LANCAMENTOS_IMPORTACAO = [
+    "Data", "Cód. Conta Debito", "Cód. Conta Credito", "Valor",
+    "Cód. Histórico", "Complemento Histórico", "Inicia Lote",
+    "Código Matriz/Filial", "Centro de Custo Débito", "Centro de Custo Crédito",
+]
+
+
+@router.get("/export/lancamentos/{arquivo_id}")
+async def exportar_lancamentos_importacao(
+    empresa_id: UUID,
+    arquivo_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exporta os lançamentos do Razão (um por linha original) no layout
+    padrão de importação contábil, débito/crédito pareados na mesma linha.
+
+    A conta do fornecedor (`Fornecedor.codigo_conta`) é sempre um dos lados
+    do lançamento; o lado é definido pelo próprio `valor_debito`/`valor_credito`
+    daquele `CpLancamento`, não pelo `tipo_operacao` — isso cobre COMPRA,
+    PAGAMENTO e DEVOLUCAO com a mesma regra, sem precisar de caso especial.
+    A contrapartida (`conta_partida`) só existe quando o Razão de origem
+    trazia essa coluna; quando ausente, sai em branco — não há cadastro de
+    conta bancária/caixa no ConciliaPro para preencher essa lacuna.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+
+    result = await db.execute(
+        select(ArquivoImportado).where(
+            ArquivoImportado.id == arquivo_id,
+            ArquivoImportado.empresa_id == empresa_id,
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+
+    stmt = (
+        select(LancamentoFornecedor, Fornecedor.codigo_conta)
+        .join(Fornecedor, LancamentoFornecedor.fornecedor_id == Fornecedor.id)
+        .where(
+            Fornecedor.empresa_id == empresa_id,
+            Fornecedor.arquivo_origem_id == arquivo_id,
+        )
+        .order_by(LancamentoFornecedor.data_lancamento, Fornecedor.nome_fornecedor)
+    )
+    linhas = (await db.execute(stmt)).all()
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Importação Lançamentos"
+
+    header_font = Font(color="FFFFFF", bold=True)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    for col, h in enumerate(_COLUNAS_LANCAMENTOS_IMPORTACAO, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+
+    for row, (lanc, codigo_conta_fornecedor) in enumerate(linhas, 2):
+        debito_fornecedor = lanc.valor_debito and lanc.valor_debito != 0
+        if debito_fornecedor:
+            conta_debito, conta_credito = codigo_conta_fornecedor, lanc.conta_partida
+            valor = lanc.valor_debito
+        else:
+            conta_credito, conta_debito = codigo_conta_fornecedor, lanc.conta_partida
+            valor = lanc.valor_credito
+
+        ws.cell(row=row, column=1, value=lanc.data_lancamento.strftime("%d/%m/%Y"))
+        ws.cell(row=row, column=2, value=_celula_texto_segura(conta_debito))
+        ws.cell(row=row, column=3, value=_celula_texto_segura(conta_credito))
+        ws.cell(row=row, column=4, value=valor or Decimal("0.00"))
+        ws.cell(row=row, column=5, value=None)
+        ws.cell(row=row, column=6, value=_celula_texto_segura(lanc.historico))
+        ws.cell(row=row, column=7, value=_celula_texto_segura(lanc.lote))
+        ws.cell(row=row, column=8, value=None)
+        ws.cell(row=row, column=9, value=None)
+        ws.cell(row=row, column=10, value=None)
+
+    for col in range(1, len(_COLUNAS_LANCAMENTOS_IMPORTACAO) + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=lancamentos_importacao_{arquivo_id}.xlsx"
+        },
+    )
