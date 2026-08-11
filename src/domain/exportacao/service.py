@@ -1,13 +1,15 @@
 """Serviço de Exportação para ERP.
 
 Gera arquivos CSV ou XLSX de:
-  - lancamentos          : registros contábeis (existente)
-  - extrato              : transações bancárias importadas, com os filtros da tela
-  - nfe_entrada          : NF-e onde empresa é destinatária
-  - nfe_saida            : NF-e onde empresa é emitente
-  - nfse_tomado          : NFS-e tomado (empresa é destinatária)
-  - nfse_prestado        : NFS-e prestado (empresa é emitente)
-  - conferencia          : conciliação cruzada transação × nota × comprovante
+  - lancamentos           : registros contábeis (existente)
+  - lancamentos_importacao: lançamentos no layout padrão de importação contábil
+                            (débito/crédito pareados na mesma linha)
+  - extrato               : transações bancárias importadas, com os filtros da tela
+  - nfe_entrada           : NF-e onde empresa é destinatária
+  - nfe_saida             : NF-e onde empresa é emitente
+  - nfse_tomado           : NFS-e tomado (empresa é destinatária)
+  - nfse_prestado         : NFS-e prestado (empresa é emitente)
+  - conferencia           : conciliação cruzada transação × nota × comprovante
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from src.db.models import (
     Empresa,
     ExportJob,
     NotaFiscal,
+    PlanoConta,
     RegistroContabil,
     Transacao,
 )
@@ -44,6 +47,16 @@ logger = structlog.get_logger(__name__)
 _COLUNAS_LANCAMENTOS = [
     "id", "data_lancamento", "historico", "historico_extrato",
     "dc", "valor", "tipo_regra", "conta_id", "agencia_id", "transacao_id",
+]
+
+# Layout padrão de importação de lançamentos contábeis (débito e crédito
+# pareados na mesma linha). Cabeçalhos e grafia acompanham exatamente o
+# modelo fornecido pelo escritório para import no sistema contábil — não
+# alterar sem confirmar que o sistema de destino aceita a mudança.
+_COLUNAS_LANCAMENTOS_IMPORTACAO = [
+    "Data", "Cód. Conta Debito", "Cód. Conta Credito", "Valor",
+    "Cód. Histórico", "Complemento Histórico", "Inicia Lote",
+    "Código Matriz/Filial", "Centro de Custo Débito", "Centro de Custo Crédito",
 ]
 
 _COLUNAS_NOTAS = [
@@ -64,8 +77,8 @@ _COLUNAS_EXTRATO = [
 ]
 
 _VALID_TIPOS = {
-    "lancamentos", "extrato", "nfe_entrada", "nfe_saida",
-    "nfse_tomado", "nfse_prestado", "conferencia",
+    "lancamentos", "lancamentos_importacao", "extrato", "nfe_entrada",
+    "nfe_saida", "nfse_tomado", "nfse_prestado", "conferencia",
 }
 
 # Os valores persistidos têm escala de centavos. Exigir igualdade exata evita
@@ -132,6 +145,9 @@ class ExportacaoService:
 
         if tipo == "lancamentos":
             rows, conteudo = await self._exportar_lancamentos(data, fmt)
+            total = len(rows)
+        elif tipo == "lancamentos_importacao":
+            rows, conteudo = await self._exportar_lancamentos_importacao(data, fmt)
             total = len(rows)
         elif tipo == "extrato":
             rows, conteudo = await self._exportar_extrato(data, fmt)
@@ -229,6 +245,81 @@ class ExportacaoService:
                 str(r.transacao_id) if r.transacao_id else "",
             ]])
         return self._save_workbook(wb)
+
+    # ── lançamentos contábeis (layout de importação) ─────────────────────────
+
+    async def _exportar_lancamentos_importacao(
+        self, data: ExportJobCreate, fmt: str
+    ) -> tuple[list, bytes]:
+        """Lançamentos no layout padrão de importação: débito e crédito pareados
+        na mesma linha, via `lancamento_id`.
+
+        Campos sem correspondente no modelo atual (Cód. Histórico, Inicia Lote,
+        Código Matriz/Filial, Centro de Custo) saem em branco — a planilha ainda
+        é válida para import, só sem esses dados preenchidos.
+        """
+        q = select(RegistroContabil).where(
+            RegistroContabil.empresa_id == self._empresa_id
+        )
+        if data.data_de:
+            q = q.where(RegistroContabil.data_lancamento >= data.data_de)
+        if data.data_ate:
+            q = q.where(RegistroContabil.data_lancamento <= data.data_ate)
+
+        registros = (
+            await self._db.execute(q.order_by(RegistroContabil.data_lancamento))
+        ).scalars().all()
+
+        # Resolve o código da conta em lote: a alternativa é uma query por linha.
+        contas: dict = {}
+        conta_ids = {r.conta_id for r in registros}
+        if conta_ids:
+            conta_rows = (
+                await self._db.execute(
+                    select(PlanoConta).where(PlanoConta.id.in_(conta_ids))
+                )
+            ).scalars().all()
+            contas = {c.id: c.codigo for c in conta_rows}
+
+        # Agrupa por lancamento_id preservando a ordem de chegada (por data).
+        grupos: dict = {}
+        for r in registros:
+            grupos.setdefault(r.lancamento_id, {})[r.dc] = r
+
+        linhas = []
+        for lancamento_id, pernas in grupos.items():
+            debito = pernas.get("D")
+            credito = pernas.get("C")
+            if debito is None or credito is None:
+                # Layout exige débito e crédito na mesma linha; um lançamento
+                # sem as duas pernas não tem como virar uma linha válida aqui.
+                logger.warning(
+                    "exportacao.lancamento_sem_par",
+                    empresa_id=str(self._empresa_id),
+                    lancamento_id=str(lancamento_id),
+                )
+                continue
+
+            linhas.append({
+                "Data": debito.data_lancamento.strftime("%d/%m/%Y"),
+                "Cód. Conta Debito": contas.get(debito.conta_id, ""),
+                "Cód. Conta Credito": contas.get(credito.conta_id, ""),
+                "Valor": _as_decimal(debito.valor),
+                "Cód. Histórico": "",
+                "Complemento Histórico": debito.historico,
+                "Inicia Lote": "",
+                "Código Matriz/Filial": "",
+                "Centro de Custo Débito": "",
+                "Centro de Custo Crédito": "",
+            })
+
+        if fmt == "csv":
+            conteudo = self._dicts_to_csv(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
+        else:
+            conteudo = self._dicts_to_xlsx(
+                linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO, "Importação Lançamentos"
+            )
+        return linhas, conteudo
 
     # ── extrato bancário ──────────────────────────────────────────────────────
 
