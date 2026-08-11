@@ -44,8 +44,8 @@ class ExportJobCreate(BaseModel):
     tipo: str = Field(
         default="lancamentos",
         description=(
-            "lancamentos | extrato | nfe_entrada | nfe_saida | "
-            "nfse_tomado | nfse_prestado | conferencia"
+            "lancamentos | lancamentos_importacao | extrato | nfe_entrada | "
+            "nfe_saida | nfse_tomado | nfse_prestado | conferencia"
         ),
     )
     data_de: datetime | None = None

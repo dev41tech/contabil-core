@@ -167,6 +167,93 @@ async def test_exportar_sem_registros_retorna_vazio(client, tenant, usuario, emp
     assert r.headers.get("X-Total-Registros") == "0"
 
 
+# ── Exportar lançamentos (layout de importação)
+
+
+@pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_pareia_debito_e_credito(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "csv", "tipo": "lancamentos_importacao"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert r.headers.get("X-Total-Registros") == "1"
+
+    linhas = list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+    assert len(linhas) == 1
+    linha = linhas[0]
+    assert linha["Data"] == "01/05/2024"
+    assert linha["Cód. Conta Credito"] == "4.1.1"
+    assert linha["Cód. Conta Debito"] not in ("", None)
+    assert Decimal(linha["Valor"]) == Decimal("1200.00")
+    assert linha["Complemento Histórico"]
+    # Campos sem correspondente no modelo hoje saem em branco.
+    assert linha["Cód. Histórico"] == ""
+    assert linha["Inicia Lote"] == ""
+    assert linha["Código Matriz/Filial"] == ""
+    assert linha["Centro de Custo Débito"] == ""
+    assert linha["Centro de Custo Crédito"] == ""
+
+
+@pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_em_xlsx(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "xlsx", "tipo": "lancamentos_importacao"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert "spreadsheetml" in r.headers["content-type"]
+    assert r.content[:2] == b"PK"
+
+
+@pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_ignora_lancamento_sem_par(
+    db, empresa, usuario
+):
+    conta = PlanoConta(empresa_id=empresa.id, codigo="4.1.1", descricao="Serviços", tipo="receita")
+    db.add(conta)
+    await db.flush()
+
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="ITAU", agencia="0001", numero="12345")
+    db.add(agencia)
+    await db.flush()
+
+    from src.db.models import RegistroContabil
+
+    db.add(
+        RegistroContabil(
+            empresa_id=empresa.id,
+            lancamento_id=uuid4(),
+            conta_id=conta.id,
+            agencia_id=agencia.id,
+            descricao="Órfão",
+            historico="ÓRFÃO SEM PAR",
+            historico_extrato="ÓRFÃO SEM PAR",
+            dc="D",
+            tipo_regra="manual",
+            valor=Decimal("50.00"),
+            data_lancamento=datetime(2024, 8, 1, tzinfo=UTC),
+        )
+    )
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    linhas, _ = await service._exportar_lancamentos_importacao(
+        ExportJobCreate(formato="csv"), "csv"
+    )
+    assert linhas == []
+
+
 # ── Exportar extrato bancário
 
 
