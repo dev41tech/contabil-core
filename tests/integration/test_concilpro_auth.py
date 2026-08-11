@@ -25,6 +25,7 @@ ROTAS_GET = [
     "/fornecedores/1/conciliacao-fifo",
     "/divergencias?arquivo_id=1",
     "/export/excel/1",
+    "/export/lancamentos/1",
 ]
 
 
