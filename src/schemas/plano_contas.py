@@ -22,6 +22,18 @@ TIPOS_VALIDOS = (
 # Código de conta: dígitos separados por ponto — ex: 1, 1.1, 1.1.02, 4.3.1.1
 _CODIGO_RE = re.compile(r"^\d+(\.\d+)*$")
 
+# Abreviações comuns em razões contábeis exportados de outros sistemas.
+# "PL" para patrimônio líquido é a mais frequente — sem isso, toda conta
+# de PL de um razão real vira erro de importação em massa.
+_ALIASES_TIPO = {
+    "pl": "patrimonio_liquido",
+}
+
+
+def _normaliza_tipo(v: str) -> str:
+    v = v.strip().lower()
+    return _ALIASES_TIPO.get(v, v)
+
 
 class PlanoContaCreate(BaseModel):
     conta_numero: int | None = Field(
@@ -66,7 +78,7 @@ class PlanoContaCreate(BaseModel):
     @field_validator("tipo")
     @classmethod
     def valida_tipo(cls, v: str) -> str:
-        v = v.strip().lower()
+        v = _normaliza_tipo(v)
         if v not in TIPOS_VALIDOS:
             raise ValueError(f"Tipo inválido. Opções: {TIPOS_VALIDOS}")
         return v
@@ -106,7 +118,7 @@ class PlanoContaUpdate(BaseModel):
     def valida_tipo(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        v = v.strip().lower()
+        v = _normaliza_tipo(v)
         if v not in TIPOS_VALIDOS:
             raise ValueError(f"Tipo inválido. Opções: {TIPOS_VALIDOS}")
         return v
