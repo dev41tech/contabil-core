@@ -61,6 +61,13 @@ def test_tipo_invalido_rejeita():
     assert "Tipo inválido" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("tipo", ["PL", "pl", " Pl "])
+def test_tipo_pl_resolve_para_patrimonio_liquido(tipo: str):
+    """"PL" é a abreviação usual de patrimônio líquido nos razões importados."""
+    c = PlanoContaCreate(codigo="1", descricao="Conta", tipo=tipo)
+    assert c.tipo == "patrimonio_liquido"
+
+
 # ── PlanoContaCreate — descricao
 
 
@@ -106,6 +113,11 @@ def test_update_apenas_descricao():
 def test_update_tipo_invalido_rejeita():
     with pytest.raises(ValidationError):
         PlanoContaUpdate(tipo="inexistente")
+
+
+def test_update_tipo_pl_resolve_para_patrimonio_liquido():
+    u = PlanoContaUpdate(tipo="PL")
+    assert u.tipo == "patrimonio_liquido"
 
 
 def test_update_descricao_stripped():
