@@ -190,7 +190,17 @@ class PlanoConta(Base, TimestampMixin):
     )
 
     __table_args__ = (
-        UniqueConstraint("empresa_id", "codigo", name="uq_plano_empresa_codigo"),
+        # Parcial (só linhas ativas): sem isso, "Excluir Todas" (soft delete)
+        # deixa o código soterrado — reimportar o mesmo plano de contas depois
+        # de limpar tudo esbarra na conta "excluída" que ainda ocupa o código.
+        Index(
+            "uq_plano_empresa_codigo_ativo",
+            "empresa_id",
+            "codigo",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
     )
 
     @property
