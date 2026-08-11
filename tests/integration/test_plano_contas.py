@@ -214,6 +214,31 @@ async def test_importacao_infere_hierarquia_mesmo_com_filho_antes_do_pai(
 
 
 @pytest.mark.asyncio
+async def test_importacao_sem_coluna_tipo_rejeita_em_vez_de_assumir_despesa(
+    client, tenant, usuario, empresa
+):
+    """Planilha real de razão frequentemente não tem coluna "Tipo" — antes
+    disso virava "despesa" pra toda conta, silenciosamente. Agora tem que
+    dar erro por linha, nunca adivinhar a natureza contábil."""
+    csrf = await _login(client, tenant, usuario)
+    csv = "codigo,descricao\n1,Ativo\n2,Passivo\n"
+
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["importadas"] == 0
+    assert len(body["erros"]) == 2
+    assert all("tipo ausente" in e["erro"].lower() for e in body["erros"])
+
+    lista = await client.get(_url(empresa.id))
+    assert lista.json()["items"] == []
+
+
+@pytest.mark.asyncio
 async def test_remover_conta_folha(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):

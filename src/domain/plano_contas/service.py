@@ -342,13 +342,27 @@ class PlanoContaService:
             if not descricao:
                 erros.append(ImportacaoLinhaErro(linha=linha, codigo=codigo, erro="Descrição ausente."))
                 continue
+            if not tipo:
+                # Nunca adivinhar o tipo contábil: um "despesa" default errado
+                # se propaga silenciosamente pros relatórios do cliente.
+                erros.append(
+                    ImportacaoLinhaErro(
+                        linha=linha,
+                        codigo=codigo,
+                        erro=(
+                            "Tipo ausente. Inclua a coluna \"Tipo\" na planilha "
+                            "ou informe manualmente após importar."
+                        ),
+                    )
+                )
+                continue
 
             try:
                 data = PlanoContaCreate(
                     conta_numero=conta_numero,
                     codigo=codigo,
                     descricao=descricao,
-                    tipo=tipo or "despesa",
+                    tipo=tipo,
                     tipo_sa=tipo_sa,
                 )
             except Exception as e:
