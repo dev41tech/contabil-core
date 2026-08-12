@@ -14,7 +14,7 @@ from src.domain.cartoes.pdf_parser import (
 
 def test_parse_por_regex_extrai_compra_simples():
     linhas = ["05/03  POSTO IPIRANGA  150,00"]
-    lancamentos = _parse_por_regex(linhas, referencia_ano=2026)
+    lancamentos = _parse_por_regex(linhas, referencia=(2026, 12))
 
     assert len(lancamentos) == 1
     lanc = lancamentos[0]
@@ -28,7 +28,7 @@ def test_parse_por_regex_extrai_compra_simples():
 
 def test_parse_por_regex_extrai_parcela():
     linhas = ["07/03  UBER *TRIP  02/03  45,90"]
-    lancamentos = _parse_por_regex(linhas, referencia_ano=2026)
+    lancamentos = _parse_por_regex(linhas, referencia=(2026, 12))
 
     assert len(lancamentos) == 1
     lanc = lancamentos[0]
@@ -45,7 +45,7 @@ def test_parse_por_regex_ignora_linhas_de_total_e_cabecalho():
         "Total desta fatura  150,00",
         "Página 1 de 1",
     ]
-    lancamentos = _parse_por_regex(linhas, referencia_ano=2026)
+    lancamentos = _parse_por_regex(linhas, referencia=(2026, 12))
 
     assert len(lancamentos) == 1
     assert lancamentos[0].descricao == "POSTO IPIRANGA"
@@ -53,7 +53,7 @@ def test_parse_por_regex_ignora_linhas_de_total_e_cabecalho():
 
 def test_parse_por_regex_sem_linhas_reconheciveis_retorna_vazio():
     linhas = ["texto qualquer sem formato de lançamento", "outra linha"]
-    assert _parse_por_regex(linhas, referencia_ano=2026) == []
+    assert _parse_por_regex(linhas, referencia=(2026, 12)) == []
 
 
 def test_parse_valor_aceita_formato_brasileiro():
@@ -86,6 +86,45 @@ def test_validar_total_declarado_rejeita_quando_soma_diverge():
 
     with pytest.raises(PDFParseError, match="não bate"):
         _validar_total_declarado(linhas, lancamentos)
+
+
+def test_parse_por_regex_sicredi_mes_abreviado_hora_e_pagamento_negativo():
+    """Layout real do Sicredi: mês abreviado PT-BR ("16/dez", não "16/12"),
+    hora colada na data ("08:08"), valor com "R$" embutido, e uma linha de
+    "Pagamento" com valor negativo ("-R$ 39.249,28") que é a quitação da
+    fatura anterior, não uma compra — tem que ser ignorada, não virar uma
+    compra positiva de R$ 39 mil."""
+    linhas = [
+        "16/dez 08:08 Curitiba Presencial Portao R$ 317,93",
+        "15/dez 20:55 Pagamento 004691404 -R$ 39.249,28",
+        "25/nov 02:12 Presencial Jim Com Plakomaster 02/03 R$ 7.771,00",
+    ]
+    lancamentos = _parse_por_regex(linhas, referencia=(2026, 1))
+
+    assert len(lancamentos) == 2
+    assert lancamentos[0].descricao == "Curitiba Presencial Portao"
+    assert lancamentos[0].valor == Decimal("317.93")
+    assert lancamentos[0].data_compra.year == 2025  # virada de ano: dez < vencimento jan
+    assert lancamentos[0].data_compra.month == 12
+    assert lancamentos[0].data_compra.day == 16
+
+    assert lancamentos[1].descricao == "Presencial Jim Com Plakomaster"
+    assert lancamentos[1].valor == Decimal("7771.00")
+    assert lancamentos[1].parcela_atual == 2
+    assert lancamentos[1].parcela_total == 3
+
+
+def test_referencia_fatura_extrai_ano_e_mes_do_vencimento():
+    from src.domain.cartoes.pdf_parser import _referencia_fatura
+
+    linhas = ["Sind Do Com De Veic Vencimento 13/01/2026"]
+    assert _referencia_fatura(linhas) == (2026, 1)
+
+
+def test_referencia_fatura_none_quando_nao_encontra_vencimento():
+    from src.domain.cartoes.pdf_parser import _referencia_fatura
+
+    assert _referencia_fatura(["nenhum vencimento aqui"]) is None
 
 
 def test_validar_total_declarado_nao_bloqueia_quando_nao_ha_total_reconhecivel():

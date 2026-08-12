@@ -72,8 +72,39 @@ class _PDFBudget:
 
 # ──────────────────────────────────────────────────────────── helpers gerais
 
-def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
-    """Aceita DD/MM/AAAA, DD/MM/AA ou DD/MM (sem ano)."""
+_MESES_ABREV = {
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+
+
+def _mes_do_texto(mes_str: str) -> int | None:
+    """"12" ou "dez" (abreviação PT-BR, como o Sicredi usa: "16/dez")."""
+    if mes_str.isdigit():
+        mo = int(mes_str)
+        return mo if 1 <= mo <= 12 else None
+    return _MESES_ABREV.get(mes_str.lower())
+
+
+def _resolve_ano(mes_transacao: int, referencia: tuple[int, int] | None) -> int:
+    if referencia is None:
+        return datetime.now(UTC).year
+    ano_vencimento, mes_vencimento = referencia
+    # Fatura cruzando virada de ano: transação de mês posterior ao mês de
+    # vencimento (ex: transação em dezembro, vencimento em janeiro) é do
+    # ano anterior ao do vencimento.
+    if mes_transacao > mes_vencimento:
+        return ano_vencimento - 1
+    return ano_vencimento
+
+
+def _parse_data(s: str, referencia: tuple[int, int] | None = None) -> datetime | None:
+    """Aceita DD/MM/AAAA, DD/MM/AA, DD/MM ou DD/MMM (mês abreviado PT-BR, ex:
+    "16/dez" — layout Sicredi, sem ano nem separador numérico de mês).
+
+    `referencia` é (ano_vencimento, mes_vencimento) da fatura, usado só
+    quando o texto não traz o ano — ver `_resolve_ano`.
+    """
     s = s.strip()
     m = re.match(r"^(\d{2})/(\d{2})/(\d{2,4})$", s)
     if m:
@@ -84,15 +115,34 @@ def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
             return datetime(int(y), int(mo), int(d), tzinfo=UTC)
         except ValueError:
             return None
-    m2 = re.match(r"^(\d{2})/(\d{2})$", s)
+    m2 = re.match(r"^(\d{2})/([a-zç0-9]{2,3})$", s, re.IGNORECASE)
     if m2:
-        d, mo = m2.groups()
-        ano = referencia_ano or datetime.now(UTC).year
+        d, mes_str = m2.groups()
+        mo = _mes_do_texto(mes_str)
+        if mo is None:
+            return None
+        ano = _resolve_ano(mo, referencia)
         try:
-            return datetime(ano, int(mo), int(d), tzinfo=UTC)
+            return datetime(ano, mo, int(d), tzinfo=UTC)
         except ValueError:
             return None
     return None
+
+
+_VENCIMENTO_RE = re.compile(r"vencimento\s+(\d{2})/(\d{2})/(\d{4})", re.IGNORECASE)
+
+
+def _referencia_fatura(linhas: list[str]) -> tuple[int, int] | None:
+    """(ano, mês) de vencimento da fatura, se aparecer em alguma linha —
+    usado como âncora pra resolver o ano de transações sem ano explícito
+    quando a fatura cruza virada de ano (compras de nov/dez, vencimento em
+    jan). Sem isso, `_resolve_ano` cai no ano corrente na hora do import."""
+    texto = "\n".join(linhas)
+    m = _VENCIMENTO_RE.search(texto)
+    if not m:
+        return None
+    _dia, mes, ano = m.groups()
+    return int(ano), int(mes)
 
 
 def _parse_valor(s: str) -> Decimal | None:
@@ -112,12 +162,19 @@ def _parse_valor(s: str) -> Decimal | None:
 
 # ──────────────────────────────────────────────────────────── Camada 1: regex
 
-# Linha típica de fatura: "DD/MM[/AAAA]  DESCRICAO  [NN/NN]  VALOR"
+# Linha típica de fatura: "DD/MM[/AAAA]  [HH:MM]  DESCRICAO  [NN/NN]  VALOR"
+# Mês pode vir numérico (Itaú/Nubank etc: "05/03") ou abreviado PT-BR
+# (Sicredi: "16/dez"). Hora colada na data (Sicredi: "16/dez 08:08") é
+# descartada — não faz parte da descrição do lançamento. Valor aceita "R$"
+# e sinal antes OU depois do "R$" ("-R$ 39.249,28"); `_parse_valor` já
+# normaliza qualquer uma dessas formas.
 _LINHA_RE = re.compile(
-    r"^(?P<data>\d{2}/\d{2}(?:/\d{2,4})?)\s+"
+    r"^(?P<data>\d{2}/(?:\d{2}|[a-zç]{3})(?:/\d{2,4})?)\s+"
+    r"(?:\d{2}:\d{2}\s+)?"
     r"(?P<descricao>.+?)"
     r"(?:\s+(?P<parc_atual>\d{1,2})/(?P<parc_total>\d{1,2}))?"
-    r"\s+(?P<valor>-?\d{1,3}(?:\.\d{3})*,\d{2})\s*$"
+    r"\s+(?P<valor>-?\s*(?:R\$\s*)?-?\d{1,3}(?:\.\d{3})*,\d{2})\s*$",
+    re.IGNORECASE,
 )
 
 _SKIP_RE = re.compile(
@@ -145,7 +202,9 @@ def _extrair_linhas(conteudo_bytes: bytes, budget: _PDFBudget) -> tuple[list[str
     return all_lines, total_chars
 
 
-def _parse_por_regex(linhas: list[str], referencia_ano: int) -> list[LancamentoPDF]:
+def _parse_por_regex(
+    linhas: list[str], referencia: tuple[int, int] | None
+) -> list[LancamentoPDF]:
     lancamentos: list[LancamentoPDF] = []
     for raw in linhas:
         line = raw.strip()
@@ -154,11 +213,15 @@ def _parse_por_regex(linhas: list[str], referencia_ano: int) -> list[LancamentoP
         m = _LINHA_RE.match(line)
         if not m:
             continue
-        data = _parse_data(m.group("data"), referencia_ano)
+        data = _parse_data(m.group("data"), referencia)
         if data is None:
             continue
         valor = _parse_valor(m.group("valor"))
-        if valor is None or valor == 0:
+        # Valor negativo é pagamento/crédito da fatura anterior (ex: "-R$
+        # 39.249,28"), não uma compra — importar como positivo inflaria o
+        # total da fatura e duplicaria algo que já é rastreado por outro
+        # caminho (conciliação bancária), não como lançamento de cartão.
+        if valor is None or valor <= 0:
             continue
         descricao = m.group("descricao").strip()
         if not descricao:
@@ -169,7 +232,7 @@ def _parse_por_regex(linhas: list[str], referencia_ano: int) -> list[LancamentoP
             LancamentoPDF(
                 data_compra=data,
                 descricao=descricao[:200],
-                valor=abs(valor),
+                valor=valor,
                 parcela_atual=parc_atual,
                 parcela_total=parc_total,
             )
@@ -369,8 +432,8 @@ def parse_pdf(conteudo_bytes: bytes) -> list[LancamentoPDF]:
             "não são suportados para fatura de cartão; envie via CSV/Excel)."
         )
 
-    referencia_ano = datetime.now(UTC).year
-    lancamentos = _parse_por_regex(linhas, referencia_ano)
+    referencia = _referencia_fatura(linhas)
+    lancamentos = _parse_por_regex(linhas, referencia)
     if lancamentos:
         _validar_total_declarado(linhas, lancamentos)
         logger.info("PDF fatura: %d lançamentos via regex (camada 1)", len(lancamentos))

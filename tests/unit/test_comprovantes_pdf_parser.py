@@ -80,3 +80,28 @@ def test_sem_rotulos_reconheciveis_nao_encontra_valor_pago():
 def test_parse_valor_aceita_formato_brasileiro():
     assert _parse_valor("1.234,56") == Decimal("1234.56")
     assert _parse_valor("R$ 89,90") == Decimal("89.90")
+
+
+def test_extrai_comprovante_pix_sicredi():
+    """Layout real do Sicredi: "Valor:" sozinho (sem "pago"/"total"), "Nome do
+    destinatário" em vez de "Favorecido", "Realizado em" em vez de "Data de
+    pagamento". Nenhum desses rótulos batia antes — a extração inteira
+    falhava porque valor_pago é o único campo obrigatório."""
+    linhas = [
+        "Comprovante de Pagamento Pix",
+        "JANTAR 70ANO Cris Eventos",
+        "Valor: R$ 200,00",
+        "Realizado em: 13/05/2026 - 09:33:52",
+        "Solicitante: CEZAR AUGUSTUS GUARIENTE",
+        "Nome do destinatário: 58.021.701 CRISTIANE LOURENCO",
+        "CNPJ do destinatário: 58.021.701/0001-97",
+        "Nome do pagador: SIND DO COM DE VEIC",
+        "CNPJ do pagador: 76.682.236/0001-17",
+    ]
+    r = _parse_por_regex(linhas)
+
+    assert r.valor_pago == Decimal("200.00")
+    assert r.favorecido == "58.021.701 CRISTIANE LOURENCO"
+    assert r.cpf_cnpj == "58.021.701/0001-97"
+    assert r.data_pagamento.day == 13
+    assert r.data_pagamento.month == 5
