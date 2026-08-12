@@ -344,7 +344,10 @@ class PlanoContaService:
             conta_numero: int | None = None
             if conta_num_raw:
                 try:
-                    conta_numero = int(str(conta_num_raw).strip())
+                    # openpyxl às vezes entrega a célula numérica como float
+                    # ("1507.0"): int() direto rejeita o ponto e o número
+                    # cai silenciosamente pro fallback de auto-numeração.
+                    conta_numero = int(float(str(conta_num_raw).strip()))
                 except (ValueError, TypeError):
                     pass
 
