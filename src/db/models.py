@@ -209,6 +209,28 @@ class PlanoConta(Base, TimestampMixin):
         return len(self.codigo.split("."))
 
 
+class PlanoContaFaixaTipo(Base, TimestampMixin):
+    """Faixa de código → tipo contábil, configurada por empresa.
+
+    Usada como fallback na importação quando a planilha não tem coluna
+    "Tipo": se o código do lançamento cai dentro de uma faixa configurada,
+    o tipo é inferido dali. Configuração explícita do usuário, não
+    heurística do sistema — evita adivinhar a natureza contábil.
+    """
+
+    __tablename__ = "plano_contas_faixas_tipo"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
+    tipo: Mapped[str] = mapped_column(String(50), nullable=False)
+    codigo_de: Mapped[str] = mapped_column(String(30), nullable=False)
+    codigo_ate: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    __table_args__ = (
+        Index("ix_plano_contas_faixas_tipo_empresa", "empresa_id"),
+    )
+
+
 # ─────────────────────────────────────────────────────────────── Agência Bancária
 
 

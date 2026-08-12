@@ -324,6 +324,172 @@ async def test_importacao_sem_coluna_tipo_rejeita_em_vez_de_assumir_despesa(
     assert lista.json()["items"] == []
 
 
+# ── Faixas de classificação (código → tipo, configurada por empresa) ─────────
+
+
+@pytest.mark.asyncio
+async def test_salvar_e_listar_faixas_tipo(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    body = {
+        "faixas": [
+            {"tipo": "ativo", "codigo_de": "1", "codigo_ate": "1.999999999"},
+            {"tipo": "passivo", "codigo_de": "2", "codigo_ate": "2.2.999999999"},
+            {"tipo": "PL", "codigo_de": "2.3", "codigo_ate": "2.3.999999999"},
+        ]
+    }
+    r = await client.put(
+        _url(empresa.id, extra="/faixas-tipo"), json=body, headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 200, r.json()
+    assert len(r.json()["faixas"]) == 3
+    assert {f["tipo"] for f in r.json()["faixas"]} == {"ativo", "passivo", "patrimonio_liquido"}
+
+    listagem = await client.get(_url(empresa.id, extra="/faixas-tipo"))
+    assert len(listagem.json()["faixas"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_salvar_faixas_tipo_rejeita_sobreposicao_entre_tipos_diferentes(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    body = {
+        "faixas": [
+            {"tipo": "passivo", "codigo_de": "2", "codigo_ate": "2.999999999"},
+            {"tipo": "PL", "codigo_de": "2.3", "codigo_ate": "2.3.999999999"},
+        ]
+    }
+    r = await client.put(
+        _url(empresa.id, extra="/faixas-tipo"), json=body, headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 422
+    assert "sobrepõe" in r.json()["message"].lower()
+
+    # Nada deve ter sido persistido
+    listagem = await client.get(_url(empresa.id, extra="/faixas-tipo"))
+    assert listagem.json()["faixas"] == []
+
+
+@pytest.mark.asyncio
+async def test_salvar_faixas_tipo_permite_sobreposicao_no_mesmo_tipo(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    body = {
+        "faixas": [
+            {"tipo": "despesa", "codigo_de": "3.4", "codigo_ate": "3.4.999999999"},
+            {"tipo": "despesa", "codigo_de": "3.4.5", "codigo_ate": "3.5.1.07.004"},
+        ]
+    }
+    r = await client.put(
+        _url(empresa.id, extra="/faixas-tipo"), json=body, headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 200, r.json()
+    assert len(r.json()["faixas"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_salvar_faixas_tipo_substitui_conjunto_anterior(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await client.put(
+        _url(empresa.id, extra="/faixas-tipo"),
+        json={"faixas": [{"tipo": "ativo", "codigo_de": "1", "codigo_ate": "1.999999999"}]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    r = await client.put(
+        _url(empresa.id, extra="/faixas-tipo"),
+        json={"faixas": [{"tipo": "passivo", "codigo_de": "2", "codigo_ate": "2.999999999"}]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    listagem = await client.get(_url(empresa.id, extra="/faixas-tipo"))
+    faixas = listagem.json()["faixas"]
+    assert len(faixas) == 1
+    assert faixas[0]["tipo"] == "passivo"
+
+
+@pytest.mark.asyncio
+async def test_importacao_usa_faixa_configurada_quando_tipo_ausente(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await client.put(
+        _url(empresa.id, extra="/faixas-tipo"),
+        json={
+            "faixas": [
+                {"tipo": "ativo", "codigo_de": "1", "codigo_ate": "1.999999999"},
+                {"tipo": "passivo", "codigo_de": "2", "codigo_ate": "2.2.999999999"},
+                {"tipo": "PL", "codigo_de": "2.3", "codigo_ate": "2.3.999999999"},
+                {"tipo": "receita", "codigo_de": "3", "codigo_ate": "3.2.1.04.001"},
+                {"tipo": "custo", "codigo_de": "3.3", "codigo_ate": "3.3.7.01.0001"},
+                {"tipo": "despesa", "codigo_de": "3.4", "codigo_ate": "3.5.1.07.004"},
+                {"tipo": "resultado", "codigo_de": "4", "codigo_ate": "4.999999999"},
+            ]
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    # Códigos rasos (no máx. 1 nível) pra não misturar a validação de
+    # hierarquia (ancestral tem que existir no lote) com o que este teste
+    # quer provar: a classificação por faixa. O limite exato da faixa
+    # (3.5.1.07.004) já é coberto pelos testes unitários de codigo_para_tupla.
+    csv = (
+        "codigo,descricao\n"
+        "1,Ativo Circulante\n"
+        "2,Fornecedores\n"
+        "2.3,Capital Social\n"
+        "3,Receita de Vendas\n"
+        "3.3,CMV\n"
+        "3.4,Despesas Administrativas\n"
+        "4,Apuracao do Resultado\n"
+    )
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    assert body["erros"] == []
+    assert body["importadas"] == 7
+
+    lista = await client.get(_url(empresa.id))
+    tipos = {c["codigo"]: c["tipo"] for c in lista.json()["items"]}
+    assert tipos["1"] == "ativo"
+    assert tipos["2"] == "passivo"
+    assert tipos["2.3"] == "patrimonio_liquido"
+    assert tipos["3"] == "receita"
+    assert tipos["3.3"] == "custo"
+    assert tipos["3.4"] == "despesa"
+    assert tipos["4"] == "resultado"
+
+
+@pytest.mark.asyncio
+async def test_importacao_sem_tipo_fora_de_toda_faixa_ainda_erra(
+    client, tenant, usuario, empresa
+):
+    """Faixa configurada não cobre tudo — código fora dela tem que dar erro,
+    nunca virar uma classificação inventada."""
+    csrf = await _login(client, tenant, usuario)
+    await client.put(
+        _url(empresa.id, extra="/faixas-tipo"),
+        json={"faixas": [{"tipo": "ativo", "codigo_de": "1", "codigo_ate": "1.999999999"}]},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    csv = "codigo,descricao\n9.9,Fora de Qualquer Faixa\n"
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["importadas"] == 0
+    assert len(body["erros"]) == 1
+    assert "nenhuma faixa" in body["erros"][0]["erro"].lower()
+
+
 @pytest.mark.asyncio
 async def test_remover_conta_folha(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa

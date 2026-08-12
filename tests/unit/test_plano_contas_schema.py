@@ -7,7 +7,12 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
-from src.schemas.plano_contas import PlanoContaCreate, PlanoContaUpdate
+from src.schemas.plano_contas import (
+    FaixaTipoItem,
+    PlanoContaCreate,
+    PlanoContaUpdate,
+    codigo_para_tupla,
+)
 
 
 # ── PlanoContaCreate — código
@@ -170,3 +175,38 @@ def test_assert_nivel_abaixo_limite_ok():
     svc = PlanoContaService.__new__(PlanoContaService)
     codigo_abaixo = ".".join(["1"] * (_NIVEL_MAXIMO - 1))  # ex: "1.1.1.1"
     svc._assert_nivel_valido(codigo_abaixo)  # não deve lançar
+
+
+# ── codigo_para_tupla / FaixaTipoItem (faixas de classificação) ──────────────
+
+
+def test_codigo_para_tupla_compara_numericamente_nao_como_texto():
+    # "3.10" > "3.9" numericamente, mas seria o contrário como string
+    assert codigo_para_tupla("3.10") > codigo_para_tupla("3.9")
+    assert codigo_para_tupla("3.2.1.04.001") < codigo_para_tupla("3.3")
+
+
+def test_faixa_tipo_item_aceita_pl_como_alias():
+    f = FaixaTipoItem(tipo="PL", codigo_de="2.3", codigo_ate="2.3.999999")
+    assert f.tipo == "patrimonio_liquido"
+
+
+def test_faixa_tipo_item_tipo_invalido_rejeita():
+    with pytest.raises(ValidationError):
+        FaixaTipoItem(tipo="invalido", codigo_de="1", codigo_ate="1.999999")
+
+
+@pytest.mark.parametrize("codigo", ["", "1.", ".1", "1..2", "abc"])
+def test_faixa_tipo_item_codigo_invalido_rejeita(codigo):
+    with pytest.raises(ValidationError):
+        FaixaTipoItem(tipo="ativo", codigo_de=codigo, codigo_ate="1.999999")
+
+
+def test_faixa_tipo_item_de_maior_que_ate_rejeita():
+    with pytest.raises(ValidationError):
+        FaixaTipoItem(tipo="ativo", codigo_de="1.5", codigo_ate="1.2")
+
+
+def test_faixa_tipo_item_de_igual_ate_ok():
+    f = FaixaTipoItem(tipo="ativo", codigo_de="1", codigo_ate="1")
+    assert f.codigo_de == f.codigo_ate == "1"
