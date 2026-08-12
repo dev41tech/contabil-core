@@ -206,6 +206,39 @@ def _is_nfe(root: ET.Element) -> bool:
     return False
 
 
+# Eventos de NF-e (tpEvento) que aparecem em produção — nomes só pra mensagem
+# de erro, não influenciam a detecção em si.
+_NOMES_EVENTO_NFE = {
+    "110110": "Carta de Correção",
+    "110111": "Cancelamento",
+    "210200": "Confirmação da Operação",
+    "210210": "Ciência da Operação",
+    "210220": "Desconhecimento da Operação",
+    "210240": "Operação não Realizada",
+}
+
+
+def _is_evento_nfe(root: ET.Element) -> bool:
+    """Verifica se o XML é um EVENTO da NF-e (Carta de Correção, Cancelamento,
+    Manifestação do Destinatário etc.), não a nota fiscal em si.
+
+    Usa o mesmo namespace da NF-e (`_is_nfe` também retornaria True aqui),
+    então essa checagem precisa rodar antes — senão o evento cai em
+    `_parse_nfe` e falha com "infNFe não encontrado", sem dizer ao usuário
+    que o arquivo certo (o XML da nota, não do evento) precisa ser enviado.
+    """
+    root_tag = _strip_ns(root.tag)
+    if root_tag in ("procEventoNFe", "envEvento", "evento"):
+        return True
+    return _find_by_local_tag(root, "infEvento") is not None
+
+
+def _descricao_evento_nfe(root: ET.Element) -> str:
+    tp_evento = _find_by_local_tag(root, "tpEvento")
+    codigo = _safe_text(tp_evento) if tp_evento is not None else None
+    return _NOMES_EVENTO_NFE.get(codigo or "", "evento")
+
+
 def _is_nfse(root: ET.Element) -> bool:
     """Verifica se o XML é uma NFS-e ABRASF."""
     root_tag = _strip_ns(root.tag)
@@ -419,6 +452,13 @@ def parse_nota_xml(conteudo: bytes) -> NotaParseada:
         root = ET.fromstring(conteudo)
     except ET.ParseError as exc:
         raise ValueError(f"XML inválido: {exc}") from exc
+
+    if _is_evento_nfe(root):
+        nome_evento = _descricao_evento_nfe(root)
+        raise ValueError(
+            f"Este arquivo é um evento da NF-e ({nome_evento}), não a nota fiscal "
+            "em si. Envie o XML da própria NF-e (nfeProc/NFe) para importar."
+        )
 
     if _is_nfe(root):
         nota = _parse_nfe(root)

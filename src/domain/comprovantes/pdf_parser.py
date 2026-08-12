@@ -156,17 +156,21 @@ def _apos_rotulo(linha: str, rotulo_re: re.Pattern[str]) -> str | None:
 
 # ──────────────────────────────────────────────────────────── Camada 1: regex por rótulo
 
-_ROTULO_FAVORECIDO = re.compile(r"favorecido|benefici[aá]rio|recebedor|pago\s+a\b", re.IGNORECASE)
+_ROTULO_FAVORECIDO = re.compile(
+    r"favorecido|benefici[aá]rio|recebedor|pago\s+a\b|nome\s+d[oe]\s+destinat[aá]rio",
+    re.IGNORECASE,
+)
 _ROTULO_DOCUMENTO = re.compile(r"cpf\s*/\s*cnpj|cnpj\s*/\s*cpf|\bcpf\b|\bcnpj\b", re.IGNORECASE)
 _ROTULO_VALOR_DOCUMENTO = re.compile(
     r"valor\s+(?:do\s+)?documento|valor\s+nominal|valor\s+de\s+face", re.IGNORECASE
 )
 _ROTULO_VALOR_PAGO = re.compile(
-    r"valor\s+(?:total\s+)?pago|valor\s+da\s+transa[cç][aã]o|valor\s+total\b", re.IGNORECASE
+    r"valor\s+(?:total\s+)?pago|valor\s+da\s+transa[cç][aã]o|valor\s+total\b|^valor\s*:",
+    re.IGNORECASE,
 )
 _ROTULO_DATA_PAGAMENTO = re.compile(
     r"data\s+(?:d[oe]\s+)?pagamento|pago\s+em|data\s+da\s+transa[cç][aã]o|"
-    r"data\s+d[oe]\s+cr[eé]dito|efetivad[oa]\s+em",
+    r"data\s+d[oe]\s+cr[eé]dito|efetivad[oa]\s+em|realizado\s+em",
     re.IGNORECASE,
 )
 _ROTULO_VENCIMENTO = re.compile(r"vencimento", re.IGNORECASE)
