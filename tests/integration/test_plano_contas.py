@@ -807,6 +807,35 @@ async def test_importacao_preserva_conta_numero_informado_no_arquivo(
     assert lista.json()["items"][0]["conta_numero"] == 900
 
 
+@pytest.mark.asyncio
+async def test_importacao_conta_numero_vindo_como_float_do_xlsx(
+    client, tenant, usuario, empresa
+):
+    """openpyxl às vezes entrega célula numérica como float ("1507.0", não
+    "1507") dependendo de como a planilha de origem formatou a coluna —
+    visto num export real do MrContador. int() direto rejeita o ponto e o
+    valor caía silenciosamente pro fallback de auto-numeração.
+
+    CSV (não xlsx) de propósito: todo valor em CSV já chega como texto
+    puro, então "1507.0" fica exatamente "1507.0" sem depender de como o
+    openpyxl serializa/normaliza float — o bug está no parse em
+    importar_lote, não na leitura do arquivo.
+    """
+    csrf = await _login(client, tenant, usuario)
+    csv = "codigo,descricao,tipo,conta_numero\n1,Ativo Circulante,ativo,1507.0\n"
+
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    assert r.json()["importadas"] == 1
+
+    lista = await client.get(_url(empresa.id))
+    assert lista.json()["items"][0]["conta_numero"] == 1507
+
+
 # ── Exclusão em lote
 
 
