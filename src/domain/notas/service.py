@@ -27,7 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.cnpj import formatar as formatar_cnpj, somente_digitos
 from src.core.errors import ConflictError, NotFoundError, ValidationError
 from src.db.models import Empresa, NotaFiscal, Transacao
-from src.domain.notas.xml_parser import parse_nota_xml
+from src.domain.notas import visual_parser
+from src.domain.notas.xml_parser import NotaParseada, parse_nota_xml
 from src.schemas.notas import (
     AssociarTransacaoRequest,
     NotaFiscalCreate,
@@ -152,6 +153,7 @@ class NotaService:
             chave_acesso=chave_acesso,
             dedup_key=dedup_key,
             observacao=data.observacao,
+            origem=data.origem,
         )
         try:
             async with self._db.begin_nested():
@@ -228,13 +230,43 @@ class NotaService:
 
     async def importar_xml(self, conteudo: bytes, nome_arquivo: str) -> ImportXmlResult:
         """Faz parse de um XML de NF-e ou NFS-e e persiste a nota."""
-        resultado = ImportXmlResult()
         try:
             nota_parseada = parse_nota_xml(conteudo)
         except ValueError as exc:
+            resultado = ImportXmlResult()
             resultado.erros.append(f"{nome_arquivo}: {exc}")
             return resultado
 
+        return await self._importar_parseada(nota_parseada, nome_arquivo, origem="xml_assinado")
+
+    async def importar_visual(
+        self, conteudo: bytes, nome_arquivo: str, extensao: str
+    ) -> ImportXmlResult:
+        """Faz parse de um PDF ou imagem (DANFe) via OCR/Vision e persiste a nota.
+
+        Diferente de `importar_xml`, não há assinatura digital pra verificar — a
+        nota fica marcada com `origem="ocr"` (ver `visual_parser`).
+        """
+        resultado = ImportXmlResult()
+        try:
+            if extensao == ".pdf":
+                nota_parseada = visual_parser.parse_pdf(conteudo)
+            else:
+                content_type = "image/jpeg" if extensao in (".jpg", ".jpeg") else "image/png"
+                nota_parseada = visual_parser.parse_imagem(conteudo, content_type)
+        except visual_parser.VisualParseError as exc:
+            resultado.erros.append(f"{nome_arquivo}: {exc}")
+            return resultado
+
+        return await self._importar_parseada(nota_parseada, nome_arquivo, origem="ocr")
+
+    async def _importar_parseada(
+        self, nota_parseada: NotaParseada, nome_arquivo: str, origem: str
+    ) -> ImportXmlResult:
+        """Valida o CNPJ da empresa contra a nota parseada e persiste — compartilhado
+        entre `importar_xml` e `importar_visual`, que só diferem em como chegam a
+        um `NotaParseada`."""
+        resultado = ImportXmlResult()
         empresa = (
             await self._db.execute(
                 select(Empresa).where(Empresa.id == self._empresa_id)
@@ -267,6 +299,7 @@ class NotaService:
                     data_emissao=nota_parseada.data_emissao,
                     chave_acesso=nota_parseada.chave_acesso,
                     observacao=nota_parseada.observacao,
+                    origem=origem,
                 )
             )
             resultado.importadas += 1

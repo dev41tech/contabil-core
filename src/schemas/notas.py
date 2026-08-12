@@ -22,6 +22,10 @@ class NotaFiscalCreate(BaseModel):
     data_emissao: datetime
     chave_acesso: str | None = Field(default=None, max_length=60)
     observacao: str | None = Field(default=None, max_length=500)
+    origem: str = Field(
+        default="xml_assinado",
+        description="xml_assinado (verificado por assinatura digital) ou ocr (extraído de PDF/imagem, sem verificação)",
+    )
 
     @field_validator("tipo")
     @classmethod
@@ -40,6 +44,14 @@ class NotaFiscalCreate(BaseModel):
         if len(digits) != 44:
             raise ValueError("Chave de acesso deve ter 44 dígitos.")
         return digits
+
+    @field_validator("origem")
+    @classmethod
+    def valida_origem(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in ("xml_assinado", "ocr"):
+            raise ValueError("origem deve ser 'xml_assinado' ou 'ocr'.")
+        return v
 
 
 class AssociarTransacaoRequest(BaseModel):
@@ -60,6 +72,7 @@ class NotaFiscalResponse(BaseModel):
     transacao_id: UUID | None
     chave_acesso: str | None
     observacao: str | None
+    origem: str
 
     model_config = {"from_attributes": True}
 
