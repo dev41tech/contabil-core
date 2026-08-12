@@ -199,3 +199,65 @@ class PlanoContaExclusaoBloqueada(BaseModel):
 class PlanoContaExclusaoLoteResultado(BaseModel):
     removidas: int
     bloqueadas: list[PlanoContaExclusaoBloqueada]
+
+
+# ── Faixas de código → tipo (configuração de classificação por empresa) ──────
+
+
+def codigo_para_tupla(codigo: str) -> tuple[int, ...]:
+    """Converte "3.2.1.04.001" em (3, 2, 1, 4, 1) pra comparar faixas
+    hierarquicamente (não como texto — "3.10" > "3.9" numericamente, mas
+    "3.10" < "3.9" como string)."""
+    return tuple(int(parte) for parte in codigo.split("."))
+
+
+class FaixaTipoItem(BaseModel):
+    tipo: str
+    codigo_de: str = Field(..., min_length=1, max_length=30)
+    codigo_ate: str = Field(..., min_length=1, max_length=30)
+
+    @field_validator("tipo")
+    @classmethod
+    def valida_tipo(cls, v: str) -> str:
+        v = _normaliza_tipo(v)
+        if v not in TIPOS_VALIDOS:
+            raise ValueError(f"Tipo inválido. Opções: {TIPOS_VALIDOS}")
+        return v
+
+    @field_validator("codigo_de", "codigo_ate", mode="before")
+    @classmethod
+    def normaliza_codigo(cls, v: str) -> str:
+        v = v.strip()
+        if not _CODIGO_RE.match(v):
+            raise ValueError(
+                "Código inválido. Use dígitos separados por ponto. Ex: 1, 1.1, 4.2.01"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def valida_ordem(self) -> "FaixaTipoItem":
+        if codigo_para_tupla(self.codigo_de) > codigo_para_tupla(self.codigo_ate):
+            raise ValueError(
+                f"Faixa inválida para '{self.tipo}': codigo_de ({self.codigo_de}) "
+                f"é maior que codigo_ate ({self.codigo_ate})."
+            )
+        return self
+
+
+class FaixasTipoConfig(BaseModel):
+    """Substitui a configuração inteira de faixas da empresa — não é PATCH
+    incremental, é o conjunto completo que a tela de configuração envia."""
+    faixas: list[FaixaTipoItem] = Field(default_factory=list)
+
+
+class FaixaTipoResponse(BaseModel):
+    id: UUID
+    tipo: str
+    codigo_de: str
+    codigo_ate: str
+
+    model_config = {"from_attributes": True}
+
+
+class FaixasTipoListResponse(BaseModel):
+    faixas: list[FaixaTipoResponse]

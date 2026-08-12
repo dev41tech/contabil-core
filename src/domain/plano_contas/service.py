@@ -13,6 +13,7 @@ Regras de negócio:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
@@ -21,9 +22,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.errors import ConflictError, NotFoundError, ValidationError
-from src.db.models import LancamentoCartao, PlanoConta, RegistroContabil, Regra
+from src.db.models import (
+    LancamentoCartao,
+    PlanoConta,
+    PlanoContaFaixaTipo,
+    RegistroContabil,
+    Regra,
+)
 from src.domain.auditoria import registrar_auditoria
 from src.schemas.plano_contas import (
+    FaixaTipoItem,
+    FaixaTipoResponse,
+    FaixasTipoListResponse,
     PlanoContaCreate,
     PlanoContaExclusaoBloqueada,
     PlanoContaExclusaoLoteResultado,
@@ -32,6 +42,7 @@ from src.schemas.plano_contas import (
     PlanoContaResponse,
     PlanoContaTreeResponse,
     PlanoContaUpdate,
+    codigo_para_tupla,
 )
 
 logger = structlog.get_logger(__name__)
@@ -320,6 +331,7 @@ class PlanoContaService:
         importadas = 0
         duplicadas = 0
         erros: list[ImportacaoLinhaErro] = []
+        faixas_classificacao = await self._faixas_para_classificacao()
 
         candidatos: dict[str, tuple[PlanoContaCreate, int]] = {}
         for row in rows:
@@ -343,19 +355,26 @@ class PlanoContaService:
                 erros.append(ImportacaoLinhaErro(linha=linha, codigo=codigo, erro="Descrição ausente."))
                 continue
             if not tipo:
-                # Nunca adivinhar o tipo contábil: um "despesa" default errado
-                # se propaga silenciosamente pros relatórios do cliente.
-                erros.append(
-                    ImportacaoLinhaErro(
-                        linha=linha,
-                        codigo=codigo,
-                        erro=(
-                            "Tipo ausente. Inclua a coluna \"Tipo\" na planilha "
-                            "ou informe manualmente após importar."
-                        ),
+                # Nunca adivinhar o tipo contábil sem uma regra explícita: um
+                # "despesa" default errado se propaga silenciosamente pros
+                # relatórios do cliente. Faixas configuradas pela própria
+                # empresa (não heurística do sistema) são a única exceção.
+                tipo_inferido = self._classificar_por_faixa(codigo, faixas_classificacao)
+                if tipo_inferido is None:
+                    erros.append(
+                        ImportacaoLinhaErro(
+                            linha=linha,
+                            codigo=codigo,
+                            erro=(
+                                "Tipo ausente e código não corresponde a nenhuma faixa "
+                                "de classificação configurada. Inclua a coluna \"Tipo\" "
+                                "na planilha, informe manualmente após importar, ou "
+                                "configure as faixas de classificação da empresa."
+                            ),
+                        )
                     )
-                )
-                continue
+                    continue
+                tipo = tipo_inferido
 
             try:
                 data = PlanoContaCreate(
@@ -489,6 +508,99 @@ class PlanoContaService:
             )
 
         return ImportacaoPlanoResult(importadas=importadas, duplicadas=duplicadas, erros=erros)
+
+    # ── Faixas de classificação (código → tipo, configurada por empresa) ──────
+
+    async def listar_faixas_tipo(self) -> FaixasTipoListResponse:
+        q = (
+            select(PlanoContaFaixaTipo)
+            .where(
+                PlanoContaFaixaTipo.empresa_id == self._empresa_id,
+                PlanoContaFaixaTipo.deleted_at == None,
+            )
+            .order_by(PlanoContaFaixaTipo.tipo, PlanoContaFaixaTipo.codigo_de)
+        )
+        faixas = (await self._db.execute(q)).scalars().all()
+        return FaixasTipoListResponse(
+            faixas=[FaixaTipoResponse.model_validate(f) for f in faixas]
+        )
+
+    async def salvar_faixas_tipo(self, faixas: list[FaixaTipoItem]) -> FaixasTipoListResponse:
+        """Substitui o conjunto inteiro de faixas da empresa — não é PATCH
+        incremental. Rejeita se alguma faixa de um tipo sobrepõe a de outro
+        tipo (ambiguidade real: mesmo código classificaria em dois lugares)."""
+        self._valida_faixas_sem_sobreposicao(faixas)
+
+        antigas_q = select(PlanoContaFaixaTipo).where(
+            PlanoContaFaixaTipo.empresa_id == self._empresa_id,
+            PlanoContaFaixaTipo.deleted_at == None,
+        )
+        antigas = (await self._db.execute(antigas_q)).scalars().all()
+        agora = datetime.now(UTC)
+        for antiga in antigas:
+            antiga.deleted_at = agora
+
+        novas = [
+            PlanoContaFaixaTipo(
+                empresa_id=self._empresa_id,
+                tipo=item.tipo,
+                codigo_de=item.codigo_de,
+                codigo_ate=item.codigo_ate,
+            )
+            for item in faixas
+        ]
+        self._db.add_all(novas)
+        await self._db.flush()
+
+        return FaixasTipoListResponse(
+            faixas=[FaixaTipoResponse.model_validate(f) for f in novas]
+        )
+
+    @staticmethod
+    def _valida_faixas_sem_sobreposicao(faixas: list[FaixaTipoItem]) -> None:
+        anotadas = [
+            (item, codigo_para_tupla(item.codigo_de), codigo_para_tupla(item.codigo_ate))
+            for item in faixas
+        ]
+        for i, (item_a, de_a, ate_a) in enumerate(anotadas):
+            for item_b, de_b, ate_b in anotadas[i + 1:]:
+                if item_a.tipo == item_b.tipo:
+                    continue  # sobreposição dentro do mesmo tipo é inofensiva
+                if de_a <= ate_b and de_b <= ate_a:
+                    raise ValidationError(
+                        message=(
+                            f'Faixa "{item_a.codigo_de} a {item_a.codigo_ate}" '
+                            f"({item_a.tipo}) sobrepõe a faixa "
+                            f'"{item_b.codigo_de} a {item_b.codigo_ate}" ({item_b.tipo}). '
+                            "Ajuste os limites antes de salvar."
+                        )
+                    )
+
+    async def _faixas_para_classificacao(
+        self,
+    ) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
+        q = select(PlanoContaFaixaTipo).where(
+            PlanoContaFaixaTipo.empresa_id == self._empresa_id,
+            PlanoContaFaixaTipo.deleted_at == None,
+        )
+        faixas = (await self._db.execute(q)).scalars().all()
+        return [
+            (f.tipo, codigo_para_tupla(f.codigo_de), codigo_para_tupla(f.codigo_ate))
+            for f in faixas
+        ]
+
+    @staticmethod
+    def _classificar_por_faixa(
+        codigo: str, faixas: list[tuple[str, tuple[int, ...], tuple[int, ...]]]
+    ) -> str | None:
+        try:
+            codigo_tupla = codigo_para_tupla(codigo)
+        except ValueError:
+            return None
+        for tipo, de, ate in faixas:
+            if de <= codigo_tupla <= ate:
+                return tipo
+        return None
 
     # ── Validações privadas ───────────────────────────────────────────────────
 

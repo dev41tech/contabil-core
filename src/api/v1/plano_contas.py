@@ -14,6 +14,8 @@ from src.api.uploads import ler_upload_limitado
 from src.db.session import get_db
 from src.domain.plano_contas.service import PlanoContaService
 from src.schemas.plano_contas import (
+    FaixasTipoConfig,
+    FaixasTipoListResponse,
     PlanoContaCreate,
     PlanoContaExclusaoLoteRequest,
     PlanoContaExclusaoLoteResultado,
@@ -63,6 +65,35 @@ async def arvore_contas(
 ) -> PlanoContaTreeResponse:
     """Retorna o plano de contas em estrutura de árvore hierárquica."""
     return await _svc(empresa_id, db).arvore()
+
+
+@router.get("/faixas-tipo", response_model=FaixasTipoListResponse)
+async def listar_faixas_tipo(
+    empresa_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> FaixasTipoListResponse:
+    """Lista as faixas de código → tipo configuradas para a empresa."""
+    return await _svc(empresa_id, db).listar_faixas_tipo()
+
+
+@router.put(
+    "/faixas-tipo",
+    response_model=FaixasTipoListResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def salvar_faixas_tipo(
+    empresa_id: UUID,
+    body: FaixasTipoConfig,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> FaixasTipoListResponse:
+    """Substitui o conjunto inteiro de faixas de classificação da empresa.
+
+    Usadas como fallback na importação quando a planilha não tem coluna
+    "Tipo": se o código cai numa faixa configurada, o tipo é inferido dali.
+    """
+    return await _svc(empresa_id, db).salvar_faixas_tipo(body.faixas)
 
 
 @router.get("/{conta_id}", response_model=PlanoContaResponse)
