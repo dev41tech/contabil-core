@@ -85,31 +85,44 @@ async def criar_comprovante(
 )
 async def extrair_dados_pdf(
     empresa_id: UUID,
-    arquivo: UploadFile = File(..., description="PDF do comprovante de pagamento"),
+    arquivo: UploadFile = File(..., description="PDF ou imagem (PNG/JPG) do comprovante de pagamento"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> ComprovanteExtracaoResponse:
-    """Extrai os campos de um comprovante em PDF para pré-preencher o formulário.
+    """Extrai os campos de um comprovante em PDF ou imagem para pré-preencher o formulário.
 
     Não persiste nada — envie os campos revisados via POST /comprovantes normal.
     """
     from src.core.config import get_settings
     from src.core.errors import ValidationError as AppValidationError
-    from src.domain.comprovantes.pdf_parser import PDFParseError, parse_pdf
+    from src.domain.comprovantes.pdf_parser import PDFParseError, parse_imagem, parse_pdf
 
     conteudo = await ler_upload_limitado(arquivo)
+    nome_lower = (arquivo.filename or "").lower()
+
+    if nome_lower.endswith(".pdf"):
+        parser, args, rotulo = parse_pdf, (conteudo,), "PDF"
+    elif nome_lower.endswith(".png"):
+        parser, args, rotulo = parse_imagem, (conteudo, "image/png"), "Imagem"
+    elif nome_lower.endswith(".jpg") or nome_lower.endswith(".jpeg"):
+        parser, args, rotulo = parse_imagem, (conteudo, "image/jpeg"), "Imagem"
+    else:
+        raise AppValidationError(
+            message="Formato não suportado. Envie um PDF, PNG ou JPG do comprovante."
+        )
+
     try:
         timeout = get_settings().pdf_parse_timeout_seconds + 5
         extraido = await asyncio.wait_for(
-            run_in_threadpool(parse_pdf, conteudo),
+            run_in_threadpool(parser, *args),
             timeout=timeout,
         )
     except TimeoutError:
         raise AppValidationError(
-            message="Processamento do PDF excedeu o tempo limite."
+            message="Processamento do arquivo excedeu o tempo limite."
         ) from None
     except PDFParseError as e:
-        raise AppValidationError(message=f"Arquivo PDF inválido: {e}") from e
+        raise AppValidationError(message=f"{rotulo} inválido: {e}") from e
 
     return ComprovanteExtracaoResponse(
         favorecido=extraido.favorecido,

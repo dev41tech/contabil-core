@@ -1,6 +1,6 @@
-"""Parser de comprovantes de pagamento (PIX, TED, DOC, boleto) em PDF.
+"""Parser de comprovantes de pagamento (PIX, TED, DOC, boleto) em PDF ou imagem.
 
-Estratégia em duas camadas (para na primeira que encontrar o valor pago —
+Estratégia em camadas (para na primeira que encontrar o valor pago —
 o único campo realmente obrigatório do cadastro):
 
   1. pdfplumber + busca por rótulo — percorre linha a linha procurando
@@ -15,15 +15,19 @@ o único campo realmente obrigatório do cadastro):
      entre bancos/apps do que fatura de cartão, então esta camada carrega
      boa parte da cobertura real.
 
-Diferente do extrato bancário, não há aqui uma terceira camada de OCR/
-Vision: comprovantes quase sempre são gerados digitalmente (têm camada de
-texto). Se nem regex nem IA encontrarem o valor pago, o chamador deve
-orientar o preenchimento manual — que já é o comportamento atual do
+  3. PyMuPDF + GPT-4o Vision — para PDF sem camada de texto (escaneado) ou
+     para upload direto de imagem (PNG/JPG), quando não há texto algum pra
+     extrair localmente. Mais lento e caro; usado só quando as camadas
+     anteriores não se aplicam.
+
+Se nem regex, nem IA-texto, nem Vision encontrarem o valor pago, o chamador
+deve orientar o preenchimento manual — que já é o comportamento atual do
 sistema.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -42,6 +46,12 @@ try:
     _PDFPLUMBER_AVAILABLE = True
 except ImportError:
     _PDFPLUMBER_AVAILABLE = False
+
+try:
+    import fitz  # PyMuPDF
+    _FITZ_AVAILABLE = True
+except ImportError:
+    _FITZ_AVAILABLE = False
 
 
 class PDFParseError(Exception):
@@ -297,6 +307,26 @@ def _data_do_item(item: dict, chave: str) -> datetime | None:
     return _parse_data(str(valor))
 
 
+def _comprovante_from_item(item: dict, confianca: str) -> ComprovantePDF | None:
+    """Converte o dict retornado pela IA (texto ou Vision) em ComprovantePDF."""
+    if not item:
+        return None
+    favorecido = item.get("favorecido")
+    cpf_cnpj = item.get("cpf_cnpj")
+    return ComprovantePDF(
+        favorecido=str(favorecido)[:300] if favorecido else None,
+        cpf_cnpj=str(cpf_cnpj)[:18] if cpf_cnpj else None,
+        valor_pago=_decimal_do_item(item, "valor_pago"),
+        valor_documento=_decimal_do_item(item, "valor_documento"),
+        data_pagamento=_data_do_item(item, "data_pagamento"),
+        data_vencimento=_data_do_item(item, "data_vencimento"),
+        juros=_decimal_do_item(item, "juros"),
+        multa=_decimal_do_item(item, "multa"),
+        desconto=_decimal_do_item(item, "desconto"),
+        confianca=confianca,
+    )
+
+
 def _parse_por_ai_texto(linhas: list[str], budget: _PDFBudget) -> ComprovantePDF | None:
     settings = get_settings()
     if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
@@ -332,23 +362,98 @@ def _parse_por_ai_texto(linhas: list[str], budget: _PDFBudget) -> ComprovantePDF
 
     raw = response.choices[0].message.content or ""
     item = _parse_ai_response(raw)
-    if not item:
-        return None
+    return _comprovante_from_item(item, confianca="ia")
 
-    favorecido = item.get("favorecido")
-    cpf_cnpj = item.get("cpf_cnpj")
-    return ComprovantePDF(
-        favorecido=str(favorecido)[:300] if favorecido else None,
-        cpf_cnpj=str(cpf_cnpj)[:18] if cpf_cnpj else None,
-        valor_pago=_decimal_do_item(item, "valor_pago"),
-        valor_documento=_decimal_do_item(item, "valor_documento"),
-        data_pagamento=_data_do_item(item, "data_pagamento"),
-        data_vencimento=_data_do_item(item, "data_vencimento"),
-        juros=_decimal_do_item(item, "juros"),
-        multa=_decimal_do_item(item, "multa"),
-        desconto=_decimal_do_item(item, "desconto"),
-        confianca="ia",
+
+# ──────────────────────────────────────────────────────────── Camada 3: OCR Vision
+
+def _render_page_to_png(pdf_bytes: bytes, page_num: int, dpi: int = 150) -> bytes:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(page_num)
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return png_bytes
+
+
+def _extrair_via_vision(img_bytes: bytes, mime_type: str, budget: _PDFBudget) -> dict:
+    settings = get_settings()
+    if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
+        raise PDFParseError(
+            "OCR externo desabilitado. Configure consentimento explícito para enviar "
+            "dados financeiros ao provedor de IA."
+        )
+    budget.consumir_chamada_ai()
+    from openai import OpenAI
+    client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
+    img_b64 = base64.standard_b64encode(img_bytes).decode()
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        timeout=budget.timeout_restante,
+        max_tokens=1024,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": _AI_SYSTEM},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_b64}", "detail": "high"}},
+                {"type": "text", "text": _AI_PROMPT},
+            ]},
+        ],
     )
+    raw = response.choices[0].message.content or ""
+    logger.info("Vision: resposta recebida com %d chars", len(raw))
+    return _parse_ai_response(raw)
+
+
+def _parse_por_vision_pdf(conteudo_bytes: bytes, budget: _PDFBudget) -> ComprovantePDF | None:
+    """Renderiza páginas de um PDF sem camada de texto e tenta extrair via Vision.
+
+    Para na primeira página que produzir um valor pago — comprovante quase
+    sempre é 1 página; não vale a pena consultar Vision em todas as páginas.
+    """
+    if not _FITZ_AVAILABLE:
+        raise PDFParseError("PyMuPDF não instalado. Execute: pip install pymupdf")
+    doc = fitz.open(stream=conteudo_bytes, filetype="pdf")
+    num_pages = doc.page_count
+    doc.close()
+    if num_pages > budget.max_pages:
+        raise PDFParseError(f"PDF excede o limite de {budget.max_pages} páginas.")
+
+    for page_num in range(num_pages):
+        budget.verificar_tempo()
+        logger.info("Vision: processando página %d/%d", page_num + 1, num_pages)
+        png_bytes = _render_page_to_png(conteudo_bytes, page_num)
+        item = _extrair_via_vision(png_bytes, "image/png", budget)
+        resultado = _comprovante_from_item(item, confianca="ia")
+        if resultado is not None and resultado.valor_pago is not None:
+            return resultado
+    return None
+
+
+def parse_imagem(conteudo_bytes: bytes, content_type: str = "image/png") -> ComprovantePDF:
+    """Extrai os dados de um comprovante a partir de uma imagem (PNG/JPG).
+
+    Diferente do PDF, uma imagem crua não tem camada de texto extraível
+    localmente — vai direto para a Camada 3 (Vision).
+
+    Levanta `PDFParseError` se o serviço de IA estiver desabilitado ou se o
+    valor pago não puder ser identificado.
+    """
+    settings = get_settings()
+    budget = _PDFBudget(
+        deadline=time.monotonic() + settings.pdf_parse_timeout_seconds,
+        max_pages=settings.pdf_max_pages,
+        ai_calls_restantes=settings.pdf_max_ai_calls,
+    )
+    item = _extrair_via_vision(conteudo_bytes, content_type, budget)
+    resultado = _comprovante_from_item(item, confianca="ia")
+    if resultado is None or resultado.valor_pago is None:
+        raise PDFParseError(
+            "Não foi possível identificar o valor pago nesta imagem. "
+            "Preencha os campos manualmente."
+        )
+    return resultado
 
 
 # ──────────────────────────────────────────────────────────── extração de texto do PDF
@@ -389,6 +494,10 @@ def parse_pdf(conteudo_bytes: bytes) -> ComprovantePDF:
       Fallback para quando a camada 1 não encontra o valor pago —
       comprovantes têm layout muito heterogêneo entre bancos/apps.
 
+    Camada 3 — PyMuPDF + GPT-4o Vision
+      Ativada quando o PDF não tem camada de texto (escaneado/imagem
+      embutida em wrapper PDF).
+
     Levanta `PDFParseError` se nenhuma camada encontrar o valor pago; o
     chamador deve orientar o preenchimento manual nesse caso.
     """
@@ -405,9 +514,17 @@ def parse_pdf(conteudo_bytes: bytes) -> ComprovantePDF:
     linhas, total_chars = _extrair_linhas(conteudo_bytes, budget)
 
     if total_chars < 20:
+        logger.info(
+            "PDF comprovante: sem camada de texto (%d chars) — tentando Vision (camada 3)",
+            total_chars,
+        )
+        resultado_vision = _parse_por_vision_pdf(conteudo_bytes, budget)
+        if resultado_vision is not None:
+            logger.info("PDF comprovante: extraído via Vision (camada 3)")
+            return resultado_vision
         raise PDFParseError(
-            "PDF sem camada de texto reconhecível (documentos escaneados/imagem "
-            "não são suportados; preencha os campos manualmente)."
+            "Não foi possível identificar o valor pago neste comprovante escaneado. "
+            "Preencha os campos manualmente."
         )
 
     resultado = _parse_por_regex(linhas)

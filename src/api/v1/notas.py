@@ -143,18 +143,30 @@ async def cancelar_nota(
 )
 async def importar_xml_nota(
     empresa_id: UUID,
-    arquivo: UploadFile = File(...),
+    arquivo: UploadFile = File(
+        ..., description="XML, ZIP (múltiplos XMLs), PDF ou imagem (PNG/JPG) de nota fiscal"
+    ),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> ImportXmlResponse:
-    """Importa NF-e ou NFS-e de um arquivo XML ou ZIP contendo múltiplos XMLs."""
+    """Importa NF-e/NFS-e de um XML, ZIP (múltiplos XMLs), PDF ou imagem (DANFe).
+
+    Nota importada via PDF/imagem não tem assinatura digital verificável — fica
+    marcada com `origem="ocr"` em vez de `origem="xml_assinado"` (ver
+    `NotaService.importar_visual`).
+    """
     conteudo = await ler_upload_limitado(arquivo)
     nome = arquivo.filename or ""
+    nome_lower = nome.lower()
 
-    if nome.lower().endswith(".zip"):
-        resultado = await _svc(empresa_id, db).importar_zip(conteudo)
+    svc = _svc(empresa_id, db)
+    if nome_lower.endswith(".zip"):
+        resultado = await svc.importar_zip(conteudo)
+    elif nome_lower.endswith((".pdf", ".png", ".jpg", ".jpeg")):
+        extensao = "." + nome_lower.rsplit(".", 1)[-1]
+        resultado = await svc.importar_visual(conteudo, nome, extensao)
     else:
-        resultado = await _svc(empresa_id, db).importar_xml(conteudo, nome)
+        resultado = await svc.importar_xml(conteudo, nome)
 
     return ImportXmlResponse(
         importadas=resultado.importadas,

@@ -454,6 +454,11 @@ class NotaFiscal(Base, TimestampMixin):
     chave_acesso: Mapped[str | None] = mapped_column(String(44), nullable=True)
     dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    origem: Mapped[str] = mapped_column(
+        Enum("xml_assinado", "ocr", name="origem_nota_enum"),
+        default="xml_assinado",
+        nullable=False,
+    )
 
     __table_args__ = (
         UniqueConstraint("empresa_id", "chave_acesso", name="uq_nota_empresa_chave"),
