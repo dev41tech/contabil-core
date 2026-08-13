@@ -271,6 +271,11 @@ class ExportacaoService:
         ).scalars().all()
 
         # Resolve o código da conta em lote: a alternativa é uma query por linha.
+        # Este layout importa num sistema contábil externo (legado do MrContador),
+        # que espera o número de conta antigo (`conta_numero`, ex: 1026) — não o
+        # código hierárquico usado internamente pro Plano de Contas do
+        # contabil-core (`codigo`, ex: 3.4.2.05.0009). Cai pro código hierárquico
+        # só quando a conta não tem `conta_numero` (ex: criada após a migração).
         contas: dict = {}
         conta_ids = {r.conta_id for r in registros}
         if conta_ids:
@@ -279,7 +284,10 @@ class ExportacaoService:
                     select(PlanoConta).where(PlanoConta.id.in_(conta_ids))
                 )
             ).scalars().all()
-            contas = {c.id: c.codigo for c in conta_rows}
+            contas = {
+                c.id: str(c.conta_numero) if c.conta_numero is not None else c.codigo
+                for c in conta_rows
+            }
 
         # Agrupa por lancamento_id preservando a ordem de chegada (por data).
         grupos: dict = {}

@@ -13,10 +13,12 @@ from uuid import UUID
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from src.core.errors import ConflictError, NotFoundError
-from src.db.models import AgenciaBancaria
+from src.db.models import AgenciaBancaria, PlanoConta
 from src.schemas.agencias import (
     AgenciaCreate,
     AgenciaListResponse,
@@ -36,7 +38,9 @@ class AgenciaService:
         self._tenant_id = tenant_id
 
     async def listar(self, apenas_ativas: bool = False) -> AgenciaListResponse:
-        q = select(AgenciaBancaria).where(
+        q = select(AgenciaBancaria).options(
+            joinedload(AgenciaBancaria.conta_contabil)
+        ).where(
             AgenciaBancaria.empresa_id == self._empresa_id,
             AgenciaBancaria.deleted_at == None,
         )
@@ -55,13 +59,13 @@ class AgenciaService:
         total = (await self._db.execute(total_q)).scalar_one()
 
         return AgenciaListResponse(
-            items=[AgenciaResponse.model_validate(a) for a in rows],
+            items=[self._to_response(a) for a in rows],
             total=total,
         )
 
     async def obter(self, agencia_id: UUID) -> AgenciaResponse:
         agencia = await self._get_or_404(agencia_id)
-        return AgenciaResponse.model_validate(agencia)
+        return self._to_response(agencia)
 
     async def criar(self, data: AgenciaCreate) -> AgenciaResponse:
         await self._check_duplicata(data.banco_sigla, data.agencia, data.numero)
@@ -83,7 +87,7 @@ class AgenciaService:
             banco=agencia.banco_sigla,
             descricao=agencia.descricao,
         )
-        return AgenciaResponse.model_validate(agencia)
+        return self._to_response(agencia)
 
     async def atualizar(self, agencia_id: UUID, data: AgenciaUpdate) -> AgenciaResponse:
         agencia = await self._get_or_404(agencia_id)
@@ -113,10 +117,19 @@ class AgenciaService:
             agencia.digito = data.digito
         if data.ativa is not None:
             agencia.ativa = data.ativa
+        if "conta_contabil_id" in data.model_fields_set:
+            await self._vincular_conta_contabil(agencia, data.conta_contabil_id)
 
-        await self._db.flush()
+        try:
+            await self._db.flush()
+        except IntegrityError as exc:
+            raise ConflictError(
+                message="Esta conta do Plano de Contas já está vinculada a outra agência bancária."
+            ) from exc
+
         logger.info("agencia.atualizada", agencia_id=str(agencia_id))
-        return AgenciaResponse.model_validate(agencia)
+        await self._db.refresh(agencia, attribute_names=["conta_contabil"])
+        return self._to_response(agencia)
 
     async def desativar(self, agencia_id: UUID) -> None:
         """Desativa a agência sem deletar — histórico de transações é preservado."""
@@ -132,9 +145,40 @@ class AgenciaService:
 
     # ── Helpers privados
 
+    def _to_response(self, agencia: AgenciaBancaria) -> AgenciaResponse:
+        resp = AgenciaResponse.model_validate(agencia)
+        if agencia.conta_contabil is not None:
+            resp.conta_contabil_codigo = agencia.conta_contabil.codigo
+            resp.conta_contabil_descricao = agencia.conta_contabil.descricao
+        return resp
+
+    async def _vincular_conta_contabil(
+        self, agencia: AgenciaBancaria, conta_contabil_id: UUID | None
+    ) -> None:
+        if conta_contabil_id is None:
+            agencia.conta_contabil_id = None
+            return
+
+        conta = (
+            await self._db.execute(
+                select(PlanoConta).where(
+                    PlanoConta.id == conta_contabil_id,
+                    PlanoConta.empresa_id == self._empresa_id,
+                    PlanoConta.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if conta is None:
+            raise NotFoundError(
+                message="Conta do Plano de Contas não encontrada nesta empresa."
+            )
+        agencia.conta_contabil_id = conta.id
+
     async def _get_or_404(self, agencia_id: UUID) -> AgenciaBancaria:
         result = await self._db.execute(
-            select(AgenciaBancaria).where(
+            select(AgenciaBancaria)
+            .options(joinedload(AgenciaBancaria.conta_contabil))
+            .where(
                 AgenciaBancaria.id == agencia_id,
                 AgenciaBancaria.empresa_id == self._empresa_id,
                 AgenciaBancaria.deleted_at == None,
