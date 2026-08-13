@@ -35,6 +35,14 @@ class AgenciaUpdate(BaseModel):
     numero: NumeroConta | None = None
     digito: str | None = None
     ativa: bool | None = None
+    conta_contabil_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Conta do Plano de Contas que representa esta conta bancária. "
+            "Sem esse vínculo, o motor NEO cria uma conta sintética automática "
+            "para lançar a contrapartida bancária. Envie null para desvincular."
+        ),
+    )
 
 class AgenciaResponse(BaseModel):
     id: UUID
@@ -45,6 +53,9 @@ class AgenciaResponse(BaseModel):
     digito: str | None
     ativa: bool
     descricao: str  # propriedade computada do model
+    conta_contabil_id: UUID | None = None
+    conta_contabil_codigo: str | None = None
+    conta_contabil_descricao: str | None = None
 
     model_config = {"from_attributes": True}
 

@@ -202,6 +202,119 @@ async def test_exportar_lancamentos_importacao_pareia_debito_e_credito(
 
 
 @pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_usa_conta_numero_legado(
+    db, empresa, usuario
+):
+    """Este layout importa num sistema contábil externo (legado do MrContador),
+    que espera `conta_numero` (ex: 1026) — não o `codigo` hierárquico interno
+    do contabil-core (ex: 3.4.2.05.0009). Quando `conta_numero` existe, ele
+    tem prioridade sobre `codigo`."""
+    conta_debito = PlanoConta(
+        empresa_id=empresa.id,
+        codigo="3.4.2.05.0009",
+        conta_numero=1026,
+        descricao="Despesas Bancárias",
+        tipo="despesa",
+    )
+    conta_credito = PlanoConta(
+        empresa_id=empresa.id,
+        codigo="1.1.02.0001",
+        conta_numero=1379,
+        descricao="Banco Movimento",
+        tipo="ativo",
+    )
+    db.add_all([conta_debito, conta_credito])
+    await db.flush()
+
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="SICREDI", agencia="0001", numero="12345")
+    db.add(agencia)
+    await db.flush()
+
+    from src.db.models import RegistroContabil
+
+    lancamento_id = uuid4()
+    db.add_all([
+        RegistroContabil(
+            empresa_id=empresa.id, lancamento_id=lancamento_id,
+            conta_id=conta_debito.id, agencia_id=agencia.id,
+            descricao="Tarifa", historico="TARIFA BANCARIA", historico_extrato="TARIFA BANCARIA",
+            dc="D", tipo_regra="manual", valor=Decimal("1.19"),
+            data_lancamento=datetime(2026, 1, 5, tzinfo=UTC),
+        ),
+        RegistroContabil(
+            empresa_id=empresa.id, lancamento_id=lancamento_id,
+            conta_id=conta_credito.id, agencia_id=agencia.id,
+            descricao="Contrapartida bancária: Tarifa", historico="TARIFA BANCARIA",
+            historico_extrato="TARIFA BANCARIA",
+            dc="C", tipo_regra="manual", valor=Decimal("1.19"),
+            data_lancamento=datetime(2026, 1, 5, tzinfo=UTC),
+        ),
+    ])
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    linhas, _ = await service._exportar_lancamentos_importacao(
+        ExportJobCreate(formato="csv"), "csv"
+    )
+    assert len(linhas) == 1
+    assert linhas[0]["Cód. Conta Debito"] == "1026"
+    assert linhas[0]["Cód. Conta Credito"] == "1379"
+
+
+@pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_sem_conta_numero_cai_pro_codigo(
+    db, empresa, usuario
+):
+    """Conta sem `conta_numero` (ex: criada direto no contabil-core, sem ID
+    legado do MrContador) cai de volta pro código hierárquico — melhor que
+    célula em branco."""
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="3.4.2.05.0009", conta_numero=None,
+        descricao="Despesas Bancárias", tipo="despesa",
+    )
+    contrapartida = PlanoConta(
+        empresa_id=empresa.id, codigo="1.1.B.abc123", conta_numero=None,
+        descricao="Conta bancária sintética", tipo="ativo",
+    )
+    db.add_all([conta, contrapartida])
+    await db.flush()
+
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="SICREDI", agencia="0002", numero="54321")
+    db.add(agencia)
+    await db.flush()
+
+    from src.db.models import RegistroContabil
+
+    lancamento_id = uuid4()
+    db.add_all([
+        RegistroContabil(
+            empresa_id=empresa.id, lancamento_id=lancamento_id,
+            conta_id=conta.id, agencia_id=agencia.id,
+            descricao="Tarifa", historico="TARIFA BANCARIA", historico_extrato="TARIFA BANCARIA",
+            dc="D", tipo_regra="manual", valor=Decimal("1.19"),
+            data_lancamento=datetime(2026, 1, 5, tzinfo=UTC),
+        ),
+        RegistroContabil(
+            empresa_id=empresa.id, lancamento_id=lancamento_id,
+            conta_id=contrapartida.id, agencia_id=agencia.id,
+            descricao="Contrapartida bancária: Tarifa", historico="TARIFA BANCARIA",
+            historico_extrato="TARIFA BANCARIA",
+            dc="C", tipo_regra="manual", valor=Decimal("1.19"),
+            data_lancamento=datetime(2026, 1, 5, tzinfo=UTC),
+        ),
+    ])
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    linhas, _ = await service._exportar_lancamentos_importacao(
+        ExportJobCreate(formato="csv"), "csv"
+    )
+    assert len(linhas) == 1
+    assert linhas[0]["Cód. Conta Debito"] == "3.4.2.05.0009"
+    assert linhas[0]["Cód. Conta Credito"] == "1.1.B.abc123"
+
+
+@pytest.mark.asyncio
 async def test_exportar_lancamentos_importacao_em_xlsx(client, db, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     await _setup_registros(client, db, empresa, csrf)

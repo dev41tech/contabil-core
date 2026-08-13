@@ -6,7 +6,23 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Empresa, Tenant, Usuario
+from src.db.models import Empresa, PlanoConta, Tenant, Usuario
+
+
+async def _criar_plano_conta(
+    db: AsyncSession, empresa: Empresa, *, codigo: str, conta_numero: int | None = None
+) -> PlanoConta:
+    conta = PlanoConta(
+        empresa_id=empresa.id,
+        codigo=codigo,
+        conta_numero=conta_numero,
+        descricao=f"Conta {codigo}",
+        tipo="ativo",
+        tipo_sa="A",
+    )
+    db.add(conta)
+    await db.flush()
+    return conta
 
 
 # ── Helpers
@@ -308,6 +324,159 @@ async def test_reativar_agencia_via_update(
     )
     assert r.status_code == 200
     assert r.json()["ativa"] is True
+
+
+# ── Vínculo com o Plano de Contas (conta_contabil_id)
+
+
+@pytest.mark.asyncio
+async def test_vincular_conta_contabil_sucesso(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    conta = await _criar_plano_conta(db, empresa, codigo="1.1.02.0001", conta_numero=1379)
+    csrf = await _login(client, tenant, usuario)
+    criada = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0001", "numero": "10101"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+
+    r = await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"conta_contabil_id": str(conta.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["conta_contabil_id"] == str(conta.id)
+    assert body["conta_contabil_codigo"] == "1.1.02.0001"
+    assert body["conta_contabil_descricao"] == "Conta 1.1.02.0001"
+
+
+@pytest.mark.asyncio
+async def test_vincular_conta_contabil_inexistente_retorna_404(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    import uuid
+
+    csrf = await _login(client, tenant, usuario)
+    criada = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0002", "numero": "20202"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+
+    r = await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"conta_contabil_id": str(uuid.uuid4())},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_vincular_conta_contabil_de_outra_empresa_retorna_404(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Isolamento: não pode vincular a uma conta do Plano de Contas de outra empresa."""
+    outra_empresa = Empresa(
+        tenant_id=tenant.id,
+        razao_social="Outra Empresa LTDA",
+        cnpj="99.888.777/0001-00",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra_empresa)
+    await db.flush()
+    conta_de_outra = await _criar_plano_conta(db, outra_empresa, codigo="1.1.01.0001")
+
+    csrf = await _login(client, tenant, usuario)
+    criada = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0003", "numero": "30303"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+
+    r = await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"conta_contabil_id": str(conta_de_outra.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_vincular_conta_contabil_ja_vinculada_a_outra_agencia_rejeita(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """A constraint de unicidade em conta_contabil_id impede duas agências
+    apontarem pra mesma conta bancária no Plano de Contas."""
+    conta = await _criar_plano_conta(db, empresa, codigo="1.1.02.0002", conta_numero=1380)
+    csrf = await _login(client, tenant, usuario)
+
+    a1 = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0004", "numero": "40404"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    a2 = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0005", "numero": "50505"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+
+    r1 = await client.patch(
+        _url(empresa.id, a1["id"]),
+        json={"conta_contabil_id": str(conta.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r1.status_code == 200
+
+    r2 = await client.patch(
+        _url(empresa.id, a2["id"]),
+        json={"conta_contabil_id": str(conta.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r2.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_desvincular_conta_contabil(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    conta = await _criar_plano_conta(db, empresa, codigo="1.1.02.0003", conta_numero=1381)
+    csrf = await _login(client, tenant, usuario)
+    criada = (
+        await client.post(
+            _url(empresa.id),
+            json={"banco_sigla": "BB", "agencia": "0006", "numero": "60606"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"conta_contabil_id": str(conta.id)},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"conta_contabil_id": None},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["conta_contabil_id"] is None
+    assert body["conta_contabil_codigo"] is None
 
 
 # ── Isolamento de tenant
