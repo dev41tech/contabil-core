@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import io
 from datetime import UTC, datetime
-from uuid import UUID
+from decimal import Decimal
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -834,6 +835,130 @@ async def test_importacao_conta_numero_vindo_como_float_do_xlsx(
 
     lista = await client.get(_url(empresa.id))
     assert lista.json()["items"][0]["conta_numero"] == 1507
+
+
+# ── Reimportação atualiza contas já existentes (em vez de só ignorar)
+
+
+@pytest.mark.asyncio
+async def test_reimport_atualiza_descricao_e_conta_numero_de_conta_existente(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa.id, csrf, "1", "Ativo (nome antigo)", "ativo")
+
+    csv = "codigo,descricao,tipo,conta_numero\n1,Ativo (nome corrigido),ativo,777\n"
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    assert body["importadas"] == 0
+    assert body["atualizadas"] == 1
+    assert body["duplicadas"] == 0
+    assert body["erros"] == []
+
+    lista = await client.get(_url(empresa.id))
+    conta = lista.json()["items"][0]
+    assert conta["descricao"] == "Ativo (nome corrigido)"
+    assert conta["conta_numero"] == 777
+
+
+@pytest.mark.asyncio
+async def test_reimport_atualiza_tipo_quando_conta_sem_movimentacao(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa.id, csrf, "2.1.1", "Fornecedor X", "despesa")
+
+    csv = "codigo,descricao,tipo\n2.1.1,Fornecedor X,passivo\n"
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    assert r.json()["atualizadas"] == 1
+    assert r.json()["erros"] == []
+
+    lista = await client.get(_url(empresa.id))
+    conta = next(c for c in lista.json()["items"] if c["codigo"] == "2.1.1")
+    assert conta["tipo"] == "passivo"
+
+
+@pytest.mark.asyncio
+async def test_reimport_nao_atualiza_tipo_de_conta_com_movimentacao_e_avisa(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Mesma trava do achado A7 (aplicada em atualizar()): mudar Tipo/S-A de
+    uma conta que já tem lançamento corromperia DRE/Balancete retroativamente.
+    A reimportação não deve aplicar essa mudança silenciosamente — nem deve
+    silenciosamente ignorá-la sem avisar (era o comportamento antigo)."""
+    csrf = await _login(client, tenant, usuario)
+    conta = await _criar(client, empresa.id, csrf, "2.1.2", "Fornecedor Y", "despesa")
+
+    agencia = AgenciaBancaria(
+        empresa_id=empresa.id, banco_sigla="BB", agencia="0001", numero="99999"
+    )
+    db.add(agencia)
+    await db.flush()
+    db.add(
+        RegistroContabil(
+            empresa_id=empresa.id,
+            lancamento_id=uuid4(),
+            conta_id=UUID(conta["id"]),
+            agencia_id=agencia.id,
+            descricao="Pagamento Fornecedor Y",
+            historico="PGTO FORNECEDOR Y",
+            historico_extrato="PGTO FORNECEDOR Y",
+            dc="D",
+            tipo_regra="manual",
+            valor=Decimal("100.00"),
+            data_lancamento=datetime(2026, 1, 5, tzinfo=UTC),
+        )
+    )
+    await db.flush()
+
+    csv = "codigo,descricao,tipo\n2.1.2,Fornecedor Y Ltda,passivo\n"
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    # descricao mudou (sem risco de relatorio) -> conta na atualizadas
+    assert body["atualizadas"] == 1
+    assert len(body["erros"]) == 1
+    assert "movimentação" in body["erros"][0]["erro"]
+    assert body["erros"][0]["codigo"] == "2.1.2"
+
+    lista = await client.get(_url(empresa.id))
+    conta_depois = next(c for c in lista.json()["items"] if c["codigo"] == "2.1.2")
+    assert conta_depois["descricao"] == "Fornecedor Y Ltda"
+    assert conta_depois["tipo"] == "despesa"  # não mudou
+
+
+@pytest.mark.asyncio
+async def test_reimport_linha_identica_conta_como_duplicada(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa.id, csrf, "3", "Resultado", "resultado")
+
+    csv = "codigo,descricao,tipo\n3,Resultado,resultado\n"
+    r = await client.post(
+        _url(empresa.id, extra="/importar"),
+        files={"arquivo": ("plano.csv", io.BytesIO(csv.encode()), "text/csv")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.json()
+    body = r.json()
+    assert body["atualizadas"] == 0
+    assert body["duplicadas"] == 1
+    assert body["erros"] == []
 
 
 # ── Exclusão em lote
