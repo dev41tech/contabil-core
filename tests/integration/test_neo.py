@@ -131,6 +131,95 @@ async def test_neo_processa_com_match(client, db, tenant, usuario, empresa):
     assert "sem_regra" in body
 
 
+_OFX_DOIS_MESES = """\
+OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20240301
+<TRNAMT>-150.00
+<FITID>NEO_MES_TX1
+<MEMO>PGTO FORNECEDOR MES TESTE
+</STMTTRN>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20240415
+<TRNAMT>-150.00
+<FITID>NEO_MES_TX2
+<MEMO>PGTO FORNECEDOR MES TESTE
+</STMTTRN>
+</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
+"""
+
+
+@pytest.mark.asyncio
+async def test_neo_processar_filtra_por_mes(client, db, tenant, usuario, empresa):
+    """mes=AAAA-MM restringe o processamento àquele mês — a transação de
+    outro mês permanece pendente até um processamento futuro (com ou sem
+    filtro) alcançá-la."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "BRADESCO", "agencia": "0004", "numero": "44444"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = PlanoConta(empresa_id=empresa.id, codigo="4.1.1", descricao="Despesas Fornecedor", tipo="despesa")
+    db.add(conta)
+    await db.flush()
+
+    await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importar?agencia_id={agencia['id']}",
+        files={"arquivo": ("e.ofx", io.BytesIO(_OFX_DOIS_MESES.encode()), "application/octet-stream")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    await _criar_regra(client, empresa, agencia["id"], str(conta.id), "PGTO FORNECEDOR MES TESTE", "D", csrf)
+
+    r_marco = await client.post(
+        _processar_url(empresa.id),
+        json={"mes": "2024-03"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r_marco.status_code == 200
+    body_marco = r_marco.json()
+    assert body_marco["total_pendentes"] == 1
+    assert body_marco["associadas"] == 1
+
+    # A transação de abril não foi tocada — continua pendente.
+    pendentes = (
+        await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id, Transacao.status == "pendente"))
+    ).scalars().all()
+    assert len(pendentes) == 1
+    assert pendentes[0].data.month == 4
+
+    r_abril = await client.post(
+        _processar_url(empresa.id),
+        json={"mes": "2024-04"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r_abril.status_code == 200
+    assert r_abril.json()["associadas"] == 1
+
+    pendentes_depois = (
+        await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id, Transacao.status == "pendente"))
+    ).scalars().all()
+    assert pendentes_depois == []
+
+
+@pytest.mark.asyncio
+async def test_neo_processar_mes_formato_invalido_rejeita(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _processar_url(empresa.id),
+        json={"mes": "03-2024"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_neo_processa_substring(client, db, tenant, usuario, empresa):
     """Regra com substring do histórico deve ser encontrada."""

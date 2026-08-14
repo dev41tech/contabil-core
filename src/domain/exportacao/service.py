@@ -18,7 +18,7 @@ import csv
 import io
 import re
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.cnpj import valido as cnpj_valido
+from src.core.dates import bounds_do_mes as _bounds_do_mes
 from src.core.errors import ValidationError
 from src.db.models import (
     AgenciaBancaria,
@@ -101,18 +102,6 @@ def _as_decimal(value: Decimal | int | float | str | None) -> Decimal:
 
 def _valor_assinado(value: Decimal, dc: str) -> Decimal:
     return -value if dc == "D" else value
-
-
-def _bounds_do_mes(mes: str) -> tuple[datetime, datetime]:
-    """Converte 'AAAA-MM' no intervalo [primeiro instante, último instante] do mês."""
-    ano, mes_num = int(mes[:4]), int(mes[5:7])
-    inicio = datetime(ano, mes_num, 1, tzinfo=UTC)
-    fim_exclusivo = (
-        datetime(ano + 1, 1, 1, tzinfo=UTC)
-        if mes_num == 12
-        else datetime(ano, mes_num + 1, 1, tzinfo=UTC)
-    )
-    return inicio, fim_exclusivo - timedelta(microseconds=1)
 
 
 def _celula_segura(value: object) -> object:
