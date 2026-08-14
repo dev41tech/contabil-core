@@ -34,6 +34,7 @@ class ImportacaoLinhaErro(BaseModel):
 
 class ImportacaoPlanoResult(BaseModel):
     importadas: int
+    atualizadas: int = 0
     duplicadas: int
     erros: list[ImportacaoLinhaErro]
 

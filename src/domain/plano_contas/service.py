@@ -407,11 +407,32 @@ class PlanoContaService:
 
         # Valida previamente se todo código hierárquico tem seus ancestrais no
         # banco ou no próprio lote. Assim nenhuma conta filha vira raiz por engano.
+        atualizadas = 0
         validos: dict[str, tuple[PlanoContaCreate, int]] = {}
         codigos_disponiveis = set(existentes) | set(candidatos)
         for codigo, item in candidatos.items():
             if codigo in existentes:
-                duplicadas += 1
+                data, linha = item
+                conta_existente = existentes[codigo]
+                antes = _snapshot_conta(conta_existente)
+                mudou, aviso = await self._atualizar_existente_da_importacao(
+                    conta_existente, data
+                )
+                if mudou:
+                    atualizadas += 1
+                    await registrar_auditoria(
+                        self._db,
+                        empresa_id=self._empresa_id,
+                        acao="plano_conta.atualizada_via_importacao",
+                        entidade="plano_conta",
+                        entidade_id=conta_existente.id,
+                        dados_antes=antes,
+                        dados_depois=_snapshot_conta(conta_existente),
+                    )
+                else:
+                    duplicadas += 1
+                if aviso:
+                    erros.append(ImportacaoLinhaErro(linha=linha, codigo=codigo, erro=aviso))
                 continue
             partes = codigo.split(".")
             if len(partes) > _NIVEL_MAXIMO:
@@ -510,7 +531,47 @@ class PlanoContaService:
                 },
             )
 
-        return ImportacaoPlanoResult(importadas=importadas, duplicadas=duplicadas, erros=erros)
+        return ImportacaoPlanoResult(
+            importadas=importadas, atualizadas=atualizadas, duplicadas=duplicadas, erros=erros
+        )
+
+    async def _atualizar_existente_da_importacao(
+        self, conta: PlanoConta, data: PlanoContaCreate
+    ) -> tuple[bool, str | None]:
+        """Aplica os valores de uma linha de reimportação a uma conta já
+        existente (mesmo código), em vez de simplesmente ignorá-la.
+
+        `conta_numero` e `descricao` são sempre atualizados quando a planilha
+        traz valor diferente — não afetam relatórios já fechados. `tipo` e
+        `tipo_sa` só são atualizados se a conta ainda não tiver movimentação:
+        mudar a natureza contábil de uma conta já movimentada corrompe
+        DRE/Balancete retroativamente (mesma trava do achado A7 da auditoria,
+        aplicada em `atualizar()`). Quando divergem mas a conta já tem
+        movimentação, devolve um aviso em vez de aplicar silenciosamente.
+        """
+        mudou = False
+        aviso: str | None = None
+
+        if data.conta_numero is not None and data.conta_numero != conta.conta_numero:
+            conta.conta_numero = data.conta_numero
+            mudou = True
+        if data.descricao != conta.descricao:
+            conta.descricao = data.descricao
+            mudou = True
+
+        if data.tipo != conta.tipo or data.tipo_sa != conta.tipo_sa:
+            if await self._tem_movimentacao(conta.id):
+                aviso = (
+                    f"Tipo/S-A da planilha ({data.tipo}/{data.tipo_sa}) divergem do "
+                    f"cadastrado ({conta.tipo}/{conta.tipo_sa}), mas não foram "
+                    "alterados: a conta já tem movimentação contábil."
+                )
+            else:
+                conta.tipo = data.tipo
+                conta.tipo_sa = data.tipo_sa
+                mudou = True
+
+        return mudou, aviso
 
     # ── Faixas de classificação (código → tipo, configurada por empresa) ──────
 
