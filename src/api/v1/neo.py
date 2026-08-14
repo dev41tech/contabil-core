@@ -42,9 +42,10 @@ async def processar(
 
     Idempotente — transações já processadas são ignoradas.
     Se agencia_id for informado, processa apenas aquela agência.
+    Se mes for informado (AAAA-MM), processa apenas transações daquele mês.
     """
     engine = NeoEngine(db=db, empresa_id=empresa_id)
-    return await engine.processar(agencia_id=body.agencia_id)
+    return await engine.processar(agencia_id=body.agencia_id, mes=body.mes)
 
 
 @router.get("/decisoes", response_model=NeoDecisaoListResponse)

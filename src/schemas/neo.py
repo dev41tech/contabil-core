@@ -8,9 +8,15 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from src.schemas.types import Competencia
+
 
 class NeoProcessarRequest(BaseModel):
     agencia_id: UUID | None = None  # None = processar todas as agências da empresa
+    mes: Competencia | None = Field(
+        default=None,
+        description="Filtra transações do mês (AAAA-MM). None = processa todas as pendentes.",
+    )
 
 
 class NeoResultado(BaseModel):

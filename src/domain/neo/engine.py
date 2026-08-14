@@ -36,6 +36,7 @@ import structlog
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.dates import bounds_do_mes
 from src.db.models import (
     AgenciaBancaria,
     Comprovante,
@@ -66,10 +67,13 @@ class NeoEngine:
         self._contas_bancarias: dict[UUID, PlanoConta] = {}
         self._empresa_cnpj: str | None = None
 
-    async def processar(self, agencia_id: UUID | None = None) -> NeoResultado:
-        """Processa todas as transações pendentes da empresa (ou de uma agência específica)."""
+    async def processar(
+        self, agencia_id: UUID | None = None, mes: str | None = None
+    ) -> NeoResultado:
+        """Processa as transações pendentes da empresa (opcionalmente restrito a
+        uma agência e/ou a um mês específico, formato 'AAAA-MM')."""
         regras = await self._carregar_regras(agencia_id)
-        pendentes = await self._carregar_pendentes(agencia_id)
+        pendentes = await self._carregar_pendentes(agencia_id, mes)
         sem_regra_existentes = await self._carregar_sem_regra_existentes(pendentes)
         self._comprovantes_consumidos.clear()
         self._notas_consumidas.clear()
@@ -476,7 +480,9 @@ class NeoEngine:
             q = q.where(Regra.agencia_id == agencia_id)
         return (await self._db.execute(q)).scalars().all()
 
-    async def _carregar_pendentes(self, agencia_id: UUID | None) -> list[Transacao]:
+    async def _carregar_pendentes(
+        self, agencia_id: UUID | None, mes: str | None = None
+    ) -> list[Transacao]:
         """Carrega as transações pendentes em ordem estável.
 
         Importa mesmo sem empate de regra: a auto-associação de comprovantes e
@@ -494,6 +500,9 @@ class NeoEngine:
         )
         if agencia_id:
             q = q.where(Transacao.agencia_id == agencia_id)
+        if mes:
+            inicio, fim = bounds_do_mes(mes)
+            q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
         return (await self._db.execute(q)).scalars().all()
 
     async def _carregar_sem_regra_existentes(
