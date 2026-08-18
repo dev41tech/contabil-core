@@ -60,7 +60,7 @@ async def listar_decisoes(
         default=None, description="Busca no histórico do extrato ou na descrição da regra"
     ),
     estrategia: str | None = Query(
-        default=None, description="exato | substring | prefixo | manual"
+        default=None, description="exato | substring | prefixo | manual | contraparte"
     ),
     dc: str | None = Query(default=None, description="D (débito) ou C (crédito)"),
     agencia_id: UUID | None = Query(default=None),

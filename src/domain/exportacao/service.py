@@ -3,7 +3,10 @@
 Gera arquivos CSV ou XLSX de:
   - lancamentos           : registros contábeis (existente)
   - lancamentos_importacao: lançamentos no layout padrão de importação contábil
-                            (débito/crédito pareados na mesma linha)
+                            (débito/crédito pareados na mesma linha). Único tipo
+                            que também aceita TXT — layout do arquivo modelo do
+                            escritório: mesmas colunas, delimitado por ';', SEM
+                            cabeçalho, valor com vírgula decimal.
   - extrato               : transações bancárias importadas, com os filtros da tela
   - nfe_entrada           : NF-e onde empresa é destinatária
   - nfe_saida             : NF-e onde empresa é emitente
@@ -104,6 +107,19 @@ def _valor_assinado(value: Decimal, dc: str) -> Decimal:
     return -value if dc == "D" else value
 
 
+def _formatar_valor_br(value: object) -> str:
+    """'700.00' -> '700'; '1.19' -> '1,19'; '583.61' -> '583,61'.
+
+    Only used pelo layout .txt de importação — o modelo do escritório não
+    preenche zeros à direita e usa vírgula decimal. `Decimal.normalize()` não
+    serve aqui: joga números redondos pra notação científica ('7E+2').
+    """
+    texto = f"{Decimal(str(value)):f}"
+    if "." in texto:
+        texto = texto.rstrip("0").rstrip(".")
+    return texto.replace(".", ",")
+
+
 def _celula_segura(value: object) -> object:
     """Neutraliza fórmulas em qualquer texto antes de cruzar a borda CSV/XLSX."""
     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
@@ -125,12 +141,23 @@ class ExportacaoService:
             data = data.model_copy(update={"data_de": data_de, "data_ate": data_ate})
 
         fmt = data.formato
-        if fmt not in ("csv", "xlsx"):
-            raise ValidationError(message="Formato deve ser 'csv' ou 'xlsx'.")
+        if fmt not in ("csv", "xlsx", "txt"):
+            raise ValidationError(message="Formato deve ser 'csv', 'xlsx' ou 'txt'.")
 
         tipo = data.tipo or "lancamentos"
         if tipo not in _VALID_TIPOS:
             raise ValidationError(message=f"Tipo de exportação inválido: '{tipo}'.")
+
+        # .txt só existe para o layout de importação de lançamentos — é o
+        # único tipo pedido com esse formato até agora (planilha modelo
+        # fornecida pelo escritório). Os outros tipos continuam csv/xlsx.
+        if fmt == "txt" and tipo != "lancamentos_importacao":
+            raise ValidationError(
+                message=(
+                    "O formato 'txt' só está disponível para "
+                    "'lancamentos_importacao' por enquanto."
+                )
+            )
 
         if tipo == "lancamentos":
             rows, conteudo = await self._exportar_lancamentos(data, fmt)
@@ -312,6 +339,8 @@ class ExportacaoService:
 
         if fmt == "csv":
             conteudo = self._dicts_to_csv(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
+        elif fmt == "txt":
+            conteudo = self._dicts_to_txt(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
         else:
             conteudo = self._dicts_to_xlsx(
                 linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO, "Importação Lançamentos"
@@ -613,6 +642,28 @@ class ExportacaoService:
             {chave: _celula_segura(valor) for chave, valor in linha.items()}
             for linha in linhas
         )
+        return buf.getvalue().encode("utf-8-sig")
+
+    def _dicts_to_txt(self, linhas: list[dict], colunas: list[str]) -> bytes:
+        """Layout exato do arquivo modelo fornecido pelo escritório para
+        importar direto no sistema contábil deles: delimitado por ';', SEM
+        linha de cabeçalho, e "Valor" com vírgula decimal e sem zeros à
+        direita (`700` em vez de `700.00`; `1,19` em vez de `1.19`) — padrão
+        brasileiro, e diferente do .csv/.xlsx (que mantêm ponto e 2 casas).
+        Só a coluna "Valor" leva essa conversão — colunas de código de conta
+        podem ter ponto de verdade (ex: '3.4.2.05.0009') e não podem ser
+        tocadas.
+        """
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";")
+        for linha in linhas:
+            row = []
+            for col in colunas:
+                valor = linha.get(col, "")
+                if col == "Valor":
+                    valor = _formatar_valor_br(valor)
+                row.append(_celula_segura(valor))
+            w.writerow(row)
         return buf.getvalue().encode("utf-8-sig")
 
     def _dicts_to_xlsx(

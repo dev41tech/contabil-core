@@ -17,7 +17,17 @@ Ao encontrar match:
   - Salva NeoDecisao com a estratégia usada.
   - Tenta auto-associar Comprovantes e NotasFiscais com valor/data próximos.
 
-Ao não encontrar match:
+Classificação por contraparte (itens 1+2 do PDF de feedback dos contadores):
+  Quando NENHUMA regra casa, antes de desistir o motor tenta achar a
+  contraparte (fornecedor/cliente cadastrado por CNPJ/CPF) a partir do
+  comprovante/nota fiscal candidato. Se achar, classifica exatamente como um
+  match de regra faria — conta da contraparte, histórico no formato "PGTO/
+  RECEBIMENTO REF [NF ...] RAZÃO SOCIAL" — com `estrategia="contraparte"` e
+  `regra_id=None`. Isso NUNCA disputa com uma regra já existente: só entra em
+  jogo quando a regra não classificou nada, então não pode regredir nenhuma
+  classificação que já funcionava.
+
+Ao não encontrar match nem contraparte:
   - Salva NeoDecisao com resultado "sem_regra".
   - Transação permanece "pendente".
 
@@ -125,10 +135,12 @@ class NeoEngine:
 
         associadas = sem_regra = erros = 0
         comprovantes_associados = notas_associadas = 0
+        classificadas_por_contraparte = 0
 
         for transacao in pendentes:
             try:
                 teve_match = associou_comprovante = associou_nota = False
+                associou_por_contraparte = False
                 async with self._db.begin_nested():
                     regra, estrategia = self._encontrar_regra(transacao, regras)
                     if regra:
@@ -137,15 +149,23 @@ class NeoEngine:
                         )
                         teve_match = True
                     else:
-                        if transacao.id not in sem_regra_existentes:
+                        resultado_contraparte = await self._tentar_classificar_por_contraparte(
+                            transacao
+                        )
+                        if resultado_contraparte is not None:
+                            associou_comprovante, associou_nota = resultado_contraparte
+                            teve_match = True
+                            associou_por_contraparte = True
+                        elif transacao.id not in sem_regra_existentes:
                             await self._registrar_sem_regra(transacao)
                             sem_regra_existentes.add(transacao.id)
-                        await self._logar_resolucao_sombra_sem_regra(transacao)
                     await self._db.flush()
                 if teve_match:
                     associadas += 1
                     comprovantes_associados += int(associou_comprovante)
                     notas_associadas += int(associou_nota)
+                    if associou_por_contraparte:
+                        classificadas_por_contraparte += 1
                 else:
                     sem_regra += 1
             except Exception as exc:
@@ -169,6 +189,7 @@ class NeoEngine:
             erros=erros,
             comprovantes_associados=comprovantes_associados,
             notas_associadas=notas_associadas,
+            classificadas_por_contraparte=classificadas_por_contraparte,
         )
 
         return NeoResultado(
@@ -179,6 +200,7 @@ class NeoEngine:
             erros=erros,
             comprovantes_associados=comprovantes_associados,
             notas_associadas=notas_associadas,
+            classificadas_por_contraparte=classificadas_por_contraparte,
             processado_em=datetime.now(UTC),
         )
 
@@ -274,10 +296,15 @@ class NeoEngine:
 
         return associou_comprovante, associou_nota
 
-    # ── Shadow mode — resolução de contraparte (Entrega 5) ──────────────────────
+    # ── Contraparte: shadow mode (quando já há regra) + classificação real
+    #    (quando não há regra) ─────────────────────────────────────────────────
     #
-    # Calcula o que a Entrega 6/7 usaria (conta e histórico por contraparte),
-    # só para métrica — nunca substitui o que a regra decidiu nesta entrega.
+    # Quando uma regra já classificou a transação, a resolução de contraparte
+    # abaixo continua em shadow mode — só mede divergência com a regra, nunca
+    # substitui a decisão dela (`_logar_resolucao_sombra`/`_resolver_contraparte_sombra`).
+    # Quando NÃO há regra, `_tentar_classificar_por_contraparte` usa a mesma
+    # resolução para classificar de verdade — é aí que os itens 1+2 do PDF
+    # de feedback realmente entram em produção.
 
     async def _logar_resolucao_sombra(
         self,
@@ -343,14 +370,18 @@ class NeoEngine:
             ),
         )
 
-    async def _logar_resolucao_sombra_sem_regra(self, transacao: Transacao) -> None:
-        """Mesma resolução em shadow mode, mas para transações que a regra
-        NÃO classificou. Aqui está o maior valor de medir antes de ativar: são
-        as transações que hoje exigem revisão manual — quantas delas o
-        cadastro de contrapartes já resolveria sozinho?
+    async def _tentar_classificar_por_contraparte(
+        self, transacao: Transacao
+    ) -> tuple[bool, bool] | None:
+        """Classifica de verdade uma transação sem regra, usando o cadastro de
+        contrapartes (itens 1+2 do PDF de feedback dos contadores) — ativado
+        em 2026-08-18, depois de rodar em shadow mode.
 
-        Não há regra pra comparar, então não existe `conta_divergente` aqui —
-        só reporta que uma classificação teria sido possível.
+        Só chamado quando `_encontrar_regra` não achou nada, então nunca
+        disputa com uma regra já existente. Retorna `None` se não achou
+        contraparte (o chamador segue o fluxo `sem_regra` de sempre); se
+        achou, cria a classificação exatamente como `_registrar_match` faria
+        para uma regra e retorna `(associou_comprovante, associou_nota)`.
         """
         comprovante_candidato = await self._selecionar_comprovante_candidato(transacao)
         nota_candidata = await self._selecionar_nota_candidata(transacao)
@@ -359,20 +390,54 @@ class NeoEngine:
             transacao, comprovante_candidato, nota_candidata
         )
         if encontrado is None:
-            return
+            return None
         contraparte, origem_evidencia, numero_nf = encontrado
 
-        logger.info(
-            "neo.shadow.sem_regra_resolveria",
-            transacao_id=str(transacao.id),
-            contraparte_id=str(contraparte.id),
-            documento=contraparte.documento,
-            origem_evidencia=origem_evidencia,
-            conta_sugerida_id=str(contraparte.conta_contabil_id),
-            historico_sugerido=gerar_historico_sugerido(
-                dc=transacao.dc, razao_social=contraparte.razao_social, numero_nf=numero_nf
+        historico_gerado = gerar_historico_sugerido(
+            dc=transacao.dc, razao_social=contraparte.razao_social, numero_nf=numero_nf
+        )
+
+        await self._registrar_partidas(
+            transacao=transacao,
+            conta_id=contraparte.conta_contabil_id,
+            descricao=contraparte.razao_social,
+            historico=historico_gerado,
+            dc=transacao.dc,
+            tipo_regra="contraparte",
+        )
+        transacao.status = "processada"
+
+        decisao = NeoDecisao(
+            empresa_id=self._empresa_id,
+            transacao_id=transacao.id,
+            regra_id=None,
+            resultado="associada",
+            estrategia="contraparte",
+            motivo=(
+                f"Contraparte '{contraparte.razao_social}' identificada via "
+                f"{origem_evidencia} (documento {contraparte.documento})"
             ),
         )
+        self._db.add(decisao)
+        logger.info(
+            "neo.classificado_por_contraparte",
+            transacao_id=str(transacao.id),
+            contraparte_id=str(contraparte.id),
+            origem_evidencia=origem_evidencia,
+            conta_id=str(contraparte.conta_contabil_id),
+        )
+
+        associou_comprovante = False
+        if comprovante_candidato is not None:
+            await self._vincular_comprovante(transacao, comprovante_candidato)
+            associou_comprovante = True
+
+        associou_nota = False
+        if nota_candidata is not None:
+            await self._vincular_nota(transacao, nota_candidata)
+            associou_nota = True
+
+        return associou_comprovante, associou_nota
 
     async def _resolver_contraparte_candidata(
         self,
@@ -380,9 +445,11 @@ class NeoEngine:
         comprovante_candidato: Comprovante | None,
         nota_candidata: NotaFiscal | None,
     ) -> tuple[Contraparte, str, str | None] | None:
-        """Núcleo comum da resolução em shadow mode: acha o documento
-        (CNPJ/CPF) nos candidatos e busca a contraparte cadastrada. Não muta
-        nada e não depende de haver regra.
+        """Núcleo comum da resolução de contraparte — usado tanto pelo shadow
+        mode (quando há regra) quanto pela classificação real (quando não
+        há): acha o documento (CNPJ/CPF) nos candidatos e busca a contraparte
+        cadastrada. Não muta nada — quem chama decide o que fazer com o
+        resultado.
 
         Ordem de evidência: nota fiscal candidata (documento do lado que é a
         contraparte, conforme a direção financeira) primeiro, comprovante
@@ -419,7 +486,7 @@ class NeoEngine:
         contraparte = await self._buscar_contraparte_por_documento(digitos)
         if contraparte is None:
             logger.debug(
-                "neo.shadow.contraparte_nao_encontrada",
+                "neo.contraparte_nao_encontrada",
                 transacao_id=str(transacao.id),
                 documento=digitos,
                 origem_evidencia=origem_evidencia,

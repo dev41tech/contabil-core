@@ -330,6 +330,65 @@ async def test_exportar_lancamentos_importacao_em_xlsx(client, db, tenant, usuar
 
 
 @pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_em_txt(client, db, tenant, usuario, empresa):
+    """TXT segue o layout exato do arquivo modelo do escritório: mesmas
+    colunas do .xlsx, delimitado por ';', SEM cabeçalho, valor com vírgula
+    decimal e sem zeros à direita."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "txt", "tipo": "lancamentos_importacao"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    assert r.headers["Content-Disposition"].endswith(".txt\"")
+    assert r.headers.get("X-Total-Registros") == "1"
+
+    linhas = list(csv.reader(io.StringIO(r.content.decode("utf-8-sig")), delimiter=";"))
+    assert len(linhas) == 1  # sem linha de cabeçalho
+    (
+        data, conta_debito, conta_credito, valor, cod_historico, complemento,
+        inicia_lote, cod_matriz, cc_debito, cc_credito,
+    ) = linhas[0]
+    assert data == "01/05/2024"
+    assert conta_credito == "4.1.1"
+    assert conta_debito
+    assert valor == "1200"  # sem zeros à direita, vírgula decimal
+    assert complemento
+    assert (cod_historico, inicia_lote, cod_matriz, cc_debito, cc_credito) == ("",) * 5
+
+
+@pytest.mark.asyncio
+async def test_formatar_valor_br_segue_o_modelo_do_escritorio():
+    """Casos reais do arquivo modelo: zeros à direita somem, fração usa vírgula."""
+    from src.domain.exportacao.service import _formatar_valor_br
+
+    assert _formatar_valor_br(Decimal("700.00")) == "700"
+    assert _formatar_valor_br(Decimal("1518.00")) == "1518"
+    assert _formatar_valor_br(Decimal("1.19")) == "1,19"
+    assert _formatar_valor_br(Decimal("583.61")) == "583,61"
+    assert _formatar_valor_br(Decimal("2.38")) == "2,38"
+
+
+@pytest.mark.asyncio
+async def test_exportar_txt_so_disponivel_para_lancamentos_importacao(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "txt", "tipo": "lancamentos"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_exportar_lancamentos_importacao_ignora_lancamento_sem_par(
     db, empresa, usuario
 ):

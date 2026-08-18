@@ -28,6 +28,9 @@ class NeoResultado(BaseModel):
     # Auto-associações (tasks 5 & 6)
     comprovantes_associados: int = 0
     notas_associadas: int = 0
+    # Classificadas sem regra, só pelo cadastro de contrapartes (itens 1+2 do
+    # PDF de feedback dos contadores) — subconjunto de `associadas`.
+    classificadas_por_contraparte: int = 0
     processado_em: datetime
 
 

@@ -948,14 +948,16 @@ async def test_resolver_contraparte_candidata_funciona_sem_regra(
 
 
 @pytest.mark.asyncio
-async def test_shadow_sem_regra_nao_cria_lancamento_nem_associa(
+async def test_neo_classifica_sem_regra_via_contraparte(
     client, db, tenant, usuario, empresa
 ):
-    """Fim a fim: mesmo achando uma contraparte pra uma transação sem_regra,
-    o processamento não cria lançamento nem associa o documento — só observa."""
+    """Ativação dos itens 1+2 do PDF (2026-08-18): uma transação sem regra,
+    mas com contraparte identificável via nota fiscal, é classificada de
+    verdade — lançamento criado na conta da contraparte, histórico no
+    formato pedido, documento associado, transação processada."""
     csrf = await _login(client, tenant, usuario)
     await _setup_base(client, db, empresa, csrf)
-    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.5")
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.6")
 
     transacoes = {
         t.historico: t
@@ -963,41 +965,113 @@ async def test_shadow_sem_regra_nao_cria_lancamento_nem_associa(
             await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
         ).scalars().all()
     }
-    sem_regra_transacao = transacoes["DEPOSITO AVULSO DESCONHECIDO"]
+    transacao = transacoes["DEPOSITO AVULSO DESCONHECIDO"]  # crédito, sem regra
     nota = NotaFiscal(
         empresa_id=empresa.id,
         tipo="nfe",
         numero="NF-321",
         cnpj_emitente=empresa.cnpj,
         cnpj_destinatario="52.540.787/0001-88",
-        valor=sem_regra_transacao.valor,
-        data_emissao=sem_regra_transacao.data,
-        dedup_key="teste-shadow-sem-regra-e2e",
+        valor=transacao.valor,
+        data_emissao=transacao.data,
+        dedup_key="teste-classificacao-contraparte",
     )
     db.add(nota)
     await db.flush()
-    await _criar_contraparte(
-        db, empresa, conta_contraparte, documento="52540787000188", tipo="cliente"
+    contraparte = await _criar_contraparte(
+        db, empresa, conta_contraparte, documento="52540787000188",
+        tipo="cliente", razao_social="Axel Tecnologia Ltda",
     )
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200
+    body = r.json()
+    assert body["classificadas_por_contraparte"] == 1
+    assert body["associadas"] >= 1
+    assert body["sem_regra"] == 2  # as outras 2 transações do OFX continuam sem regra/contraparte
 
-    await db.refresh(sem_regra_transacao)
-    assert sem_regra_transacao.status == "pendente"
+    await db.refresh(transacao)
+    assert transacao.status == "processada"
 
     await db.refresh(nota)
-    assert nota.transacao_id is None
-    assert nota.status == "pendente"
+    assert nota.transacao_id == transacao.id
+    assert nota.status == "associada"
 
-    lancamentos = (
+    partidas = (
         await db.execute(
             select(RegistroContabil).where(
-                RegistroContabil.transacao_id == sem_regra_transacao.id
+                RegistroContabil.transacao_id == transacao.id,
+                RegistroContabil.deleted_at.is_(None),
             )
         )
     ).scalars().all()
-    assert lancamentos == []
+    assert len(partidas) == 2
+    lancamento = next(p for p in partidas if p.conta_id == conta_contraparte.id)
+    assert lancamento.dc == "C"
+    assert lancamento.descricao == "AXEL TECNOLOGIA LTDA"
+    assert lancamento.historico == "RECEBIMENTO REF NF NF-321 - AXEL TECNOLOGIA LTDA"
+    assert lancamento.historico_extrato == "DEPOSITO AVULSO DESCONHECIDO"  # extrato bruto preservado
+
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+    assert decisao.resultado == "associada"
+    assert decisao.estrategia == "contraparte"
+    assert decisao.regra_id is None
+
+
+@pytest.mark.asyncio
+async def test_neo_classificacao_por_contraparte_nunca_disputa_com_regra_existente(
+    client, db, tenant, usuario, empresa
+):
+    """Quando já existe uma regra que classifica a transação, a contraparte
+    NUNCA entra em jogo — mesmo que aponte para uma conta diferente."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.7")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-999",
+        cnpj_emitente="52.540.787/0001-88",
+        cnpj_destinatario=empresa.cnpj,
+        valor=debito.valor,
+        data_emissao=debito.data,
+        dedup_key="teste-nao-disputa-regra",
+    )
+    db.add(nota)
+    await db.flush()
+    await _criar_contraparte(db, empresa, conta_contraparte, documento="52540787000188")
+    await _criar_regra(client, empresa, agencia_id, conta_regra, "BOLETO", "D", csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+    assert r.json()["classificadas_por_contraparte"] == 0
+
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(RegistroContabil.transacao_id == debito.id)
+        )
+    ).scalars().all()
+    lancamento = next(p for p in partidas if p.conta_id == UUID(conta_regra))
+    assert lancamento is not None
+    assert lancamento.conta_id != conta_contraparte.id
+
+    decisao = (
+        await db.execute(select(NeoDecisao).where(NeoDecisao.transacao_id == debito.id))
+    ).scalar_one()
+    assert decisao.estrategia != "contraparte"
+    assert decisao.regra_id is not None
 
 
 @pytest.mark.asyncio
