@@ -145,6 +145,9 @@ class Empresa(Base, TimestampMixin):
     aplicacoes_financeiras: Mapped[list[AplicacaoFinanceira]] = relationship(
         "AplicacaoFinanceira", back_populates="empresa"
     )
+    contrapartes: Mapped[list[Contraparte]] = relationship(
+        "Contraparte", back_populates="empresa"
+    )
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "cnpj", name="uq_empresa_tenant_cnpj"),
@@ -353,6 +356,60 @@ class Regra(Base, TimestampMixin):
     def _normalizar_historico(self, _key: str, value: str) -> str:
         self.historico_normalizado = value.strip().lower()
         return value
+
+
+# ─────────────────────────────────────────────────────────────── Contraparte
+
+
+class Contraparte(Base, TimestampMixin):
+    """Fornecedor ou cliente identificado por CPF/CNPJ, com conta contábil padrão.
+
+    Cadastro separado de `Regra`: o mesmo histórico bancário pode variar por
+    agência/redação, mas a identidade fiscal e a conta padrão de um fornecedor
+    ou cliente não dependem disso. `tipo` cobre os dois sentidos porque o
+    mesmo documento pode aparecer tanto em pagamentos (fornecedor) quanto em
+    recebimentos (cliente).
+    """
+
+    __tablename__ = "contrapartes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
+    tipo: Mapped[str] = mapped_column(
+        Enum("fornecedor", "cliente", "ambos", name="tipo_contraparte_enum"), nullable=False
+    )
+    documento: Mapped[str] = mapped_column(String(14), nullable=False)  # CPF/CNPJ, só dígitos
+    razao_social: Mapped[str] = mapped_column(String(300), nullable=False)
+    nome_fantasia: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    conta_contabil_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("plano_contas.id"), nullable=False
+    )
+    origem: Mapped[str] = mapped_column(
+        Enum(
+            "manual", "nota_fiscal", "comprovante", "historico_extrato", "backfill",
+            name="origem_contraparte_enum",
+        ),
+        default="manual",
+        nullable=False,
+    )
+    confirmado_em: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmado_por: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("usuarios.id"), nullable=True)
+    ativa: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    empresa: Mapped[Empresa] = relationship("Empresa", back_populates="contrapartes")
+    conta_contabil: Mapped[PlanoConta] = relationship("PlanoConta")
+
+    __table_args__ = (
+        Index(
+            "uq_contraparte_empresa_documento_ativa",
+            "empresa_id",
+            "documento",
+            unique=True,
+            postgresql_where=text("ativa = true AND deleted_at IS NULL"),
+            sqlite_where=text("ativa = 1 AND deleted_at IS NULL"),
+        ),
+        Index("ix_contraparte_empresa_razao_social", "empresa_id", "razao_social"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────── Extrato / Transação
