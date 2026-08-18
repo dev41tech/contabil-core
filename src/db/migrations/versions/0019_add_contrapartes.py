@@ -25,12 +25,16 @@ down_revision = "0018"
 branch_labels = None
 depends_on = None
 
+#  create_type=False é o que evita o DuplicateObjectError: sem isso, o
+# SQLAlchemy tenta recriar o tipo uma segunda vez sozinho ao ver a coluna
+# dentro de op.create_table (sem checkfirst), duplicando a criação manual
+# abaixo. Criação e remoção do tipo ficam só a cargo de upgrade()/downgrade().
 tipo_contraparte_enum = postgresql.ENUM(
-    "fornecedor", "cliente", "ambos", name="tipo_contraparte_enum"
+    "fornecedor", "cliente", "ambos", name="tipo_contraparte_enum", create_type=False
 )
 origem_contraparte_enum = postgresql.ENUM(
     "manual", "nota_fiscal", "comprovante", "historico_extrato", "backfill",
-    name="origem_contraparte_enum",
+    name="origem_contraparte_enum", create_type=False,
 )
 
 
