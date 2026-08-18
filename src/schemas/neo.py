@@ -52,6 +52,8 @@ class NeoDecisaoResponse(BaseModel):
 class NeoDecisaoListResponse(BaseModel):
     items: list[NeoDecisaoResponse]
     total: int
+    page: int
+    page_size: int
 
 
 class NeoAssociarManualRequest(BaseModel):

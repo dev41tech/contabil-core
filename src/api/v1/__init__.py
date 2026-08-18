@@ -7,6 +7,7 @@ from src.api.v1.aplicacoes import router as aplicacoes_router
 from src.api.v1.auth import router as auth_router
 from src.api.v1.comprovantes import router as comprovantes_router
 from src.api.v1.contabil import router as contabil_router
+from src.api.v1.contrapartes import router as contrapartes_router
 from src.api.v1.empresas import router as empresas_router
 from src.api.v1.exportacao import router as exportacao_router
 from src.api.v1.extrato import router as extrato_router
@@ -31,6 +32,7 @@ router.include_router(agencias_router)
 router.include_router(aplicacoes_router)
 router.include_router(plano_contas_router)
 router.include_router(regras_router)
+router.include_router(contrapartes_router)
 router.include_router(extrato_router)
 router.include_router(notas_router)
 router.include_router(comprovantes_router)

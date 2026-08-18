@@ -15,6 +15,7 @@ from src.db.models import (
     AuditLog,
     AgenciaBancaria,
     Comprovante,
+    Contraparte,
     Empresa,
     NeoDecisao,
     NotaFiscal,
@@ -364,6 +365,48 @@ async def test_neo_cria_duas_partidas_balanceadas(client, db, tenant, usuario, e
 
 
 @pytest.mark.asyncio
+async def test_neo_normaliza_historico_e_descricao_preservando_extrato(
+    client, db, tenant, usuario, empresa
+):
+    """RegistroContabil.historico/descricao saem em maiúsculas e sem espaços
+    duplicados, mas historico_extrato preserva o texto bruto do banco."""
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    _, conta_id = await _setup_base(client, db, empresa, csrf)
+    transacao = (
+        await db.execute(
+            select(Transacao).where(
+                Transacao.empresa_id == empresa.id,
+                Transacao.historico == "BOLETO ENERGIA ELETRICA",
+            )
+        )
+    ).scalar_one()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    await engine.registrar_partidas_manuais(
+        transacao, conta_id=UUID(conta_id), descricao="  pgto   ref\nFornecedor Alfa  "
+    )
+    await db.flush()
+
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id,
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    assert len(partidas) == 2
+    lancamento = next(p for p in partidas if p.conta_id == UUID(conta_id))
+    assert lancamento.descricao == "PGTO REF FORNECEDOR ALFA"
+    assert lancamento.historico == "BOLETO ENERGIA ELETRICA"
+    # A evidência bruta do extrato não é tocada pela normalização.
+    assert lancamento.historico_extrato == "BOLETO ENERGIA ELETRICA"
+
+
+@pytest.mark.asyncio
 async def test_neo_sem_regra_nao_duplica_decisao(client, db, tenant, usuario, empresa):
     csrf = await _login(client, tenant, usuario)
     await _setup_base(client, db, empresa, csrf)
@@ -557,6 +600,420 @@ async def test_autoassociacao_de_nota_respeita_direcao_financeira(
     assert emitida_mesmo_valor.transacao_id is None
 
 
+@pytest.mark.asyncio
+async def test_selecionar_comprovante_candidato_nao_associa(
+    client, db, tenant, usuario, empresa
+):
+    """A seleção é só leitura — não muta transacao_id do candidato."""
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    comprovante = Comprovante(
+        empresa_id=empresa.id,
+        agencia_id=debito.agencia_id,
+        data_pagamento=debito.data,
+        valor_pago=debito.valor,
+    )
+    db.add(comprovante)
+    await db.flush()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    candidato = await engine._selecionar_comprovante_candidato(debito)
+    assert candidato is not None
+    assert candidato.id == comprovante.id
+    assert comprovante.transacao_id is None  # seleção não associa
+
+    # selecionar de novo (sem vincular) continua encontrando o mesmo candidato
+    candidato_de_novo = await engine._selecionar_comprovante_candidato(debito)
+    assert candidato_de_novo.id == comprovante.id
+
+    await engine._vincular_comprovante(debito, candidato)
+    assert comprovante.transacao_id == debito.id
+
+
+@pytest.mark.asyncio
+async def test_selecionar_nota_candidata_nao_associa(client, db, tenant, usuario, empresa):
+    """A seleção é só leitura — não muta transacao_id/status do candidato."""
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-SELECAO",
+        cnpj_emitente="11.111.111/0001-11",
+        cnpj_destinatario=empresa.cnpj,
+        valor=debito.valor,
+        data_emissao=debito.data,
+        dedup_key="teste-selecao-nota",
+    )
+    db.add(nota)
+    await db.flush()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    engine._empresa_cnpj = empresa.cnpj
+    candidata = await engine._selecionar_nota_candidata(debito)
+    assert candidata is not None
+    assert candidata.id == nota.id
+    assert nota.transacao_id is None
+    assert nota.status == "pendente"
+
+    await engine._vincular_nota(debito, candidata)
+    assert nota.transacao_id == debito.id
+    assert nota.status == "associada"
+
+
+async def _criar_conta_generica(db, empresa, codigo="4.9.0") -> PlanoConta:
+    conta = PlanoConta(empresa_id=empresa.id, codigo=codigo, descricao="Conta de teste", tipo="despesa")
+    db.add(conta)
+    await db.flush()
+    return conta
+
+
+async def _criar_contraparte(db, empresa, conta, documento="52540787000188", **over) -> Contraparte:
+    contraparte = Contraparte(
+        empresa_id=empresa.id,
+        tipo=over.pop("tipo", "fornecedor"),
+        documento=documento,
+        razao_social=over.pop("razao_social", "Axel Tecnologia Ltda"),
+        conta_contabil_id=conta.id,
+        origem="manual",
+        confirmado_em=datetime.now(UTC),
+        **over,
+    )
+    db.add(contraparte)
+    await db.flush()
+    return contraparte
+
+
+@pytest.mark.asyncio
+async def test_shadow_resolve_contraparte_por_nota_fiscal(
+    client, db, tenant, usuario, empresa
+):
+    """A resolução em shadow mode encontra a contraparte pelo CNPJ do lado
+    correto da nota (emitente, numa transação de débito), sem alterar nada."""
+    from src.db.models import Regra
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.1")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-777",
+        cnpj_emitente="52.540.787/0001-88",
+        cnpj_destinatario=empresa.cnpj,
+        valor=debito.valor,
+        data_emissao=debito.data,
+        dedup_key="teste-shadow-nota",
+    )
+    db.add(nota)
+    await db.flush()
+    contraparte = await _criar_contraparte(
+        db, empresa, conta_contraparte, documento="52540787000188"
+    )
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    engine._empresa_cnpj = empresa.cnpj
+    regra = Regra(conta_id=UUID(conta_regra))
+
+    resolucao = await engine._resolver_contraparte_sombra(
+        debito, regra, comprovante_candidato=None, nota_candidata=nota
+    )
+
+    assert resolucao is not None
+    assert resolucao.contraparte_id == contraparte.id
+    assert resolucao.origem_evidencia == "nota_fiscal"
+    assert resolucao.conta_contraparte_id == conta_contraparte.id
+    assert resolucao.conta_divergente is True  # regra usa conta_regra, contraparte usa outra
+    assert resolucao.historico_sugerido == "PGTO REF NF NF-777 - AXEL TECNOLOGIA LTDA"
+    # nada foi mutado pela resolução
+    assert nota.transacao_id is None
+    assert nota.status == "pendente"
+
+
+@pytest.mark.asyncio
+async def test_shadow_resolve_contraparte_por_comprovante_quando_sem_nota(
+    client, db, tenant, usuario, empresa
+):
+    from src.db.models import Regra
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.2")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    comprovante = Comprovante(
+        empresa_id=empresa.id,
+        agencia_id=debito.agencia_id,
+        data_pagamento=debito.data,
+        valor_pago=debito.valor,
+        cpf_cnpj="12.810.326/0001-63",
+    )
+    db.add(comprovante)
+    await db.flush()
+    contraparte = await _criar_contraparte(
+        db, empresa, conta_contraparte,
+        documento="12810326000163", razao_social="Cargo Time Transportes",
+    )
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    regra = Regra(conta_id=UUID(conta_regra))
+
+    resolucao = await engine._resolver_contraparte_sombra(
+        debito, regra, comprovante_candidato=comprovante, nota_candidata=None
+    )
+
+    assert resolucao is not None
+    assert resolucao.contraparte_id == contraparte.id
+    assert resolucao.origem_evidencia == "comprovante"
+    assert resolucao.historico_sugerido == "PGTO REF CARGO TIME TRANSPORTES"
+    assert comprovante.transacao_id is None  # nada foi mutado
+
+
+@pytest.mark.asyncio
+async def test_shadow_sem_contraparte_cadastrada_retorna_none(
+    client, db, tenant, usuario, empresa
+):
+    from src.db.models import Regra
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    comprovante = Comprovante(
+        empresa_id=empresa.id,
+        agencia_id=debito.agencia_id,
+        data_pagamento=debito.data,
+        valor_pago=debito.valor,
+        cpf_cnpj="00.000.000/0001-00",  # nenhuma contraparte com esse documento
+    )
+    db.add(comprovante)
+    await db.flush()
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    regra = Regra(conta_id=UUID(conta_regra))
+
+    resolucao = await engine._resolver_contraparte_sombra(
+        debito, regra, comprovante_candidato=comprovante, nota_candidata=None
+    )
+    assert resolucao is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_nao_altera_lancamento_real(
+    client, db, tenant, usuario, empresa
+):
+    """Fim a fim: mesmo com uma contraparte cadastrada apontando pra outra
+    conta, o lançamento criado pelo processamento continua usando a conta e
+    o histórico decididos pela regra — shadow mode só observa."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.3")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    debito = transacoes["BOLETO ENERGIA ELETRICA"]
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-888",
+        cnpj_emitente="52.540.787/0001-88",
+        cnpj_destinatario=empresa.cnpj,
+        valor=debito.valor,
+        data_emissao=debito.data,
+        dedup_key="teste-shadow-nao-altera",
+    )
+    db.add(nota)
+    await db.flush()
+    await _criar_contraparte(db, empresa, conta_contraparte, documento="52540787000188")
+    await _criar_regra(client, empresa, agencia_id, conta_regra, "BOLETO", "D", csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == debito.id,
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    lancamento = next(p for p in partidas if p.conta_id == UUID(conta_regra))
+    assert lancamento is not None  # a conta usada foi a da regra, não a da contraparte
+    assert lancamento.conta_id != conta_contraparte.id
+
+    # o auto-match de nota fiscal continua funcionando normalmente
+    await db.refresh(nota)
+    assert nota.transacao_id == debito.id
+    assert nota.status == "associada"
+
+
+@pytest.mark.asyncio
+async def test_resolver_contraparte_candidata_funciona_sem_regra(
+    client, db, tenant, usuario, empresa
+):
+    """O núcleo da resolução não depende de haver regra — é o que a Entrega 5
+    estendida usa para transações sem_regra (crédito, via nota fiscal de saída)."""
+    from src.domain.neo.engine import NeoEngine
+
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.4")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    sem_regra_transacao = transacoes["DEPOSITO AVULSO DESCONHECIDO"]  # crédito, sem regra
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-999",
+        cnpj_emitente=empresa.cnpj,
+        cnpj_destinatario="52.540.787/0001-88",
+        valor=sem_regra_transacao.valor,
+        data_emissao=sem_regra_transacao.data,
+        dedup_key="teste-shadow-sem-regra",
+    )
+    db.add(nota)
+    await db.flush()
+    contraparte = await _criar_contraparte(
+        db, empresa, conta_contraparte, documento="52540787000188",
+        tipo="cliente", razao_social="Axel Tecnologia Ltda",
+    )
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    engine._empresa_cnpj = empresa.cnpj
+
+    comprovante_candidato = await engine._selecionar_comprovante_candidato(sem_regra_transacao)
+    assert comprovante_candidato is None  # transação de crédito, comprovante nunca casa
+    nota_candidata = await engine._selecionar_nota_candidata(sem_regra_transacao)
+    assert nota_candidata is not None
+
+    encontrado = await engine._resolver_contraparte_candidata(
+        sem_regra_transacao, comprovante_candidato, nota_candidata
+    )
+    assert encontrado is not None
+    contraparte_encontrada, origem_evidencia, numero_nf = encontrado
+    assert contraparte_encontrada.id == contraparte.id
+    assert origem_evidencia == "nota_fiscal"
+    assert numero_nf == "NF-999"
+
+
+@pytest.mark.asyncio
+async def test_shadow_sem_regra_nao_cria_lancamento_nem_associa(
+    client, db, tenant, usuario, empresa
+):
+    """Fim a fim: mesmo achando uma contraparte pra uma transação sem_regra,
+    o processamento não cria lançamento nem associa o documento — só observa."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.5")
+
+    transacoes = {
+        t.historico: t
+        for t in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    sem_regra_transacao = transacoes["DEPOSITO AVULSO DESCONHECIDO"]
+    nota = NotaFiscal(
+        empresa_id=empresa.id,
+        tipo="nfe",
+        numero="NF-321",
+        cnpj_emitente=empresa.cnpj,
+        cnpj_destinatario="52.540.787/0001-88",
+        valor=sem_regra_transacao.valor,
+        data_emissao=sem_regra_transacao.data,
+        dedup_key="teste-shadow-sem-regra-e2e",
+    )
+    db.add(nota)
+    await db.flush()
+    await _criar_contraparte(
+        db, empresa, conta_contraparte, documento="52540787000188", tipo="cliente"
+    )
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    await db.refresh(sem_regra_transacao)
+    assert sem_regra_transacao.status == "pendente"
+
+    await db.refresh(nota)
+    assert nota.transacao_id is None
+    assert nota.status == "pendente"
+
+    lancamentos = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == sem_regra_transacao.id
+            )
+        )
+    ).scalars().all()
+    assert lancamentos == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_sem_regra_sem_contraparte_nao_quebra_processamento(
+    client, db, tenant, usuario, empresa
+):
+    """Caminho comum hoje (cadastro de contrapartes vazio): sem_regra continua
+    funcionando normalmente, sem erro nenhum vindo da tentativa de resolução."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+    assert r.json()["sem_regra"] >= 1
+
+
 # ── Listar decisões
 
 
@@ -571,6 +1028,152 @@ async def test_listar_decisoes_neo(client, db, tenant, usuario, empresa):
     body = r.json()
     assert body["total"] >= 1
     assert "items" in body
+
+
+def _decisoes_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/decisoes"
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_response_inclui_page_e_page_size(
+    client, tenant, usuario, empresa
+):
+    await _login(client, tenant, usuario)
+    r = await client.get(_decisoes_url(empresa.id) + "?page=2&page_size=10")
+    assert r.status_code == 200
+    assert r.json()["page"] == 2
+    assert r.json()["page_size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_filtro_termo_busca_historico_e_regra(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "BOLETO", "D", csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    por_historico = await client.get(_decisoes_url(empresa.id) + "?termo=CLIENTE ALFA")
+    assert por_historico.status_code == 200
+    itens = por_historico.json()["items"]
+    assert [i["transacao_descricao"] for i in itens] == ["TED RECEBIDA CLIENTE ALFA"]
+
+    por_regra = await client.get(_decisoes_url(empresa.id) + "?termo=Regra BOLETO")
+    itens_regra = por_regra.json()["items"]
+    assert [i["transacao_descricao"] for i in itens_regra] == ["BOLETO ENERGIA ELETRICA"]
+
+    sem_match = await client.get(_decisoes_url(empresa.id) + "?termo=inexistente-xyz")
+    assert sem_match.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_termo_com_percent_nao_vira_wildcard(
+    client, db, tenant, usuario, empresa
+):
+    """'%' digitado pelo usuário é texto literal, não coringa de SQL."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    r = await client.get(_decisoes_url(empresa.id) + "?termo=100%")
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_filtro_estrategia(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "BOLETO", "D", csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    exatas = await client.get(_decisoes_url(empresa.id) + "?estrategia=exato")
+    assert {i["transacao_descricao"] for i in exatas.json()["items"]} == {
+        "TED RECEBIDA CLIENTE ALFA"
+    }
+
+    substrings = await client.get(_decisoes_url(empresa.id) + "?estrategia=substring")
+    assert {i["transacao_descricao"] for i in substrings.json()["items"]} == {
+        "BOLETO ENERGIA ELETRICA"
+    }
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_filtro_dc(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    debitos = await client.get(_decisoes_url(empresa.id) + "?dc=D")
+    itens_d = debitos.json()["items"]
+    assert itens_d
+    assert all(i["transacao_dc"] == "D" for i in itens_d)
+
+    creditos = await client.get(_decisoes_url(empresa.id) + "?dc=C")
+    itens_c = creditos.json()["items"]
+    assert itens_c
+    assert all(i["transacao_dc"] == "C" for i in itens_c)
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_filtro_agencia_e_conta(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    por_agencia = await client.get(_decisoes_url(empresa.id) + f"?agencia_id={agencia_id}")
+    assert por_agencia.json()["items"]
+
+    por_conta = await client.get(_decisoes_url(empresa.id) + f"?conta_id={conta_id}")
+    assert any(
+        i["transacao_descricao"] == "TED RECEBIDA CLIENTE ALFA"
+        for i in por_conta.json()["items"]
+    )
+
+    agencia_inexistente = "00000000-0000-0000-0000-000000000099"
+    vazio = await client.get(_decisoes_url(empresa.id) + f"?agencia_id={agencia_inexistente}")
+    assert vazio.status_code == 200
+    assert vazio.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_listar_decisoes_filtro_mes(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "BRADESCO", "agencia": "0005", "numero": "55555"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="4.5.1", descricao="Despesas Mes", tipo="despesa"
+    )
+    db.add(conta)
+    await db.flush()
+    await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importar?agencia_id={agencia['id']}",
+        files={"arquivo": ("e.ofx", io.BytesIO(_OFX_DOIS_MESES.encode()), "application/octet-stream")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    await _criar_regra(
+        client, empresa, agencia["id"], str(conta.id), "PGTO FORNECEDOR MES TESTE", "D", csrf
+    )
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    marco = await client.get(_decisoes_url(empresa.id) + "?mes=2024-03")
+    assert marco.json()["total"] == 1
+
+    abril = await client.get(_decisoes_url(empresa.id) + "?mes=2024-04")
+    assert abril.json()["total"] == 1
+
+    invalido = await client.get(_decisoes_url(empresa.id) + "?mes=13-2024")
+    assert invalido.status_code == 422
 
 
 @pytest.mark.asyncio
