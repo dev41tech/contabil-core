@@ -1,13 +1,18 @@
 """Motor NEO — Matching automático de transações com regras.
 
-Estratégias de match (em ordem de prioridade):
-  1. exato      — historico da transação == historico da regra (case-insensitive)
-  2. substring  — historico da regra é substring do historico da transação
-  3. prefixo    — historico da transação começa com o historico da regra
+Estratégias de match (em ordem de prioridade). Os dois lados são comparados
+na forma canônica de `src.core.texto.normalizar_para_match` — minúsculas, sem
+acento, sem pontuação, espaços colapsados:
+  1. exato          — historico da transação == historico da regra
+  2. substring      — historico da regra é substring do historico da transação
+  3. prefixo        — historico da transação começa com o historico da regra
+  4. todas_palavras — todas as palavras da regra aparecem no histórico, em
+                      qualquer ordem e não necessariamente coladas
 
 Desempate entre regras candidatas:
-  Nas estratégias `substring` e `prefixo` mais de uma regra pode casar. Vence a
-  mais específica — o histórico mais longo — e, em caso de empate, o menor `id`.
+  Nas estratégias `substring`, `prefixo` e `todas_palavras` mais de uma regra
+  pode casar. Vence a mais específica — o histórico mais longo — e, em caso de
+  empate, o menor `id`.
   A ordem vem do `ORDER BY` em `_carregar_regras`, não da ordem que o banco
   devolveu, para que o mesmo extrato produza sempre a mesma classificação.
 
@@ -56,7 +61,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.dates import bounds_do_mes
-from src.core.texto import normalizar_historico_contabil
+from src.core.texto import normalizar_historico_contabil, normalizar_para_match
 from src.db.models import (
     AgenciaBancaria,
     Comprovante,
@@ -115,6 +120,8 @@ class NeoEngine:
         self._comprovantes_consumidos: set[UUID] = set()
         self._notas_consumidas: set[UUID] = set()
         self._contas_bancarias: dict[UUID, PlanoConta] = {}
+        self._regras_normalizadas: dict[UUID, tuple[str, list[str]]] = {}
+        self._decisoes_sem_regra: dict[UUID, NeoDecisao] = {}
         self._empresa_cnpj: str | None = None
 
     async def processar(
@@ -124,7 +131,7 @@ class NeoEngine:
         uma agência e/ou a um mês específico, formato 'AAAA-MM')."""
         regras = await self._carregar_regras(agencia_id)
         pendentes = await self._carregar_pendentes(agencia_id, mes)
-        sem_regra_existentes = await self._carregar_sem_regra_existentes(pendentes)
+        self._decisoes_sem_regra = await self._carregar_decisoes_sem_regra(pendentes)
         self._comprovantes_consumidos.clear()
         self._notas_consumidas.clear()
         self._empresa_cnpj = (
@@ -156,9 +163,8 @@ class NeoEngine:
                             associou_comprovante, associou_nota = resultado_contraparte
                             teve_match = True
                             associou_por_contraparte = True
-                        elif transacao.id not in sem_regra_existentes:
+                        elif transacao.id not in self._decisoes_sem_regra:
                             await self._registrar_sem_regra(transacao)
-                            sem_regra_existentes.add(transacao.id)
                     await self._db.flush()
                 if teve_match:
                     associadas += 1
@@ -206,11 +212,33 @@ class NeoEngine:
 
     # ── Matching ──────────────────────────────────────────────────────────────
 
+    def _forma_de_match(self, regra: Regra) -> tuple[str, list[str]]:
+        """Forma canônica do histórico da regra, memoizada por execução.
+
+        Não usa `regra.historico_normalizado` (que é só `strip().lower()`, e
+        existe para o índice único de unicidade) porque o matching precisa
+        ignorar também acento e pontuação — ver `normalizar_para_match`.
+        """
+        cacheado = self._regras_normalizadas.get(regra.id)
+        if cacheado is None:
+            texto = normalizar_para_match(regra.historico)
+            cacheado = (texto, texto.split())
+            self._regras_normalizadas[regra.id] = cacheado
+        return cacheado
+
     def _encontrar_regra(
         self, transacao: Transacao, regras: list[Regra]
     ) -> tuple[Regra | None, str | None]:
-        """Tenta as estratégias em ordem de precisão."""
-        historico_t = transacao.historico.lower().strip()
+        """Tenta as estratégias em ordem de precisão.
+
+        Todas as comparações acontecem na forma canônica dos dois lados
+        (minúsculas, sem acento, sem pontuação, espaços colapsados), então
+        uma regra "TARIFA" reconhece "Tarifa com liquidação", "TARIFA COM
+        LIQUIDACAO" e "TARIFA/LIQUIDAÇÃO" sem precisar de uma regra por
+        variação.
+        """
+        historico_t = normalizar_para_match(transacao.historico)
+        tokens_t = set(historico_t.split())
 
         # Filtra regras compatíveis com a agência e D/C da transação
         candidatas = [
@@ -220,18 +248,32 @@ class NeoEngine:
 
         # 1. Match exato
         for regra in candidatas:
-            if historico_t == regra.historico_normalizado:
+            if historico_t == self._forma_de_match(regra)[0]:
                 return regra, "exato"
 
         # 2. Match por substring (regra dentro da transação)
         for regra in candidatas:
-            if regra.historico_normalizado in historico_t:
+            if self._forma_de_match(regra)[0] in historico_t:
                 return regra, "substring"
 
         # 3. Match por prefixo (transação começa com o histórico da regra)
         for regra in candidatas:
-            if historico_t.startswith(regra.historico_normalizado):
+            if historico_t.startswith(self._forma_de_match(regra)[0]):
                 return regra, "prefixo"
+
+        # 4. Todas as palavras da regra aparecem no histórico, em qualquer
+        #    ordem e não necessariamente coladas. É o que faz a regra "TARIFA
+        #    COM LIQUIDACAO" reconhecer "TARIFA COM R LIQUIDACAO" — a palavra
+        #    extra do banco no meio do histórico quebrava as três estratégias
+        #    acima e obrigava o contador a cadastrar uma regra por variação.
+        #
+        #    Fica por último de propósito: é a estratégia mais permissiva, só
+        #    entra em jogo quando nenhuma das exatas casou, e a ordem de
+        #    `_carregar_regras` (mais específica primeiro) continua valendo.
+        for regra in candidatas:
+            tokens_r = self._forma_de_match(regra)[1]
+            if tokens_r and all(t in tokens_t for t in tokens_r):
+                return regra, "todas_palavras"
 
         return None, None
 
@@ -274,15 +316,13 @@ class NeoEngine:
 
         transacao.status = "processada"
 
-        decisao = NeoDecisao(
-            empresa_id=self._empresa_id,
-            transacao_id=transacao.id,
-            regra_id=regra.id,
+        self._registrar_decisao(
+            transacao,
             resultado="associada",
+            regra_id=regra.id,
             estrategia=estrategia,
             motivo=f"Regra '{regra.historico}' ({estrategia})",
         )
-        self._db.add(decisao)
 
         associou_comprovante = False
         if comprovante_candidato is not None:
@@ -407,18 +447,16 @@ class NeoEngine:
         )
         transacao.status = "processada"
 
-        decisao = NeoDecisao(
-            empresa_id=self._empresa_id,
-            transacao_id=transacao.id,
-            regra_id=None,
+        self._registrar_decisao(
+            transacao,
             resultado="associada",
+            regra_id=None,
             estrategia="contraparte",
             motivo=(
                 f"Contraparte '{contraparte.razao_social}' identificada via "
                 f"{origem_evidencia} (documento {contraparte.documento})"
             ),
         )
-        self._db.add(decisao)
         logger.info(
             "neo.classificado_por_contraparte",
             transacao_id=str(transacao.id),
@@ -615,28 +653,67 @@ class NeoEngine:
         self._contas_bancarias[agencia_id] = conta
         return conta
 
-    async def _registrar_sem_regra(self, transacao: Transacao) -> None:
+    def _registrar_decisao(
+        self,
+        transacao: Transacao,
+        *,
+        resultado: str,
+        regra_id: UUID | None,
+        estrategia: str | None,
+        motivo: str | None,
+    ) -> None:
+        """Grava o desfecho do NEO para esta transação.
+
+        Se já existe uma decisão 'sem_regra' aberta para a transação, ela é
+        *encerrada* (atualizada no lugar) em vez de ficar para trás enquanto uma
+        linha nova é inserida. Antes disso, uma transação que caía em 'sem_regra'
+        numa execução e era classificada na seguinte deixava a linha antiga
+        órfã: a tela "Sem Regra" continuava listando um lançamento já
+        contabilizado e tentar associá-lo respondia "A transação já foi
+        contabilizada ou não está mais pendente".
+        """
+        aberta = self._decisoes_sem_regra.get(transacao.id)
+        if aberta is not None:
+            aberta.regra_id = regra_id
+            aberta.resultado = resultado
+            aberta.estrategia = estrategia
+            aberta.motivo = motivo
+            aberta.processado_em = datetime.now(UTC)
+            return
+
         decisao = NeoDecisao(
             empresa_id=self._empresa_id,
             transacao_id=transacao.id,
-            regra_id=None,
+            regra_id=regra_id,
+            resultado=resultado,
+            estrategia=estrategia,
+            motivo=motivo,
+        )
+        self._db.add(decisao)
+        # A linha nova não entra em `_decisoes_sem_regra`: esse índice é só das já
+        # persistidas quando a execução começou. Uma linha recém-inserida pode
+        # ser desfeita pelo savepoint desta transação, e reaproveitá-la depois
+        # (no `_registrar_erro`) escreveria num objeto que o rollback já
+        # descartou — o registro de erro simplesmente sumiria.
+
+    async def _registrar_sem_regra(self, transacao: Transacao) -> None:
+        self._registrar_decisao(
+            transacao,
             resultado="sem_regra",
+            regra_id=None,
             estrategia=None,
             motivo=f"Nenhuma regra encontrada para '{transacao.historico}' (dc={transacao.dc})",
         )
-        self._db.add(decisao)
 
     async def _registrar_erro(self, transacao: Transacao, erro: str) -> None:
         transacao.status = "erro"
-        decisao = NeoDecisao(
-            empresa_id=self._empresa_id,
-            transacao_id=transacao.id,
-            regra_id=None,
+        self._registrar_decisao(
+            transacao,
             resultado="erro",
+            regra_id=None,
             estrategia=None,
             motivo=erro[:500],
         )
-        self._db.add(decisao)
 
     # ── Auto-associação de comprovantes (Task 5) ───────────────────────────────
 
@@ -833,16 +910,26 @@ class NeoEngine:
             q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
         return (await self._db.execute(q)).scalars().all()
 
-    async def _carregar_sem_regra_existentes(
+    async def _carregar_decisoes_sem_regra(
         self, transacoes: list[Transacao]
-    ) -> set[UUID]:
+    ) -> dict[UUID, NeoDecisao]:
+        """Decisões 'sem_regra' já abertas para estas transações, indexadas por
+        transação.
+
+        Carrega os objetos (e não só os ids) porque quando a transação enfim é
+        classificada a decisão aberta precisa ser *encerrada* — ver
+        `_registrar_decisao`. O índice parcial
+        `uq_neo_sem_regra_transacao` garante no máximo uma por transação.
+        """
         if not transacoes:
-            return set()
-        q = select(NeoDecisao.transacao_id).where(
+            return {}
+        q = select(NeoDecisao).where(
             NeoDecisao.transacao_id.in_([t.id for t in transacoes]),
             NeoDecisao.resultado == "sem_regra",
         )
-        return set((await self._db.execute(q)).scalars().all())
+        return {
+            d.transacao_id: d for d in (await self._db.execute(q)).scalars().all()
+        }
 
     def _direcao_nota(self, nota: NotaFiscal) -> str | None:
         empresa = self._somente_digitos(self._empresa_cnpj)

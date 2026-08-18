@@ -99,13 +99,27 @@ async def extrair_dados_pdf(
 
     conteudo = await ler_upload_limitado(arquivo)
     nome_lower = (arquivo.filename or "").lower()
+    # O content-type entra como segunda evidência porque arrastar-e-soltar nem
+    # sempre preserva o nome do arquivo: dependendo do navegador e da origem do
+    # arraste (e-mail, visualizador de PDF, print da tela) o upload chega como
+    # "blob" sem extensão, e decidir só pela extensão rejeitava um comprovante
+    # perfeitamente legível com "Formato não suportado".
+    tipo = (arquivo.content_type or "").split(";")[0].strip().lower()
 
-    if nome_lower.endswith(".pdf"):
-        parser, args, rotulo = parse_pdf, (conteudo,), "PDF"
-    elif nome_lower.endswith(".png"):
-        parser, args, rotulo = parse_imagem, (conteudo, "image/png"), "Imagem"
-    elif nome_lower.endswith(".jpg") or nome_lower.endswith(".jpeg"):
-        parser, args, rotulo = parse_imagem, (conteudo, "image/jpeg"), "Imagem"
+    if nome_lower.endswith(".pdf") or tipo == "application/pdf":
+        parser, args = parse_pdf, (conteudo,)
+    elif nome_lower.endswith(".png") or tipo == "image/png":
+        parser, args = parse_imagem, (conteudo, "image/png")
+    elif (
+        nome_lower.endswith(".jpg")
+        or nome_lower.endswith(".jpeg")
+        or tipo in ("image/jpg", "image/jpeg")
+    ):
+        parser, args = parse_imagem, (conteudo, "image/jpeg")
+    elif conteudo[:5] == b"%PDF-":
+        # Último recurso: o próprio conteúdo. Nome e content-type podem faltar
+        # os dois; a assinatura do arquivo não mente.
+        parser, args = parse_pdf, (conteudo,)
     else:
         raise AppValidationError(
             message="Formato não suportado. Envie um PDF, PNG ou JPG do comprovante."
@@ -122,7 +136,11 @@ async def extrair_dados_pdf(
             message="Processamento do arquivo excedeu o tempo limite."
         ) from None
     except PDFParseError as e:
-        raise AppValidationError(message=f"{rotulo} inválido: {e}") from e
+        # `PDFParseError` já carrega uma frase pronta para o contador ("Não foi
+        # possível identificar o valor pago...", "PDF sem páginas."). Prefixar
+        # "PDF inválido:" fazia todo comprovante legível — mas de layout não
+        # coberto — parecer arquivo corrompido.
+        raise AppValidationError(message=str(e)) from e
 
     return ComprovanteExtracaoResponse(
         favorecido=extraido.favorecido,

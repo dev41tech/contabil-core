@@ -231,3 +231,64 @@ def test_parse_pdf_escaneado_com_flag_desligada_gera_erro_claro(monkeypatch):
 
     with pytest.raises(PDFParseError, match="OCR externo desabilitado"):
         pdf_parser.parse_pdf(_pdf_em_branco())
+
+
+# ── Rótulos de valor dos apps de banco (camada 1, sem IA) ────────────────────
+#
+# Relato do escritório (2026-08-18): "permite arrastar os arquivos, no entanto
+# ele não consegue extrair a informação". Boa parte era a camada de regex não
+# reconhecer o vocabulário de PIX/TED dos apps — o que jogava a extração na
+# camada de IA, que está desligada por padrão (ALLOW_FINANCIAL_DATA_TO_OPENAI).
+
+
+@pytest.mark.parametrize(
+    ("linhas", "esperado"),
+    [
+        (["Valor", "R$ 1.234,56"], Decimal("1234.56")),
+        (["Valor:", "R$ 80,00"], Decimal("80.00")),
+        (["Valor do Pix R$ 250,00"], Decimal("250.00")),
+        (["Valor da transferência: R$ 90,10"], Decimal("90.10")),
+        (["Valor enviado", "R$ 42,00"], Decimal("42.00")),
+        (["Valor recebido: R$ 15,75"], Decimal("15.75")),
+        (["Valor debitado: R$ 33,00"], Decimal("33.00")),
+        (["Total pago: R$ 7,00"], Decimal("7.00")),
+        (["Valor a pagar: R$ 61,20"], Decimal("61.20")),
+    ],
+)
+def test_reconhece_rotulos_de_valor_dos_apps_de_banco(linhas, esperado):
+    assert _parse_por_regex(linhas).valor_pago == esperado
+
+
+def test_valor_de_taxa_nao_e_confundido_com_valor_pago():
+    """"Valor do IOF" não pode virar o valor do comprovante.
+
+    É o risco de afrouxar o rótulo: um `^valor` solto capturaria a taxa que
+    aparece antes do valor real e gravaria R$ 0,38 como pagamento.
+    """
+    linhas = [
+        "Comprovante de transferência",
+        "Valor do IOF: R$ 0,38",
+        "Valor da tarifa: R$ 2,50",
+        "Valor pago: R$ 500,00",
+    ]
+    assert _parse_por_regex(linhas).valor_pago == Decimal("500.00")
+
+
+def test_dica_de_ia_desligada_entra_na_mensagem_de_erro(monkeypatch):
+    """PDF com texto legível, valor em rótulo desconhecido e IA desligada.
+
+    Sem a dica, falta de configuração e comprovante ilegível dão exatamente a
+    mesma mensagem — e o escritório não tem como saber que o que falta é a
+    chave da IA, não o arquivo.
+    """
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    monkeypatch.setattr(
+        pdf_parser,
+        "_extrair_linhas",
+        lambda _conteudo, _budget: (["Comprovante", "Quantia transferida R$ 10,00"], 40),
+    )
+
+    with pytest.raises(PDFParseError) as exc:
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+    assert "OPENAI_API_KEY" in str(exc.value)

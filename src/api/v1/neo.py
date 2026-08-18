@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.core.errors import ConflictError
 from src.db.models import NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
@@ -60,16 +62,31 @@ async def listar_decisoes(
         default=None, description="Busca no histórico do extrato ou na descrição da regra"
     ),
     estrategia: str | None = Query(
-        default=None, description="exato | substring | prefixo | manual | contraparte"
+        default=None,
+        description="exato | substring | prefixo | todas_palavras | manual | contraparte",
     ),
-    dc: str | None = Query(default=None, description="D (débito) ou C (crédito)"),
+    dc: str | None = Query(
+        default=None,
+        description="D/débito ou C/crédito (aceita a letra ou a palavra por extenso)",
+    ),
     agencia_id: UUID | None = Query(default=None),
     conta_id: UUID | None = Query(default=None, description="Conta contábil usada na regra"),
     mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
+    valor_min: Decimal | None = Query(
+        default=None, ge=0, description="Valor mínimo da transação (R$)"
+    ),
+    valor_max: Decimal | None = Query(
+        default=None, ge=0, description="Valor máximo da transação (R$)"
+    ),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> NeoDecisaoListResponse:
-    """Lista o log de decisões do NEO para a empresa, com busca textual e filtros."""
+    """Lista o log de decisões do NEO para a empresa, com busca textual e filtros.
+
+    Filtros com valor desconhecido (`resultado`, `estrategia`, `dc`) respondem
+    422 em vez de devolver lista vazia — a tela precisa distinguir "não há
+    resultado" de "o filtro foi mandado errado".
+    """
     return await _listar_decisoes(
         db,
         empresa_id,
@@ -80,6 +97,8 @@ async def listar_decisoes(
         agencia_id=agencia_id,
         conta_id=conta_id,
         mes=mes,
+        valor_min=valor_min,
+        valor_max=valor_max,
         page=page,
         page_size=page_size,
     )
@@ -101,6 +120,12 @@ async def associar_manual(
 
     Cria as duas partidas do lançamento com estrategia='manual', marca a
     decisão como 'associada' e atualiza o status da transação para 'processada'.
+
+    Transação já contabilizada responde 409 (e não 422): é conflito de estado,
+    não payload inválido. Chegar aqui hoje significa que a tela está com uma
+    listagem velha em mãos — todo caminho que contabiliza uma transação encerra
+    a decisão 'sem_regra' dela junto (`NeoEngine._registrar_decisao` e esta
+    própria rota), então a linha não fica mais para trás como ficava antes.
     """
     # Busca e valida a decisão
     decisao_result = await db.execute(
@@ -130,10 +155,22 @@ async def associar_manual(
     transacao = t_result.scalar_one_or_none()
     if not transacao:
         raise HTTPException(status_code=404, detail="Transação não encontrada.")
+    if transacao.status == "processada":
+        # ConflictError (e não HTTPException) para a resposta sair no mesmo
+        # envelope `{"message": ...}` que o resto da API — é o que a tela lê.
+        raise ConflictError(
+            message=(
+                "Esta transação já foi contabilizada — ela não está mais na "
+                "lista 'Sem Regra'. Atualize a tela para ver a situação atual."
+            )
+        )
     if transacao.status != "pendente":
         raise HTTPException(
             status_code=422,
-            detail="A transação já foi contabilizada ou não está mais pendente.",
+            detail=(
+                f"A transação está com status '{transacao.status}' e não pode "
+                "ser associada."
+            ),
         )
 
     conta = (

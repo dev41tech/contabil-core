@@ -446,7 +446,11 @@ async def test_extrair_pdf_falha_de_extracao_retorna_422(
     csrf = await _login(client, tenant, usuario)
     r = await _extrair_pdf(client, empresa, csrf)
     assert r.status_code == 422
-    assert "PDF inválido" in r.json()["message"]
+    # A mensagem do parser chega inteira ao contador, sem prefixo de "arquivo
+    # inválido" — o comprovante é legível, só não teve o valor reconhecido.
+    assert r.json()["message"] == (
+        "Não foi possível identificar o valor pago neste comprovante."
+    )
 
 
 @pytest.mark.asyncio
@@ -459,3 +463,73 @@ async def test_extrair_pdf_sem_csrf_rejeita(
         files={"arquivo": ("c.pdf", io.BytesIO(_PDF_BYTES), "application/pdf")},
     )
     assert r.status_code == 403
+
+
+# ── Upload arrastado sem nome de arquivo utilizável ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_aceita_arquivo_sem_extensao_pelo_content_type(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    """Arrastar-e-soltar nem sempre preserva o nome do arquivo.
+
+    Dependendo do navegador e da origem do arraste (e-mail, visualizador de
+    PDF), o upload chega como "blob" sem extensão — e decidir o formato só pela
+    extensão respondia "Formato não suportado" para um comprovante perfeitamente
+    legível. Era metade do "permite arrastar mas não extrai" relatado.
+    """
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    def _fake(conteudo: bytes):
+        return pdf_parser_module.ComprovantePDF(
+            favorecido="ACME SERVICOS LTDA", valor_pago=Decimal("1500.00")
+        )
+
+    monkeypatch.setattr(pdf_parser_module, "parse_pdf", _fake)
+
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, "/extrair-pdf"),
+        files={"arquivo": ("blob", io.BytesIO(_PDF_BYTES), "application/pdf")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["favorecido"] == "ACME SERVICOS LTDA"
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_aceita_arquivo_reconhecido_pela_assinatura(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    """Sem nome e sem content-type: sobra o `%PDF-` do próprio conteúdo."""
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    monkeypatch.setattr(
+        pdf_parser_module,
+        "parse_pdf",
+        lambda conteudo: pdf_parser_module.ComprovantePDF(valor_pago=Decimal("10.00")),
+    )
+
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, "/extrair-pdf"),
+        files={"arquivo": ("blob", io.BytesIO(_PDF_BYTES), "application/octet-stream")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_extrair_pdf_rejeita_formato_que_nao_e_comprovante(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """A tolerância acima não pode virar "aceita qualquer coisa"."""
+    csrf = await _login(client, tenant, usuario)
+    r = await client.post(
+        _url(empresa.id, "/extrair-pdf"),
+        files={"arquivo": ("planilha.xlsx", io.BytesIO(b"PK\x03\x04nada"), "application/zip")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+    assert "Formato não suportado" in r.json()["message"]

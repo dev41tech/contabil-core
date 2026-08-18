@@ -10,6 +10,7 @@ contraparte (isso é shadow mode, só em log, ver `engine.py`).
 
 from __future__ import annotations
 
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -17,8 +18,54 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import contains_eager
 
 from src.core.dates import bounds_do_mes
+from src.core.errors import ValidationError
+from src.core.texto import normalizar_para_match, remover_acentos
+from src.db.functions import sem_acento
 from src.db.models import NeoDecisao, Regra, Transacao
 from src.schemas.neo import NeoDecisaoListResponse, NeoDecisaoResponse
+
+RESULTADOS_VALIDOS = ("associada", "sem_regra", "erro")
+ESTRATEGIAS_VALIDAS = (
+    "exato",
+    "substring",
+    "prefixo",
+    "todas_palavras",
+    "manual",
+    "contraparte",
+)
+
+# O front manda ora "D"/"C", ora a palavra por extenso (com ou sem acento).
+# Antes, qualquer coisa diferente de "D"/"C" virava um WHERE que não casava com
+# nada e a tela mostrava lista vazia sem dizer por quê — era o "filtro de
+# crédito/débito não funciona" relatado pelo escritório.
+_DC_ACEITOS = {
+    "d": "D",
+    "debito": "D",
+    "debitos": "D",
+    "c": "C",
+    "credito": "C",
+    "creditos": "C",
+}
+
+
+def normalizar_dc(dc: str) -> str:
+    """'débito', 'Debito', 'd', 'D' → 'D'. Valor desconhecido vira 422."""
+    chave = normalizar_para_match(dc)
+    valor = _DC_ACEITOS.get(chave)
+    if valor is None:
+        raise ValidationError(
+            message="dc deve ser 'D' (débito) ou 'C' (crédito)."
+        )
+    return valor
+
+
+def _validar_opcao(valor: str, aceitos: tuple[str, ...], campo: str) -> str:
+    normalizado = valor.strip().lower()
+    if normalizado not in aceitos:
+        raise ValidationError(
+            message=f"{campo} deve ser um de: {', '.join(aceitos)}."
+        )
+    return normalizado
 
 
 async def listar_decisoes(
@@ -32,6 +79,8 @@ async def listar_decisoes(
     agencia_id: UUID | None = None,
     conta_id: UUID | None = None,
     mes: str | None = None,
+    valor_min: Decimal | None = None,
+    valor_max: Decimal | None = None,
     page: int = 1,
     page_size: int = 50,
 ) -> NeoDecisaoListResponse:
@@ -49,11 +98,17 @@ async def listar_decisoes(
     )
 
     if resultado:
-        q = q.where(NeoDecisao.resultado == resultado)
+        q = q.where(
+            NeoDecisao.resultado
+            == _validar_opcao(resultado, RESULTADOS_VALIDOS, "resultado")
+        )
     if estrategia:
-        q = q.where(NeoDecisao.estrategia == estrategia)
+        q = q.where(
+            NeoDecisao.estrategia
+            == _validar_opcao(estrategia, ESTRATEGIAS_VALIDAS, "estrategia")
+        )
     if dc:
-        q = q.where(Transacao.dc == dc.strip().upper())
+        q = q.where(Transacao.dc == normalizar_dc(dc))
     if agencia_id:
         q = q.where(Transacao.agencia_id == agencia_id)
     if conta_id:
@@ -61,12 +116,25 @@ async def listar_decisoes(
     if mes:
         inicio, fim = bounds_do_mes(mes)
         q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
+    if valor_min is not None and valor_max is not None and valor_min > valor_max:
+        raise ValidationError(message="valor_min não pode ser maior que valor_max.")
+    # `Transacao.valor` é gravado em módulo pelo importador de extrato (o sinal
+    # do lançamento está em `dc`), então a faixa é sempre em números positivos —
+    # o contador digita "150", não "-150", para achar um débito de R$ 150,00.
+    if valor_min is not None:
+        q = q.where(Transacao.valor >= valor_min)
+    if valor_max is not None:
+        q = q.where(Transacao.valor <= valor_max)
     if termo:
-        termo_like = f"%{_escapar_ilike(termo.strip())}%"
+        # Busca com acento dobrado dos dois lados: quem digita "liquidacao"
+        # precisa achar "LIQUIDAÇÃO" no extrato, e vice-versa. Pontuação é
+        # preservada de propósito — buscar por "12.345" ou "PIX-ENVIADO" tem
+        # que continuar funcionando.
+        termo_like = f"%{_escapar_ilike(remover_acentos(termo.strip()).lower())}%"
         q = q.where(
             or_(
-                Transacao.historico.ilike(termo_like, escape="\\"),
-                Regra.descricao.ilike(termo_like, escape="\\"),
+                sem_acento(Transacao.historico).like(termo_like, escape="\\"),
+                sem_acento(Regra.descricao).like(termo_like, escape="\\"),
             )
         )
 
