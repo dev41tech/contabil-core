@@ -40,7 +40,7 @@ class RegistroContabilListResponse(BaseModel):
 
 
 class ExportJobCreate(BaseModel):
-    formato: str = Field(default="xlsx", description="csv ou xlsx")
+    formato: str = Field(default="xlsx", description="csv, xlsx ou txt")
     tipo: str = Field(
         default="lancamentos",
         description=(

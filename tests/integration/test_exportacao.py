@@ -330,6 +330,52 @@ async def test_exportar_lancamentos_importacao_em_xlsx(client, db, tenant, usuar
 
 
 @pytest.mark.asyncio
+async def test_exportar_lancamentos_importacao_em_txt(client, db, tenant, usuario, empresa):
+    """TXT usa o mesmo layout do .xlsx (mesmas colunas/valores), delimitado
+    por ';' — pedido do escritório pra importar direto no sistema deles."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "txt", "tipo": "lancamentos_importacao"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    assert r.headers["Content-Disposition"].endswith(".txt\"")
+    assert r.headers.get("X-Total-Registros") == "1"
+
+    linhas = list(
+        csv.DictReader(io.StringIO(r.content.decode("utf-8-sig")), delimiter=";")
+    )
+    assert linhas[0].keys() == {
+        "Data", "Cód. Conta Debito", "Cód. Conta Credito", "Valor",
+        "Cód. Histórico", "Complemento Histórico", "Inicia Lote",
+        "Código Matriz/Filial", "Centro de Custo Débito", "Centro de Custo Crédito",
+    }
+    linha = linhas[0]
+    assert linha["Data"] == "01/05/2024"
+    assert linha["Cód. Conta Credito"] == "4.1.1"
+    assert Decimal(linha["Valor"]) == Decimal("1200.00")
+
+
+@pytest.mark.asyncio
+async def test_exportar_txt_so_disponivel_para_lancamentos_importacao(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"formato": "txt", "tipo": "lancamentos"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_exportar_lancamentos_importacao_ignora_lancamento_sem_par(
     db, empresa, usuario
 ):

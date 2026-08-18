@@ -3,7 +3,10 @@
 Gera arquivos CSV ou XLSX de:
   - lancamentos           : registros contábeis (existente)
   - lancamentos_importacao: lançamentos no layout padrão de importação contábil
-                            (débito/crédito pareados na mesma linha)
+                            (débito/crédito pareados na mesma linha). Único tipo
+                            que também aceita TXT (mesmas colunas, delimitado
+                            por ';'), pedido pelo escritório para importar
+                            direto no sistema contábil deles.
   - extrato               : transações bancárias importadas, com os filtros da tela
   - nfe_entrada           : NF-e onde empresa é destinatária
   - nfe_saida             : NF-e onde empresa é emitente
@@ -125,12 +128,23 @@ class ExportacaoService:
             data = data.model_copy(update={"data_de": data_de, "data_ate": data_ate})
 
         fmt = data.formato
-        if fmt not in ("csv", "xlsx"):
-            raise ValidationError(message="Formato deve ser 'csv' ou 'xlsx'.")
+        if fmt not in ("csv", "xlsx", "txt"):
+            raise ValidationError(message="Formato deve ser 'csv', 'xlsx' ou 'txt'.")
 
         tipo = data.tipo or "lancamentos"
         if tipo not in _VALID_TIPOS:
             raise ValidationError(message=f"Tipo de exportação inválido: '{tipo}'.")
+
+        # .txt só existe para o layout de importação de lançamentos — é o
+        # único tipo pedido com esse formato até agora (planilha modelo
+        # fornecida pelo escritório). Os outros tipos continuam csv/xlsx.
+        if fmt == "txt" and tipo != "lancamentos_importacao":
+            raise ValidationError(
+                message=(
+                    "O formato 'txt' só está disponível para "
+                    "'lancamentos_importacao' por enquanto."
+                )
+            )
 
         if tipo == "lancamentos":
             rows, conteudo = await self._exportar_lancamentos(data, fmt)
@@ -312,6 +326,8 @@ class ExportacaoService:
 
         if fmt == "csv":
             conteudo = self._dicts_to_csv(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
+        elif fmt == "txt":
+            conteudo = self._dicts_to_txt(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
         else:
             conteudo = self._dicts_to_xlsx(
                 linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO, "Importação Lançamentos"
@@ -608,6 +624,22 @@ class ExportacaoService:
     def _dicts_to_csv(self, linhas: list[dict], colunas: list[str]) -> bytes:
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=colunas, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(
+            {chave: _celula_segura(valor) for chave, valor in linha.items()}
+            for linha in linhas
+        )
+        return buf.getvalue().encode("utf-8-sig")
+
+    def _dicts_to_txt(self, linhas: list[dict], colunas: list[str]) -> bytes:
+        """Mesmas colunas/valores do .xlsx do layout de importação, só que como
+        texto delimitado por ';' — separador padrão desse tipo de arquivo no
+        Brasil, evita ambiguidade com a vírgula decimal.
+        """
+        buf = io.StringIO()
+        w = csv.DictWriter(
+            buf, fieldnames=colunas, extrasaction="ignore", delimiter=";"
+        )
         w.writeheader()
         w.writerows(
             {chave: _celula_segura(valor) for chave, valor in linha.items()}

@@ -21,9 +21,10 @@ router = APIRouter(
 _CONTENT_TYPES = {
     "csv": "text/csv; charset=utf-8-sig",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "txt": "text/plain; charset=utf-8-sig",
 }
 
-_EXTENSIONS = {"csv": "csv", "xlsx": "xlsx"}
+_EXTENSIONS = {"csv": "csv", "xlsx": "xlsx", "txt": "txt"}
 
 
 @router.post(
