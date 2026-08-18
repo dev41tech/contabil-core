@@ -749,7 +749,7 @@ class ExportJob(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
     formato: Mapped[str] = mapped_column(
-        Enum("csv", "xlsx", name="formato_export_enum"), nullable=False
+        Enum("csv", "xlsx", "txt", name="formato_export_enum"), nullable=False
     )
     status: Mapped[str] = mapped_column(
         Enum("pendente", "processando", "concluido", "erro", name="status_job_enum"),
