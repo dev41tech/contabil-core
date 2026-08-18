@@ -5,13 +5,14 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
-from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
+from src.db.models import NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
+from src.domain.neo.consultas import listar_decisoes as _listar_decisoes
 from src.domain.neo.engine import NeoEngine
 from src.schemas.neo import (
     NeoAssociarManualRequest,
@@ -20,6 +21,7 @@ from src.schemas.neo import (
     NeoProcessarRequest,
     NeoResultado,
 )
+from src.schemas.types import Competencia
 
 router = APIRouter(
     prefix="/empresas/{empresa_id}/neo",
@@ -54,57 +56,33 @@ async def listar_decisoes(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     resultado: str | None = Query(default=None, description="associada | sem_regra | erro"),
+    termo: str | None = Query(
+        default=None, description="Busca no histórico do extrato ou na descrição da regra"
+    ),
+    estrategia: str | None = Query(
+        default=None, description="exato | substring | prefixo | manual"
+    ),
+    dc: str | None = Query(default=None, description="D (débito) ou C (crédito)"),
+    agencia_id: UUID | None = Query(default=None),
+    conta_id: UUID | None = Query(default=None, description="Conta contábil usada na regra"),
+    mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> NeoDecisaoListResponse:
-    """Lista o log de decisões do NEO para a empresa."""
-    q = select(NeoDecisao).where(NeoDecisao.empresa_id == empresa_id)
-    if resultado:
-        q = q.where(NeoDecisao.resultado == resultado)
-
-    count_q = select(func.count()).select_from(q.subquery())
-    total = (await db.execute(count_q)).scalar_one()
-
-    rows = (
-        await db.execute(
-            q.order_by(NeoDecisao.processado_em.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-        )
-    ).scalars().all()
-
-    # Collect IDs for batch fetch (avoids N+1)
-    transacao_ids = [r.transacao_id for r in rows]
-    regra_ids = [r.regra_id for r in rows if r.regra_id]
-
-    transacoes_map: dict = {}
-    if transacao_ids:
-        t_rows = (await db.execute(
-            select(Transacao).where(Transacao.id.in_(transacao_ids))
-        )).scalars().all()
-        transacoes_map = {t.id: t for t in t_rows}
-
-    regras_map: dict = {}
-    if regra_ids:
-        reg_rows = (await db.execute(
-            select(Regra).where(Regra.id.in_(regra_ids))
-        )).scalars().all()
-        regras_map = {reg.id: reg for reg in reg_rows}
-
-    items = []
-    for r in rows:
-        t = transacoes_map.get(r.transacao_id)
-        reg = regras_map.get(r.regra_id) if r.regra_id else None
-
-        item = NeoDecisaoResponse.model_validate(r)
-        item.transacao_descricao = t.historico if t else None
-        item.transacao_valor = t.valor if t else None
-        item.transacao_dc = t.dc if t else None
-        item.agencia_id = t.agencia_id if t else None
-        item.regra_descricao = reg.descricao if reg else None
-        items.append(item)
-
-    return NeoDecisaoListResponse(items=items, total=total)
+    """Lista o log de decisões do NEO para a empresa, com busca textual e filtros."""
+    return await _listar_decisoes(
+        db,
+        empresa_id,
+        termo=termo,
+        resultado=resultado,
+        estrategia=estrategia,
+        dc=dc,
+        agencia_id=agencia_id,
+        conta_id=conta_id,
+        mes=mes,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.post(

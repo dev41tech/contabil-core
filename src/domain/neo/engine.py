@@ -24,10 +24,19 @@ Ao não encontrar match:
 Idempotência:
   - Transações com status != "pendente" são ignoradas.
   - Re-executar o NEO na mesma empresa é seguro.
+
+Seleção vs. vinculação de comprovante/nota fiscal:
+  `_selecionar_*_candidato` só consulta (com lock) e nunca muta `transacao_id`;
+  `_vincular_*` faz a mutação depois que as partidas já foram criadas. A
+  separação existe para permitir que uma entrega futura resolva a
+  contraparte (CNPJ/nome do candidato) antes de decidir conta e histórico,
+  sem se arriscar a associar um documento a uma transação cujo lançamento
+  falhou no meio do caminho.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -37,9 +46,11 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.dates import bounds_do_mes
+from src.core.texto import normalizar_historico_contabil
 from src.db.models import (
     AgenciaBancaria,
     Comprovante,
+    Contraparte,
     Empresa,
     NeoDecisao,
     NotaFiscal,
@@ -56,6 +67,35 @@ logger = structlog.get_logger(__name__)
 _VALOR_TOLERANCIA = Decimal("0.01")   # diferença máxima de valor (R$)
 _DATA_TOLERANCIA_COMP = 3             # dias de tolerância para comprovantes
 _DATA_TOLERANCIA_NF = 7              # dias de tolerância para notas fiscais
+
+
+@dataclass(frozen=True)
+class ResolucaoSombra:
+    """Resultado — só leitura — de tentar resolver a contraparte de uma
+    transação já classificada por regra. Usado para medir cobertura e
+    conflito com as regras atuais antes de a Entrega 6/7 ativar isso de
+    verdade; nunca é aplicado à transação."""
+
+    contraparte_id: UUID
+    documento: str
+    origem_evidencia: str  # "nota_fiscal" | "comprovante"
+    conta_contraparte_id: UUID
+    conta_divergente: bool
+    historico_sugerido: str
+
+
+def gerar_historico_sugerido(dc: str, razao_social: str, numero_nf: str | None) -> str:
+    """Histórico no formato pedido pelos contadores (item 2 do PDF de
+    feedback): 'PGTO/RECEBIMENTO REF [NF XXX –] RAZÃO SOCIAL'.
+    """
+    prefixo = "PGTO" if dc == "D" else "RECEBIMENTO"
+    numero_nf = (numero_nf or "").strip()
+    texto = (
+        f"{prefixo} REF NF {numero_nf} - {razao_social}"
+        if numero_nf
+        else f"{prefixo} REF {razao_social}"
+    )
+    return normalizar_historico_contabil(texto)
 
 
 class NeoEngine:
@@ -92,16 +132,15 @@ class NeoEngine:
                 async with self._db.begin_nested():
                     regra, estrategia = self._encontrar_regra(transacao, regras)
                     if regra:
-                        await self._registrar_match(transacao, regra, estrategia)
-                        teve_match = True
-                        associou_comprovante = await self._tentar_associar_comprovante(
-                            transacao
+                        associou_comprovante, associou_nota = await self._registrar_match(
+                            transacao, regra, estrategia
                         )
-                        associou_nota = await self._tentar_associar_nota_fiscal(transacao)
+                        teve_match = True
                     else:
                         if transacao.id not in sem_regra_existentes:
                             await self._registrar_sem_regra(transacao)
                             sem_regra_existentes.add(transacao.id)
+                        await self._logar_resolucao_sombra_sem_regra(transacao)
                     await self._db.flush()
                 if teve_match:
                     associadas += 1
@@ -178,9 +217,28 @@ class NeoEngine:
 
     async def _registrar_match(
         self, transacao: Transacao, regra: Regra, estrategia: str
-    ) -> None:
+    ) -> tuple[bool, bool]:
+        """Cria a classificação da transação e tenta vincular comprovante/nota fiscal.
+
+        A *seleção* dos candidatos (consulta com lock, sem mutar nada) acontece
+        antes da criação das partidas — não porque a ordem de escrita importe
+        para o comportamento atual, mas para deixar disponível a informação do
+        documento (CNPJ/nome) que uma entrega futura vai usar para resolver a
+        conta/histórico por contraparte. A *vinculação* (mutação de
+        `transacao_id`) só acontece depois que as partidas já existem, como
+        sempre foi — se algo falhar antes disso, o savepoint do chamador
+        desfaz tudo e nenhum documento fica associado a uma transação sem
+        lançamento.
+        """
         historico_saida = (
             transacao.historico if regra.manter_historico else regra.descricao
+        )
+
+        comprovante_candidato = await self._selecionar_comprovante_candidato(transacao)
+        nota_candidata = await self._selecionar_nota_candidata(transacao)
+
+        await self._logar_resolucao_sombra(
+            transacao, regra, historico_saida, comprovante_candidato, nota_candidata
         )
 
         await self._registrar_partidas(
@@ -203,6 +261,183 @@ class NeoEngine:
             motivo=f"Regra '{regra.historico}' ({estrategia})",
         )
         self._db.add(decisao)
+
+        associou_comprovante = False
+        if comprovante_candidato is not None:
+            await self._vincular_comprovante(transacao, comprovante_candidato)
+            associou_comprovante = True
+
+        associou_nota = False
+        if nota_candidata is not None:
+            await self._vincular_nota(transacao, nota_candidata)
+            associou_nota = True
+
+        return associou_comprovante, associou_nota
+
+    # ── Shadow mode — resolução de contraparte (Entrega 5) ──────────────────────
+    #
+    # Calcula o que a Entrega 6/7 usaria (conta e histórico por contraparte),
+    # só para métrica — nunca substitui o que a regra decidiu nesta entrega.
+
+    async def _logar_resolucao_sombra(
+        self,
+        transacao: Transacao,
+        regra: Regra,
+        historico_regra: str,
+        comprovante_candidato: Comprovante | None,
+        nota_candidata: NotaFiscal | None,
+    ) -> None:
+        resolucao = await self._resolver_contraparte_sombra(
+            transacao, regra, comprovante_candidato, nota_candidata
+        )
+        if resolucao is None:
+            return
+
+        logger.info(
+            "neo.shadow.contraparte_encontrada",
+            transacao_id=str(transacao.id),
+            contraparte_id=str(resolucao.contraparte_id),
+            documento=resolucao.documento,
+            origem_evidencia=resolucao.origem_evidencia,
+            conta_regra_id=str(regra.conta_id),
+            conta_contraparte_id=str(resolucao.conta_contraparte_id),
+            conta_divergente=resolucao.conta_divergente,
+            historico_regra=historico_regra,
+            historico_sugerido=resolucao.historico_sugerido,
+        )
+        if resolucao.conta_divergente:
+            logger.warning(
+                "neo.shadow.conta_divergente",
+                transacao_id=str(transacao.id),
+                contraparte_id=str(resolucao.contraparte_id),
+                conta_regra_id=str(regra.conta_id),
+                conta_contraparte_id=str(resolucao.conta_contraparte_id),
+            )
+
+    async def _resolver_contraparte_sombra(
+        self,
+        transacao: Transacao,
+        regra: Regra,
+        comprovante_candidato: Comprovante | None,
+        nota_candidata: NotaFiscal | None,
+    ) -> ResolucaoSombra | None:
+        """Tenta identificar a contraparte a partir dos candidatos já
+        selecionados por `_registrar_match`, e compara a conta que ela sugere
+        com a que a regra decidiu. Não muta nada.
+        """
+        encontrado = await self._resolver_contraparte_candidata(
+            transacao, comprovante_candidato, nota_candidata
+        )
+        if encontrado is None:
+            return None
+        contraparte, origem_evidencia, numero_nf = encontrado
+
+        return ResolucaoSombra(
+            contraparte_id=contraparte.id,
+            documento=contraparte.documento,
+            origem_evidencia=origem_evidencia,
+            conta_contraparte_id=contraparte.conta_contabil_id,
+            conta_divergente=contraparte.conta_contabil_id != regra.conta_id,
+            historico_sugerido=gerar_historico_sugerido(
+                dc=transacao.dc, razao_social=contraparte.razao_social, numero_nf=numero_nf
+            ),
+        )
+
+    async def _logar_resolucao_sombra_sem_regra(self, transacao: Transacao) -> None:
+        """Mesma resolução em shadow mode, mas para transações que a regra
+        NÃO classificou. Aqui está o maior valor de medir antes de ativar: são
+        as transações que hoje exigem revisão manual — quantas delas o
+        cadastro de contrapartes já resolveria sozinho?
+
+        Não há regra pra comparar, então não existe `conta_divergente` aqui —
+        só reporta que uma classificação teria sido possível.
+        """
+        comprovante_candidato = await self._selecionar_comprovante_candidato(transacao)
+        nota_candidata = await self._selecionar_nota_candidata(transacao)
+
+        encontrado = await self._resolver_contraparte_candidata(
+            transacao, comprovante_candidato, nota_candidata
+        )
+        if encontrado is None:
+            return
+        contraparte, origem_evidencia, numero_nf = encontrado
+
+        logger.info(
+            "neo.shadow.sem_regra_resolveria",
+            transacao_id=str(transacao.id),
+            contraparte_id=str(contraparte.id),
+            documento=contraparte.documento,
+            origem_evidencia=origem_evidencia,
+            conta_sugerida_id=str(contraparte.conta_contabil_id),
+            historico_sugerido=gerar_historico_sugerido(
+                dc=transacao.dc, razao_social=contraparte.razao_social, numero_nf=numero_nf
+            ),
+        )
+
+    async def _resolver_contraparte_candidata(
+        self,
+        transacao: Transacao,
+        comprovante_candidato: Comprovante | None,
+        nota_candidata: NotaFiscal | None,
+    ) -> tuple[Contraparte, str, str | None] | None:
+        """Núcleo comum da resolução em shadow mode: acha o documento
+        (CNPJ/CPF) nos candidatos e busca a contraparte cadastrada. Não muta
+        nada e não depende de haver regra.
+
+        Ordem de evidência: nota fiscal candidata (documento do lado que é a
+        contraparte, conforme a direção financeira) primeiro, comprovante
+        candidato como fallback. Retorna `(contraparte, origem_evidencia,
+        numero_nf)` ou `None`.
+        """
+        documento: str | None = None
+        origem_evidencia: str | None = None
+        numero_nf: str | None = None
+
+        if nota_candidata is not None:
+            direcao = self._direcao_nota(nota_candidata)
+            if direcao == transacao.dc:
+                documento = (
+                    nota_candidata.cnpj_emitente
+                    if direcao == "D"
+                    else nota_candidata.cnpj_destinatario
+                )
+                origem_evidencia = "nota_fiscal"
+                numero_nf = nota_candidata.numero
+
+        if documento is None and comprovante_candidato is not None:
+            if comprovante_candidato.cpf_cnpj:
+                documento = comprovante_candidato.cpf_cnpj
+                origem_evidencia = "comprovante"
+
+        if documento is None:
+            return None
+
+        digitos = self._somente_digitos(documento)
+        if not digitos:
+            return None
+
+        contraparte = await self._buscar_contraparte_por_documento(digitos)
+        if contraparte is None:
+            logger.debug(
+                "neo.shadow.contraparte_nao_encontrada",
+                transacao_id=str(transacao.id),
+                documento=digitos,
+                origem_evidencia=origem_evidencia,
+            )
+            return None
+
+        return contraparte, origem_evidencia, numero_nf
+
+    async def _buscar_contraparte_por_documento(self, documento: str) -> Contraparte | None:
+        result = await self._db.execute(
+            select(Contraparte).where(
+                Contraparte.empresa_id == self._empresa_id,
+                Contraparte.documento == documento,
+                Contraparte.ativa == True,
+                Contraparte.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def registrar_partidas_manuais(
         self, transacao: Transacao, conta_id: UUID, descricao: str
@@ -228,12 +463,13 @@ class NeoEngine:
     ) -> None:
         conta_bancaria = await self._obter_conta_bancaria(transacao.agencia_id)
         lancamento_id = uuid4()
+        descricao_exibicao = normalizar_historico_contabil(descricao)
         dados_comuns = {
             "empresa_id": self._empresa_id,
             "transacao_id": transacao.id,
             "lancamento_id": lancamento_id,
             "agencia_id": transacao.agencia_id,
-            "historico": historico,
+            "historico": normalizar_historico_contabil(historico),
             "historico_extrato": transacao.historico,
             "tipo_regra": tipo_regra,
             "valor": transacao.valor,
@@ -243,7 +479,7 @@ class NeoEngine:
             RegistroContabil(
                 **dados_comuns,
                 conta_id=conta_id,
-                descricao=descricao,
+                descricao=descricao_exibicao,
                 dc=dc,
             )
         )
@@ -251,7 +487,9 @@ class NeoEngine:
             RegistroContabil(
                 **dados_comuns,
                 conta_id=conta_bancaria.id,
-                descricao=f"Contrapartida bancária: {descricao}",
+                descricao=normalizar_historico_contabil(
+                    f"Contrapartida bancária: {descricao}"
+                ),
                 dc="C" if dc == "D" else "D",
             )
         )
@@ -335,8 +573,10 @@ class NeoEngine:
 
     # ── Auto-associação de comprovantes (Task 5) ───────────────────────────────
 
-    async def _tentar_associar_comprovante(self, transacao: Transacao) -> bool:
-        """Vincula automaticamente um comprovante à transação por valor e data.
+    async def _selecionar_comprovante_candidato(
+        self, transacao: Transacao
+    ) -> Comprovante | None:
+        """Localiza — sem associar — um comprovante candidato à transação.
 
         Critérios:
           - Mesmo empresa_id
@@ -345,11 +585,12 @@ class NeoEngine:
           - |valor_pago - transacao.valor| <= R$ 0,01
           - |data_pagamento - transacao.data| <= 3 dias
 
-        Só associa se houver EXATAMENTE 1 match (evita falso positivos).
-        Retorna True se associou, False caso contrário.
+        Só retorna candidato se houver EXATAMENTE 1 match (evita falsos
+        positivos). Não muta nada — quem chama decide se e quando vincular
+        via `_vincular_comprovante`.
         """
         if transacao.dc != "D":
-            return False
+            return None
 
         try:
             data_min = transacao.data - timedelta(days=_DATA_TOLERANCIA_COMP)
@@ -378,29 +619,40 @@ class NeoEngine:
 
             if len(matches) != 1:
                 # 0 = não encontrou; 2+ = ambíguo; ambos são descartados
-                return False
-
-            matches[0].transacao_id = transacao.id
-            self._comprovantes_consumidos.add(matches[0].id)
-            logger.info(
-                "neo.comprovante_associado",
-                comprovante_id=str(matches[0].id),
-                transacao_id=str(transacao.id),
-            )
-            return True
+                return None
+            return matches[0]
 
         except Exception as exc:
             logger.warning(
-                "neo.auto_comprovante.erro",
+                "neo.selecionar_comprovante.erro",
                 transacao_id=str(transacao.id),
                 erro=str(exc),
             )
+            return None
+
+    async def _vincular_comprovante(
+        self, transacao: Transacao, comprovante: Comprovante
+    ) -> None:
+        comprovante.transacao_id = transacao.id
+        self._comprovantes_consumidos.add(comprovante.id)
+        logger.info(
+            "neo.comprovante_associado",
+            comprovante_id=str(comprovante.id),
+            transacao_id=str(transacao.id),
+        )
+
+    async def _tentar_associar_comprovante(self, transacao: Transacao) -> bool:
+        """Seleciona e vincula um comprovante candidato, se houver exatamente um."""
+        candidato = await self._selecionar_comprovante_candidato(transacao)
+        if candidato is None:
             return False
+        await self._vincular_comprovante(transacao, candidato)
+        return True
 
     # ── Auto-associação de notas fiscais (Task 6) ─────────────────────────────
 
-    async def _tentar_associar_nota_fiscal(self, transacao: Transacao) -> bool:
-        """Vincula automaticamente uma nota fiscal à transação por valor e data.
+    async def _selecionar_nota_candidata(self, transacao: Transacao) -> NotaFiscal | None:
+        """Localiza — sem associar — uma nota fiscal candidata à transação.
 
         Critérios:
           - Mesmo empresa_id
@@ -410,8 +662,8 @@ class NeoEngine:
           - |valor - transacao.valor| <= R$ 0,01
           - |data_emissao - transacao.data| <= 7 dias
 
-        Só associa se houver EXATAMENTE 1 match.
-        Retorna True se associou, False caso contrário.
+        Só retorna candidata se houver EXATAMENTE 1 match. Não muta nada —
+        quem chama decide se e quando vincular via `_vincular_nota`.
         """
         try:
             data_min = transacao.data - timedelta(days=_DATA_TOLERANCIA_NF)
@@ -440,21 +692,30 @@ class NeoEngine:
             ]
 
             if len(matches) != 1:
-                return False
-
-            matches[0].transacao_id = transacao.id
-            matches[0].status = "associada"
-            self._notas_consumidas.add(matches[0].id)
-            logger.info(
-                "neo.nota_associada",
-                nota_id=str(matches[0].id),
-                transacao_id=str(transacao.id),
-            )
-            return True
+                return None
+            return matches[0]
 
         except Exception as exc:
-            logger.warning("neo.auto_nota.erro", transacao_id=str(transacao.id), erro=str(exc))
+            logger.warning(
+                "neo.selecionar_nota.erro", transacao_id=str(transacao.id), erro=str(exc)
+            )
+            return None
+
+    async def _vincular_nota(self, transacao: Transacao, nota: NotaFiscal) -> None:
+        nota.transacao_id = transacao.id
+        nota.status = "associada"
+        self._notas_consumidas.add(nota.id)
+        logger.info(
+            "neo.nota_associada", nota_id=str(nota.id), transacao_id=str(transacao.id)
+        )
+
+    async def _tentar_associar_nota_fiscal(self, transacao: Transacao) -> bool:
+        """Seleciona e vincula uma nota fiscal candidata, se houver exatamente uma."""
+        candidata = await self._selecionar_nota_candidata(transacao)
+        if candidata is None:
             return False
+        await self._vincular_nota(transacao, candidata)
+        return True
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
