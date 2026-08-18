@@ -3,7 +3,12 @@
 Regras de negócio:
 - Unicidade por (empresa_id, agencia_id, historico) — mesmo texto de extrato
   em contas diferentes é permitido, mas na mesma agência não.
-- Historico não é case-sensitive na busca (NEO usa lower), mas é salvo como digitado.
+- Historico é salvo exatamente como digitado. Para *unicidade* ele é comparado
+  em `historico_normalizado` (strip + lower). Para *matching* o NEO usa uma
+  forma canônica mais tolerante — sem acento e sem pontuação, ver
+  `src.core.texto.normalizar_para_match`. A diferença é deliberada:
+  afrouxar a unicidade invalidaria regras que já existem no banco, enquanto
+  afrouxar o matching é justamente o que o escritório pediu.
 - Desativar é preferível a deletar — regra inativa não é aplicada pelo NEO.
 - Conta e agência precisam existir e pertencer à empresa.
 """

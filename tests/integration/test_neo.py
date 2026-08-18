@@ -1255,3 +1255,296 @@ async def test_neo_sem_csrf_rejeita(client, tenant, usuario, empresa):
     await _login(client, tenant, usuario)
     r = await client.post(_processar_url(empresa.id), json={})
     assert r.status_code == 403
+
+
+# ── Matching tolerante a variações do histórico bancário ─────────────────────
+#
+# Reportado pelo escritório (2026-08-18): uma regra "TARIFA" não pegava
+# "TARIFA COM LIQUIDAÇÃO" nem "TARIFA COM R LIQUIDAÇÃO", obrigando a cadastrar
+# uma regra por variação de texto do banco.
+
+_OFX_TARIFAS = """\
+OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20240301
+<TRNAMT>-12.50
+<FITID>TARIFA_1
+<MEMO>TARIFA COM LIQUIDAÇÃO
+</STMTTRN>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20240301
+<TRNAMT>-9.90
+<FITID>TARIFA_2
+<MEMO>Tarifa com R liquidacao
+</STMTTRN>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20240302
+<TRNAMT>-4.20
+<FITID>TARIFA_3
+<MEMO>TARIFA/PACOTE DE SERVICOS
+</STMTTRN>
+</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
+"""
+
+
+async def _setup_tarifas(client, db, empresa, csrf):
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "ITAU", "agencia": "0009", "numero": "99999"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.9", descricao="Tarifas Bancárias", tipo="despesa"
+    )
+    db.add(conta)
+    await db.flush()
+
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importar?agencia_id={agencia['id']}",
+        files={"arquivo": ("t.ofx", io.BytesIO(_OFX_TARIFAS.encode()), "application/octet-stream")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 201
+    return agencia["id"], str(conta.id)
+
+
+@pytest.mark.asyncio
+async def test_uma_regra_por_palavra_chave_cobre_todas_as_variacoes(
+    client, db, tenant, usuario, empresa
+):
+    """Uma regra "TARIFA" classifica as três variações que o banco escreve.
+
+    É o caso exato relatado: com acento, sem acento, com palavra extra no meio
+    e com barra separando — tudo com uma única regra cadastrada.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA", "D", csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+    assert r.json()["associadas"] == 3
+    assert r.json()["sem_regra"] == 0
+
+
+@pytest.mark.asyncio
+async def test_regra_com_acento_casa_historico_sem_acento(client, db, tenant, usuario, empresa):
+    """A regra é digitada com acento e o extrato vem sem — e vice-versa."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDAÇÃO", "D", csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    decisoes = (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
+    ).json()["items"]
+    historicos = {d["transacao_descricao"] for d in decisoes}
+    assert "TARIFA COM LIQUIDAÇÃO" in historicos
+
+
+@pytest.mark.asyncio
+async def test_palavra_extra_no_meio_do_historico_ainda_casa(
+    client, db, tenant, usuario, empresa
+):
+    """A regra "TARIFA COM LIQUIDACAO" pega "Tarifa com R liquidacao".
+
+    O "R" que o banco enfia no meio quebrava substring e prefixo — era o que
+    obrigava a cadastrar uma regra por variação.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDACAO", "D", csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    decisoes = (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
+    ).json()["items"]
+    por_historico = {d["transacao_descricao"]: d for d in decisoes}
+    assert "Tarifa com R liquidacao" in por_historico
+    assert por_historico["Tarifa com R liquidacao"]["estrategia"] == "todas_palavras"
+
+
+@pytest.mark.asyncio
+async def test_todas_palavras_nao_atropela_regra_mais_especifica(
+    client, db, tenant, usuario, empresa
+):
+    """A estratégia nova é a última da fila: quem casa exato continua vencendo."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_generica = await _setup_tarifas(client, db, empresa, csrf)
+
+    conta_especifica = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.10", descricao="Pacote de Serviços", tipo="despesa"
+    )
+    db.add(conta_especifica)
+    await db.flush()
+
+    generica = await _criar_regra(
+        client, empresa, agencia_id, conta_generica, "TARIFA", "D", csrf
+    )
+    especifica = await _criar_regra(
+        client, empresa, agencia_id, str(conta_especifica.id), "TARIFA PACOTE", "D", csrf
+    )
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 200
+
+    decisoes = (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
+    ).json()["items"]
+    pacote = [d for d in decisoes if d["transacao_descricao"] == "TARIFA/PACOTE DE SERVICOS"]
+    assert len(pacote) == 1
+    assert pacote[0]["regra_id"] == especifica["id"]
+    assert pacote[0]["regra_id"] != generica["id"]
+
+
+# ── Decisão "sem regra" órfã ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_transacao_classificada_depois_sai_da_lista_sem_regra(
+    client, db, tenant, usuario, empresa
+):
+    """O caso do "Erro ao associar" relatado pelo escritório.
+
+    Rodada 1 sem regra → a transação entra em "Sem Regra". A regra é criada e o
+    NEO roda de novo → a decisão antiga precisa ser *encerrada*, não duplicada.
+    Antes, a linha 'sem_regra' ficava para trás e a tela continuava oferecendo
+    associar uma transação já contabilizada.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.json()["sem_regra"] == 3
+
+    sem_regra = (await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")).json()
+    assert sem_regra["total"] == 3
+
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA", "D", csrf)
+    r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    assert r.json()["associadas"] == 3
+
+    sem_regra = (await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")).json()
+    assert sem_regra["total"] == 0, "decisão 'sem_regra' ficou órfã depois da classificação"
+
+    associadas = (await client.get(_decisoes_url(empresa.id) + "?resultado=associada")).json()
+    assert associadas["total"] == 3, "a decisão foi duplicada em vez de encerrada"
+
+
+@pytest.mark.asyncio
+async def test_associar_manual_em_transacao_ja_contabilizada_limpa_residuo(
+    client, db, tenant, usuario, empresa
+):
+    """Listagem velha em mãos: a rota responde 409 com mensagem que diz o que
+    houve, em vez do 422 genérico "não está mais pendente"."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    decisao_id = (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")
+    ).json()["items"][0]["id"]
+
+    # Simula a tela desatualizada: a transação foi contabilizada depois que a
+    # listagem carregou.
+    decisao = (
+        await db.execute(select(NeoDecisao).where(NeoDecisao.id == UUID(decisao_id)))
+    ).scalar_one()
+    transacao = (
+        await db.execute(select(Transacao).where(Transacao.id == decisao.transacao_id))
+    ).scalar_one()
+    transacao.status = "processada"
+    await db.flush()
+
+    r = await client.post(
+        _decisoes_url(empresa.id) + f"/{decisao_id}/associar-manual",
+        json={"conta_id": conta_id, "descricao": "Tarifa bancária"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 409
+    assert "já foi contabilizada" in r.json()["message"]
+
+
+# ── Filtros da tela de busca do NEO ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_filtro_dc_aceita_palavra_por_extenso(client, db, tenant, usuario, empresa):
+    """O front manda "débito"/"crédito" em alguns pontos — antes virava lista vazia."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    por_letra = (await client.get(_decisoes_url(empresa.id) + "?dc=D")).json()
+    assert por_letra["total"] > 0
+    for variacao in ("debito", "Débito", "DEBITOS", "d"):
+        r = await client.get(_decisoes_url(empresa.id) + f"?dc={variacao}")
+        assert r.status_code == 200, variacao
+        assert r.json()["total"] == por_letra["total"], variacao
+
+
+@pytest.mark.asyncio
+async def test_filtro_dc_invalido_responde_422(client, tenant, usuario, empresa):
+    """Filtro errado precisa doer, não devolver lista vazia em silêncio."""
+    await _login(client, tenant, usuario)
+    r = await client.get(_decisoes_url(empresa.id) + "?dc=ambos")
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_filtro_resultado_e_estrategia_invalidos_respondem_422(
+    client, tenant, usuario, empresa
+):
+    await _login(client, tenant, usuario)
+    assert (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=pendente")
+    ).status_code == 422
+    assert (
+        await client.get(_decisoes_url(empresa.id) + "?estrategia=fuzzy")
+    ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_filtro_por_faixa_de_valor(client, db, tenant, usuario, empresa):
+    """O extrato de teste tem 5000,00 (C), 200,00 (D) e 100,00 (C)."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_base(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    assert (await client.get(_decisoes_url(empresa.id))).json()["total"] == 3
+    assert (await client.get(_decisoes_url(empresa.id) + "?valor_min=150")).json()["total"] == 2
+    assert (await client.get(_decisoes_url(empresa.id) + "?valor_max=150")).json()["total"] == 1
+    faixa = await client.get(_decisoes_url(empresa.id) + "?valor_min=150&valor_max=1000")
+    assert faixa.json()["total"] == 1
+
+    invertida = await client.get(_decisoes_url(empresa.id) + "?valor_min=900&valor_max=100")
+    assert invertida.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_busca_por_termo_ignora_acento(client, db, tenant, usuario, empresa):
+    """Quem digita "liquidacao" tem que achar "TARIFA COM LIQUIDAÇÃO" no extrato."""
+    csrf = await _login(client, tenant, usuario)
+    await _setup_tarifas(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    sem_acento = (await client.get(_decisoes_url(empresa.id) + "?termo=liquidacao")).json()
+    com_acento = (await client.get(_decisoes_url(empresa.id) + "?termo=LIQUIDAÇÃO")).json()
+    assert sem_acento["total"] == 2
+    assert com_acento["total"] == 2

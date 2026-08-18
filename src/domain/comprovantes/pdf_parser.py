@@ -174,8 +174,24 @@ _ROTULO_DOCUMENTO = re.compile(r"cpf\s*/\s*cnpj|cnpj\s*/\s*cpf|\bcpf\b|\bcnpj\b"
 _ROTULO_VALOR_DOCUMENTO = re.compile(
     r"valor\s+(?:do\s+)?documento|valor\s+nominal|valor\s+de\s+face", re.IGNORECASE
 )
+# Cobre o vocabulário dos apps de banco além do boleto clássico: PIX ("Valor
+# do Pix", "Valor enviado"), TED/DOC ("Valor da transferência") e o caso mais
+# comum de todos — a linha com a palavra "Valor" sozinha e o número na linha
+# de baixo, que a versão anterior só reconhecia se viesse com dois-pontos.
 _ROTULO_VALOR_PAGO = re.compile(
-    r"valor\s+(?:total\s+)?pago|valor\s+da\s+transa[cç][aã]o|valor\s+total\b|^valor\s*:",
+    r"valor\s+(?:total\s+)?pago"
+    r"|valor\s+da\s+transa[cç][aã]o"
+    r"|valor\s+da\s+transfer[eê]ncia"
+    r"|valor\s+do\s+(?:pix|documento\s+pago)"
+    r"|valor\s+(?:enviado|recebido|debitado|creditado|cobrado)"
+    r"|valor\s+a\s+pagar"
+    r"|total\s+pago"
+    r"|valor\s+total\b"
+    # "Valor" isolado na linha (número vem na linha seguinte) ou com
+    # dois-pontos. Deliberadamente NÃO é `^valor\b`: isso capturaria
+    # "Valor do IOF" e "Valor da tarifa" e gravaria a taxa como valor pago.
+    r"|^valor\s*[:\-]?\s*$"
+    r"|^valor\s*:",
     re.IGNORECASE,
 )
 _ROTULO_DATA_PAGAMENTO = re.compile(
@@ -431,6 +447,28 @@ def _parse_por_vision_pdf(conteudo_bytes: bytes, budget: _PDFBudget) -> Comprova
     return None
 
 
+def _dica_camadas_ia() -> str:
+    """Complemento da mensagem de erro quando as camadas de IA estão fora.
+
+    Sem isto, um comprovante que a camada de regex não cobre falha com a mesma
+    mensagem tanto quando a IA tentou e não achou quanto quando a IA nunca foi
+    chamada — e o escritório não tem como saber que o que falta é configuração
+    (`OPENAI_API_KEY` / `ALLOW_FINANCIAL_DATA_TO_OPENAI`), não o arquivo.
+    """
+    settings = get_settings()
+    if not settings.openai_enabled:
+        return (
+            " (a leitura assistida por IA está desligada neste ambiente: "
+            "OPENAI_API_KEY não configurada)"
+        )
+    if not settings.allow_financial_data_to_openai:
+        return (
+            " (a leitura assistida por IA está desligada neste ambiente: "
+            "ALLOW_FINANCIAL_DATA_TO_OPENAI=false)"
+        )
+    return ""
+
+
 def parse_imagem(conteudo_bytes: bytes, content_type: str = "image/png") -> ComprovantePDF:
     """Extrai os dados de um comprovante a partir de uma imagem (PNG/JPG).
 
@@ -451,7 +489,7 @@ def parse_imagem(conteudo_bytes: bytes, content_type: str = "image/png") -> Comp
     if resultado is None or resultado.valor_pago is None:
         raise PDFParseError(
             "Não foi possível identificar o valor pago nesta imagem. "
-            "Preencha os campos manualmente."
+            "Preencha os campos manualmente." + _dica_camadas_ia()
         )
     return resultado
 
@@ -524,7 +562,7 @@ def parse_pdf(conteudo_bytes: bytes) -> ComprovantePDF:
             return resultado_vision
         raise PDFParseError(
             "Não foi possível identificar o valor pago neste comprovante escaneado. "
-            "Preencha os campos manualmente."
+            "Preencha os campos manualmente." + _dica_camadas_ia()
         )
 
     resultado = _parse_por_regex(linhas)
@@ -542,5 +580,5 @@ def parse_pdf(conteudo_bytes: bytes) -> ComprovantePDF:
 
     raise PDFParseError(
         "Não foi possível identificar o valor pago neste comprovante. "
-        "Preencha os campos manualmente."
+        "Preencha os campos manualmente." + _dica_camadas_ia()
     )
