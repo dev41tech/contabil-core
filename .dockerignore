@@ -5,7 +5,9 @@ __pycache__
 .pytest_cache
 .mypy_cache
 .ruff_cache
-.git
+# .git NÃO está aqui de propósito: o Dockerfile lê .git/ pra resolver o
+# commit (scripts/resolve_git_commit.py) e remove antes de terminar a imagem
+# final — ver Dockerfile. Se excluir aqui, o build sempre reporta "unknown".
 .gitignore
 *.md
 .env

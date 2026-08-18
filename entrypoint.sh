@@ -3,6 +3,16 @@ set -e
 
 echo "=== Contabil Core — startup ==="
 
+# ── Commit exposto em /api/health ────────────────────────────────────────────
+# Se o pipeline de deploy passou --build-arg GIT_COMMIT explícito, $GIT_COMMIT
+# já vem preenchido do Dockerfile e este bloco não faz nada. Senão, usa o
+# valor resolvido automaticamente na hora do build (Dockerfile +
+# scripts/resolve_git_commit.py) a partir do .git/ do próprio contexto.
+if [ "$GIT_COMMIT" = "unknown" ] && [ -f "$GIT_COMMIT_FALLBACK_FILE" ]; then
+  export GIT_COMMIT="$(cat "$GIT_COMMIT_FALLBACK_FILE")"
+fi
+echo "Commit: ${GIT_COMMIT:-unknown}"
+
 # ── Aguarda o PostgreSQL ──────────────────────────────────────────────────────
 # Usa um script Python separado para evitar problemas de quoting + set -e no until
 echo "Aguardando banco de dados..."

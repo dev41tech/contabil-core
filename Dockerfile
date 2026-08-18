@@ -32,9 +32,20 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . .
 
 # SHA do commit desta imagem — exposto em GET /api/health e /api/health/live.
-# Build: docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) .
+# Prioridade: --build-arg GIT_COMMIT explícito (se o pipeline passar) senão
+# resolvido automaticamente aqui a partir do próprio .git/ do build context —
+# o pipeline de deploy em uso não estava passando o build-arg, então isso
+# sempre respondia "unknown". .git/ é removido antes do fim da imagem: entra
+# só pra essa leitura, não fica na imagem final.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
+RUN if [ "$GIT_COMMIT" = "unknown" ]; then \
+        python scripts/resolve_git_commit.py > /app/.git_commit 2>/dev/null || echo unknown > /app/.git_commit; \
+    else \
+        echo "$GIT_COMMIT" > /app/.git_commit; \
+    fi \
+ && rm -rf .git
+ENV GIT_COMMIT_FALLBACK_FILE=/app/.git_commit
 
 # Entrypoint com permissão de execução
 RUN chmod +x entrypoint.sh
