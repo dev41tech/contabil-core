@@ -7,7 +7,11 @@ import io
 import pytest
 from httpx import AsyncClient
 
-from src.db.models import Empresa, Tenant, Usuario
+from decimal import Decimal
+
+from sqlalchemy import select
+
+from src.db.models import Empresa, Tenant, Transacao, Usuario
 
 # OFX 1.x mínimo para testes
 _OFX_VALIDO = """\
@@ -218,3 +222,82 @@ async def test_obter_transacao_inexistente(client, tenant, usuario, empresa):
     await _login(client, tenant, usuario)
     r = await client.get(f"/api/v1/empresas/{empresa.id}/extrato/{uuid.uuid4()}")
     assert r.status_code == 404
+
+
+# ── Valor não confiável não entra no banco ───────────────────────────────────
+#
+# Reproduz o caso real da SINCOPEÇAS (agosto/2026): extrato em PDF caiu na
+# camada de IA do parser, que devolveu a linha inteira como descrição e
+# capturou a coluna de saldo no lugar do valor. Vinte e nove transações
+# gravadas com o saldo da conta — uma tarifa de R$ 1,19 virou R$ 54.881,83 a
+# crédito. Aqui o vetor é OFX porque o teste não precisa do parser de PDF para
+# provar a barreira: o que importa é que a transação não seja persistida.
+
+_OFX_LINHA_CRUA = """\
+OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
+<STMTTRN>
+<TRNTYPE>CREDIT
+<DTPOSTED>20260218
+<TRNAMT>54881.83
+<FITID>TX_SALDO_COMO_VALOR
+<MEMO>18/02/2026 TARIFA COM R LIQUIDACAO COB000001 -1,19 -54.881,83
+</STMTTRN>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>20260219
+<TRNAMT>-350.00
+<FITID>TX_LIMPA
+<MEMO>PIX ENVIADO MARIA SILVA
+</STMTTRN>
+</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
+"""
+
+
+@pytest.mark.asyncio
+async def test_transacao_com_saldo_no_lugar_do_valor_nao_e_importada(
+    client, db, tenant, usuario, empresa
+):
+    """A linha ruim é recusada e a boa passa — recusar o arquivo inteiro por
+    causa de uma linha seria pior, porque quebra a importação de extratos que
+    são majoritariamente válidos.
+
+    A transação errada não pode chegar ao banco: valor errado entra em
+    silêncio e contamina o razão, enquanto a linha faltando aparece na
+    conciliação e pode ser corrigida à mão.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    r = await _importar(client, empresa, agencia["id"], csrf, conteudo=_OFX_LINHA_CRUA)
+    assert r.status_code == 201
+    body = r.json()
+
+    assert body["importadas"] == 1
+    assert body["rejeitadas"] == 1
+    assert len(body["motivos_rejeicao"]) == 1
+    # A mensagem diz qual era o valor certo: é o que permite lançar à mão sem
+    # reabrir o PDF do extrato.
+    assert "R$ 1,19" in body["motivos_rejeicao"][0]
+
+    persistidas = (
+        await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+    ).scalars().all()
+    assert [t.historico for t in persistidas] == ["PIX ENVIADO MARIA SILVA"]
+    assert all(t.valor != Decimal("54881.83") for t in persistidas)
+
+
+@pytest.mark.asyncio
+async def test_extrato_normal_nao_ganha_rejeicao(client, tenant, usuario, empresa):
+    """A barreira não pode cobrar pedágio de quem está certo: extrato bem
+    parseado tem descrição limpa e não entra na checagem."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    body = (await _importar(client, empresa, agencia["id"], csrf)).json()
+
+    assert body["importadas"] == 2
+    assert body["rejeitadas"] == 0
+    assert body["motivos_rejeicao"] == []
