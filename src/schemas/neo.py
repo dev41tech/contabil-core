@@ -62,6 +62,30 @@ class NeoDecisaoListResponse(BaseModel):
     page_size: int
 
 
+class NeoPendenciaGrupoResponse(BaseModel):
+    padrao: str
+    rotulo: str
+    dc: str
+    quantidade: int
+    valor_total: Decimal
+    data_inicio: datetime
+    data_fim: datetime
+    agencia_ids: list[UUID]
+    amostras: list[str]
+    transacao_ids: list[UUID]
+
+
+class NeoPendenciasAgrupadasResponse(BaseModel):
+    grupos: list[NeoPendenciaGrupoResponse]
+    total_pendentes: int
+    total_agrupadas: int
+    total_grupos: int
+    # True quando havia mais pendências do que o teto de varredura: os grupos
+    # descrevem só a fatia mais antiga. A tela precisa dizer isso ao contador
+    # em vez de deixá-lo achar que está vendo tudo.
+    parcial: bool = False
+
+
 class NeoAssociarManualRequest(BaseModel):
     conta_id: UUID
     descricao: str = Field(..., min_length=2, max_length=500)

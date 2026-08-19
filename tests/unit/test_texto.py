@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.core.texto import (
+    chave_agrupamento_historico,
     normalizar_historico_contabil,
     normalizar_para_match,
     remover_acentos,
@@ -69,3 +70,20 @@ def test_tokens_para_match():
         "liquidacao",
     ]
     assert tokens_para_match("   ") == []
+
+
+@pytest.mark.parametrize(
+    ("historico", "tokens", "esperado"),
+    [
+        ("TARIFA COM LIQUIDAÇÃO", 3, "tarifa com liquidacao"),
+        ("Tarifa com R liquidacao", 3, "tarifa com liquidacao"),
+        ("TARIFA/PACOTE DE SERVICOS", 3, "tarifa pacote de"),
+        ("DOC 12345 2026 X", 3, "doc"),
+        ("12345 R X", 3, "(sem texto)"),
+    ],
+)
+def test_chave_agrupamento_descarta_ruido_variavel(
+    historico: str, tokens: int, esperado: str
+):
+    """Números e letras soltas não podem separar históricos contabilmente iguais."""
+    assert chave_agrupamento_historico(historico, tokens) == esperado

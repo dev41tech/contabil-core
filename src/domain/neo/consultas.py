@@ -10,6 +10,9 @@ mas não a proveniência completa da contraparte.
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -19,12 +22,22 @@ from sqlalchemy.orm import contains_eager
 
 from src.core.dates import bounds_do_mes
 from src.core.errors import ValidationError
-from src.core.texto import normalizar_para_match, remover_acentos
+from src.core.texto import (
+    chave_agrupamento_historico,
+    normalizar_para_match,
+    remover_acentos,
+)
 from src.db.functions import sem_acento
 from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
-from src.schemas.neo import NeoDecisaoListResponse, NeoDecisaoResponse
+from src.schemas.neo import (
+    NeoDecisaoListResponse,
+    NeoDecisaoResponse,
+    NeoPendenciaGrupoResponse,
+    NeoPendenciasAgrupadasResponse,
+)
 
 RESULTADOS_VALIDOS = ("associada", "sem_regra", "erro")
+TETO_PENDENCIAS_AGRUPAMENTO = 10_000
 ESTRATEGIAS_VALIDAS = (
     "exato",
     "substring",
@@ -187,3 +200,138 @@ async def listar_decisoes(
 def _escapar_ilike(termo: str) -> str:
     """Escapa `%`/`_`/barra para que o termo digitado não vire wildcard SQL."""
     return termo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+@dataclass
+class _GrupoPendente:
+    """Acumula um grupo sem transformar o histórico bruto usado na exibição."""
+
+    padrao: str
+    dc: str
+    quantidade: int = 0
+    valor_total: Decimal = Decimal("0")
+    data_inicio: datetime | None = None
+    data_fim: datetime | None = None
+    agencia_ids: set[UUID] = field(default_factory=set)
+    historicos: Counter[str] = field(default_factory=Counter)
+    transacao_ids: list[UUID] = field(default_factory=list)
+
+    def adicionar(self, transacao: Transacao) -> None:
+        self.quantidade += 1
+        self.valor_total += transacao.valor
+        self.data_inicio = (
+            transacao.data
+            if self.data_inicio is None
+            else min(self.data_inicio, transacao.data)
+        )
+        self.data_fim = (
+            transacao.data
+            if self.data_fim is None
+            else max(self.data_fim, transacao.data)
+        )
+        self.agencia_ids.add(transacao.agencia_id)
+        self.historicos[transacao.historico] += 1
+        self.transacao_ids.append(transacao.id)
+
+    def resposta(self) -> NeoPendenciaGrupoResponse:
+        # Frequência aproxima o texto que o contador mais viu. O desempate
+        # lexical torna rótulo e amostras estáveis mesmo que o banco mude a
+        # ordem física das linhas entre duas chamadas.
+        historicos_ordenados = sorted(
+            self.historicos, key=lambda texto: (-self.historicos[texto], texto)
+        )
+        assert self.data_inicio is not None and self.data_fim is not None
+        return NeoPendenciaGrupoResponse(
+            padrao=self.padrao,
+            rotulo=historicos_ordenados[0],
+            dc=self.dc,
+            quantidade=self.quantidade,
+            valor_total=self.valor_total,
+            data_inicio=self.data_inicio,
+            data_fim=self.data_fim,
+            agencia_ids=sorted(self.agencia_ids, key=str),
+            amostras=historicos_ordenados[:5],
+            transacao_ids=self.transacao_ids,
+        )
+
+
+async def agrupar_pendencias(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    agencia_id: UUID | None = None,
+    mes: str | None = None,
+    tokens: int = 3,
+    limite_grupos: int = 50,
+) -> NeoPendenciasAgrupadasResponse:
+    """Agrupa a fila real de pendências do NEO por padrão textual e lado D/C.
+
+    A consulta carrega no máximo 10.000 transações. Acima disso, exige que a
+    tela restrinja agência ou competência: truncar silenciosamente faria
+    `total_grupos` mentir, enquanto carregar uma fila sem limite tornaria uma
+    rota de leitura capaz de consumir memória sem controle.
+
+    Agência não participa da chave deliberadamente. Uma regra pertence a uma
+    agência, mas fragmentar aqui esconderia que o mesmo padrão ocorre em várias
+    contas; `agencia_ids` permite à tela avisar quantas regras serão necessárias.
+    `dc`, ao contrário, participa porque uma única regra nunca cobre os dois lados.
+    """
+    filtros = [
+        NeoDecisao.empresa_id == empresa_id,
+        NeoDecisao.resultado == "sem_regra",
+        Transacao.status == "pendente",
+    ]
+    if agencia_id:
+        filtros.append(Transacao.agencia_id == agencia_id)
+    if mes:
+        inicio, fim = bounds_do_mes(mes)
+        filtros.extend((Transacao.data >= inicio, Transacao.data <= fim))
+
+    base = (
+        select(Transacao)
+        .join(NeoDecisao, NeoDecisao.transacao_id == Transacao.id)
+        .where(*filtros)
+    )
+    total_pendentes = (
+        await db.execute(select(func.count()).select_from(base.subquery()))
+    ).scalar_one()
+    # Acima do teto a varredura é truncada, não recusada. Recusar deixaria a
+    # tela sem nada justamente no pior momento — logo após importar um ano de
+    # extrato, quando ainda não existe regra nenhuma e tudo está pendente. O
+    # `total_pendentes` vem de um COUNT sobre o conjunto inteiro, então os
+    # números continuam honestos: `parcial` avisa que os grupos descrevem só
+    # uma fatia.
+    parcial = total_pendentes > TETO_PENDENCIAS_AGRUPAMENTO
+
+    transacoes = (
+        await db.execute(
+            base.order_by(Transacao.data.asc(), Transacao.id.asc()).limit(
+                TETO_PENDENCIAS_AGRUPAMENTO
+            )
+        )
+    ).scalars().all()
+
+    acumulados: dict[tuple[str, str], _GrupoPendente] = {}
+    for transacao in transacoes:
+        padrao = chave_agrupamento_historico(transacao.historico, tokens)
+        chave = (padrao, transacao.dc)
+        grupo = acumulados.setdefault(chave, _GrupoPendente(padrao, transacao.dc))
+        grupo.adicionar(transacao)
+
+    grupos = [grupo.resposta() for grupo in acumulados.values()]
+    grupos.sort(
+        key=lambda grupo: (
+            -grupo.quantidade,
+            -grupo.valor_total,
+            grupo.padrao,
+            grupo.dc,
+        )
+    )
+    devolvidos = grupos[:limite_grupos]
+    return NeoPendenciasAgrupadasResponse(
+        grupos=devolvidos,
+        total_pendentes=total_pendentes,
+        total_agrupadas=sum(grupo.quantidade for grupo in devolvidos),
+        total_grupos=len(grupos),
+        parcial=parcial,
+    )
