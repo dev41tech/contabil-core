@@ -29,6 +29,12 @@ class ImportacaoResult(BaseModel):
     importadas: int
     duplicadas: int
     erros: int
+    # Linhas recusadas porque o valor lido não confere com a linha do extrato —
+    # ver `src.domain.extrato.validacao`. Contadas à parte de `erros` porque a
+    # causa e a ação do contador são outras: aqui o arquivo foi lido, mas um
+    # número específico não é confiável.
+    rejeitadas: int = 0
+    motivos_rejeicao: list[str] = []
     transacoes: list[TransacaoResponse]
 
 

@@ -19,6 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Transacao
 from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx_detalhado
+from src.domain.extrato.validacao import (
+    historico_parece_linha_crua,
+    motivo_valor_nao_confiavel,
+)
 from src.schemas.extrato import (
     ExtratoPendentesResponse,
     ImportacaoResult,
@@ -48,6 +52,7 @@ class ExtratoService:
 
         transacoes_ofx = parse_result.transacoes
         importadas, duplicadas, erros = 0, 0, len(parse_result.erros)
+        rejeitadas, motivos_rejeicao = 0, []
         novas: list[Transacao] = []
         hashes_do_lote: set[str] = set()
 
@@ -56,6 +61,25 @@ class ExtratoService:
 
         for t in transacoes_ofx:
             try:
+                motivo = motivo_valor_nao_confiavel(t.historico, t.valor)
+                if motivo:
+                    # Não persiste: valor errado entra em silêncio e contamina o
+                    # razão, enquanto a linha faltando aparece na conciliação.
+                    rejeitadas += 1
+                    motivos_rejeicao.append(f"{t.historico[:80]} — {motivo}")
+                    logger.warning(
+                        "extrato.transacao_rejeitada_valor_suspeito",
+                        historico=t.historico[:200],
+                        valor=str(t.valor),
+                        motivo=motivo,
+                    )
+                    continue
+                if historico_parece_linha_crua(t.historico):
+                    logger.warning(
+                        "extrato.historico_linha_crua",
+                        historico=t.historico[:200],
+                    )
+
                 dc = "C" if t.valor >= 0 else "D"
                 hash_dedup = _calcular_hash(self._empresa_id, agencia_id, t)
 
@@ -101,6 +125,7 @@ class ExtratoService:
             importadas=importadas,
             duplicadas=duplicadas,
             erros=erros,
+            rejeitadas=rejeitadas,
         )
 
         return ImportacaoResult(
@@ -109,6 +134,8 @@ class ExtratoService:
             importadas=importadas,
             duplicadas=duplicadas,
             erros=erros,
+            rejeitadas=rejeitadas,
+            motivos_rejeicao=motivos_rejeicao,
             transacoes=[TransacaoResponse.model_validate(t) for t in novas],
         )
 
@@ -125,6 +152,7 @@ class ExtratoService:
             raise ValidationError(message="Nenhuma transação encontrada no PDF.")
 
         importadas, duplicadas, erros = 0, 0, 0
+        rejeitadas, motivos_rejeicao = 0, []
         novas: list[Transacao] = []
         # Guarda hashes já vistos neste lote para evitar colisão de UniqueConstraint
         # quando o mesmo PDF tem transações legítimas mas com hash idêntico (ex.:
@@ -133,6 +161,25 @@ class ExtratoService:
 
         for t in transacoes_raw:
             try:
+                motivo = motivo_valor_nao_confiavel(t.historico, t.valor)
+                if motivo:
+                    # Não persiste: valor errado entra em silêncio e contamina o
+                    # razão, enquanto a linha faltando aparece na conciliação.
+                    rejeitadas += 1
+                    motivos_rejeicao.append(f"{t.historico[:80]} — {motivo}")
+                    logger.warning(
+                        "extrato.transacao_rejeitada_valor_suspeito",
+                        historico=t.historico[:200],
+                        valor=str(t.valor),
+                        motivo=motivo,
+                    )
+                    continue
+                if historico_parece_linha_crua(t.historico):
+                    logger.warning(
+                        "extrato.historico_linha_crua",
+                        historico=t.historico[:200],
+                    )
+
                 dc = "C" if t.valor >= 0 else "D"
                 hash_dedup = _calcular_hash(self._empresa_id, agencia_id, t)
 
@@ -178,6 +225,8 @@ class ExtratoService:
             importadas=importadas,
             duplicadas=duplicadas,
             erros=erros,
+            rejeitadas=rejeitadas,
+            motivos_rejeicao=motivos_rejeicao,
             transacoes=[TransacaoResponse.model_validate(t) for t in novas],
         )
 
