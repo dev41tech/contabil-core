@@ -31,12 +31,16 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copia código da aplicação
 COPY . .
 
-# SHA do commit desta imagem — exposto em GET /api/health e /api/health/live.
-# Prioridade: --build-arg GIT_COMMIT explícito (se o pipeline passar) senão
-# resolvido automaticamente aqui a partir do próprio .git/ do build context —
-# o pipeline de deploy em uso não estava passando o build-arg, então isso
-# sempre respondia "unknown". .git/ é removido antes do fim da imagem: entra
-# só pra essa leitura, não fica na imagem final.
+# Versão do código desta imagem — exposta em GET /api/health.
+#
+# Prioridade: --build-arg GIT_COMMIT explícito; senão o resolvedor, que usa o
+# SHA de .git/ quando existe e cai no fingerprint do fonte quando não existe.
+# O EasyPanel busca o código por archive do GitHub, sem .git/ nenhum — era por
+# isso que o health respondia "unknown" mesmo depois de o resolvedor entrar.
+#
+# O valor vai para arquivo, não para ENV: um RUN não altera um ENV já definido
+# na imagem, então `ENV GIT_COMMIT=${GIT_COMMIT}` congelaria "unknown". Quem lê
+# o arquivo é `Settings.resolver_git_commit_por_arquivo`.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
 RUN if [ "$GIT_COMMIT" = "unknown" ]; then \
@@ -44,6 +48,7 @@ RUN if [ "$GIT_COMMIT" = "unknown" ]; then \
     else \
         echo "$GIT_COMMIT" > /app/.git_commit; \
     fi \
+ && echo "versao desta imagem: $(cat /app/.git_commit)" \
  && rm -rf .git
 ENV GIT_COMMIT_FALLBACK_FILE=/app/.git_commit
 

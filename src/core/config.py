@@ -23,9 +23,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ App
     app_name: str = "contabil-core"
     app_version: str = "0.1.0"
-    # SHA do commit que gerou a imagem — injetado como build arg no Dockerfile.
-    # app_version não muda entre deploys, então é isso que responde "meu deploy subiu?".
+    # Versão do código que virou a imagem — SHA do commit ou, quando o build
+    # não tem `.git/`, o fingerprint do fonte. `app_version` não muda entre
+    # deploys, então é isto que responde "meu deploy subiu?".
+    #
+    # Preenchido pelo Dockerfile em `GIT_COMMIT_FALLBACK_FILE`, e não pela
+    # variável `GIT_COMMIT` direto: um `RUN` não consegue alterar um `ENV` já
+    # definido na imagem, então o valor resolvido durante o build só chega até
+    # aqui por arquivo. Era exatamente essa a lacuna que mantinha o health
+    # respondendo "unknown" mesmo com o resolvedor funcionando.
     git_commit: str = "unknown"
+    git_commit_fallback_file: str | None = None
     environment: Literal["development", "test", "staging", "production"] = "development"
     debug: bool = False
 
@@ -108,6 +116,26 @@ class Settings(BaseSettings):
         if len(str(v)) < 32:
             raise ValueError("secret_key deve ter no mínimo 32 caracteres")
         return v
+
+    @model_validator(mode="after")
+    def resolver_git_commit_por_arquivo(self) -> Settings:
+        """Lê o arquivo escrito no build quando `GIT_COMMIT` não veio explícito.
+
+        Build arg explícito continua tendo prioridade — se alguém passar
+        `--build-arg GIT_COMMIT`, é essa a resposta.
+        """
+        if self.git_commit != "unknown" or not self.git_commit_fallback_file:
+            return self
+        try:
+            with open(self.git_commit_fallback_file, encoding="utf-8") as f:
+                valor = f.read().strip()
+        except OSError:
+            # Arquivo ausente ou ilegível não pode derrubar a aplicação: o
+            # health degradado para "unknown" é ruim, ficar sem subir é pior.
+            return self
+        if valor:
+            object.__setattr__(self, "git_commit", valor)
+        return self
 
     @model_validator(mode="after")
     def setup_exige_segredo(self) -> Settings:
