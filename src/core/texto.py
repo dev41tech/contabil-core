@@ -14,6 +14,7 @@ import re
 import unicodedata
 
 _NAO_ALFANUMERICO = re.compile(r"[^a-z0-9]+")
+_PADRAO_SEM_TEXTO = "(sem texto)"
 
 
 def normalizar_historico_contabil(texto: str) -> str:
@@ -58,3 +59,27 @@ def normalizar_para_match(texto: str) -> str:
 def tokens_para_match(texto: str) -> list[str]:
     """Palavras da forma canônica, na ordem em que aparecem."""
     return normalizar_para_match(texto).split()
+
+
+def chave_agrupamento_historico(texto: str, quantidade_tokens: int) -> str:
+    """Monta o padrão estável usado para agrupar históricos bancários.
+
+    Números e tokens de uma letra são descartados porque variam entre extratos
+    sem mudar a natureza contábil do lançamento. Em especial, alguns bancos
+    inserem uma letra solta no meio do histórico; deixá-la ocupar uma posição
+    separaria operações equivalentes justamente na fila que tenta reuni-las.
+
+    Históricos sem nenhum token significativo continuam sob uma chave própria:
+    mesmo sem texto útil, a transação ainda exige trabalho do contador.
+    """
+    if quantidade_tokens < 1:
+        raise ValueError("quantidade_tokens deve ser maior ou igual a 1")
+
+    significativos = [
+        token
+        for token in tokens_para_match(texto)
+        if not token.isnumeric() and len(token) > 1
+    ]
+    if not significativos:
+        return _PADRAO_SEM_TEXTO
+    return " ".join(significativos[:quantidade_tokens])

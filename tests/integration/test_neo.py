@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -105,8 +105,236 @@ async def _criar_regra(client, empresa, agencia_id, conta_id, historico, dc, csr
     return r.json()
 
 
+async def _registrar_fila_agrupada(db, empresa, entradas: list[dict]):
+    """Monta pendências diretamente para que o teste isole a consulta do motor."""
+    agencias = [
+        AgenciaBancaria(
+            empresa_id=empresa.id,
+            banco_sigla="ITAU",
+            agencia=f"90{indice}",
+            numero=f"9000{indice}",
+        )
+        for indice in range(2)
+    ]
+    db.add_all(agencias)
+    await db.flush()
+
+    transacoes = []
+    for indice, entrada in enumerate(entradas):
+        transacao = Transacao(
+            empresa_id=empresa.id,
+            agencia_id=agencias[entrada.get("agencia", 0)].id,
+            data=entrada.get(
+                "data", datetime(2024, 3, indice + 1, tzinfo=UTC)
+            ),
+            valor=Decimal(str(entrada.get("valor", "10.00"))),
+            historico=entrada["historico"],
+            dc=entrada.get("dc", "D"),
+            status=entrada.get("status", "pendente"),
+            hash_dedup=f"neo-grupo-{uuid4().hex}",
+        )
+        db.add(transacao)
+        await db.flush()
+        db.add(
+            NeoDecisao(
+                empresa_id=empresa.id,
+                transacao_id=transacao.id,
+                resultado="sem_regra",
+                motivo="Sem regra para o teste de agrupamento",
+            )
+        )
+        transacoes.append(transacao)
+    await db.flush()
+    return transacoes, agencias
+
+
+def _pendencias_agrupadas_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/pendencias/agrupadas"
+
+
 def _processar_url(empresa_id) -> str:
     return f"/api/v1/empresas/{empresa_id}/neo/processar"
+
+
+# ── NEO pendências agrupadas
+
+
+@pytest.mark.asyncio
+async def test_pendencias_agrupa_tarifas_sem_fragmentar_por_agencia(
+    client, db, tenant, usuario, empresa
+):
+    """A letra variável do banco não pode separar tarifas iguais, enquanto
+    outro padrão deve continuar distinto e as agências devem virar metadado.
+
+    Este é o caso que motivou o endpoint: fragmentá-lo manteria o trabalho
+    repetitivo que o agrupamento pretende eliminar.
+    """
+    await _login(client, tenant, usuario)
+    transacoes, agencias = await _registrar_fila_agrupada(
+        db,
+        empresa,
+        [
+            {"historico": "TARIFA COM LIQUIDAÇÃO", "valor": "10.00"},
+            {
+                "historico": "Tarifa com R liquidacao",
+                "valor": "20.00",
+                "agencia": 1,
+            },
+            {"historico": "TARIFA/PACOTE DE SERVICOS", "valor": "50.00"},
+        ],
+    )
+
+    resposta = await client.get(_pendencias_agrupadas_url(empresa.id))
+    assert resposta.status_code == 200
+    body = resposta.json()
+    assert body["total_pendentes"] == 3
+    assert body["total_agrupadas"] == 3
+    assert body["total_grupos"] == 2
+    # Conjunto exato de chaves: a tela lê todas, e campo novo sem intenção
+    # (ou removido) tem que aparecer aqui antes de chegar no front.
+    assert set(body) == {
+        "grupos",
+        "total_pendentes",
+        "total_agrupadas",
+        "total_grupos",
+        "parcial",
+    }
+    assert body["parcial"] is False
+
+    tarifas = next(g for g in body["grupos"] if g["padrao"] == "tarifa com liquidacao")
+    assert tarifas["quantidade"] == 2
+    assert Decimal(tarifas["valor_total"]) == Decimal("30.00")
+    assert set(tarifas["agencia_ids"]) == {str(agencia.id) for agencia in agencias}
+    assert set(tarifas["transacao_ids"]) == {
+        str(transacoes[0].id),
+        str(transacoes[1].id),
+    }
+    assert {g["padrao"] for g in body["grupos"]} == {
+        "tarifa com liquidacao",
+        "tarifa pacote de",
+    }
+
+    limitado = (
+        await client.get(
+            _pendencias_agrupadas_url(empresa.id), params={"limite_grupos": 1}
+        )
+    ).json()
+    assert limitado["total_pendentes"] == 3
+    assert limitado["total_agrupadas"] == 2
+    assert limitado["total_grupos"] == 2
+    assert len(limitado["grupos"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_pendencias_separa_mesmo_padrao_por_dc(
+    client, db, tenant, usuario, empresa
+):
+    """Débito e crédito iguais precisam gerar grupos distintos porque nenhuma
+    regra criada pela ação em lote pode operar nos dois lados.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(
+        db,
+        empresa,
+        [
+            {"historico": "PIX ENVIADO CLIENTE", "dc": "D"},
+            {"historico": "PIX ENVIADO CLIENTE", "dc": "C"},
+        ],
+    )
+
+    body = (await client.get(_pendencias_agrupadas_url(empresa.id))).json()
+    assert body["total_grupos"] == 2
+    assert {(grupo["padrao"], grupo["dc"]) for grupo in body["grupos"]} == {
+        ("pix enviado cliente", "D"),
+        ("pix enviado cliente", "C"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_pendencias_respeita_granularidade_de_tokens(
+    client, db, tenant, usuario, empresa
+):
+    """A tela deve controlar a granularidade: duas TEDs equivalentes com dois
+    tokens precisam se separar quando o terceiro token passa a contar.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(
+        db,
+        empresa,
+        [
+            {"historico": "TED RECEBIDA CLIENTE ALFA", "dc": "C"},
+            {"historico": "TED RECEBIDA EMPRESA XYZ", "dc": "C"},
+        ],
+    )
+
+    com_dois = (
+        await client.get(_pendencias_agrupadas_url(empresa.id), params={"tokens": 2})
+    ).json()
+    com_tres = (
+        await client.get(_pendencias_agrupadas_url(empresa.id), params={"tokens": 3})
+    ).json()
+
+    assert com_dois["total_grupos"] == 1
+    assert com_dois["grupos"][0]["padrao"] == "ted recebida"
+    assert com_dois["grupos"][0]["quantidade"] == 2
+    assert com_tres["total_grupos"] == 2
+    assert {grupo["padrao"] for grupo in com_tres["grupos"]} == {
+        "ted recebida cliente",
+        "ted recebida empresa",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pendencias_ignora_decisao_orfa_de_transacao_contabilizada(
+    client, db, tenant, usuario, empresa
+):
+    """Uma decisão antiga `sem_regra` não pode poluir a fila depois que sua
+    transação foi contabilizada por outro fluxo.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(
+        db,
+        empresa,
+        [
+            {"historico": "BOLETO AINDA PENDENTE"},
+            {"historico": "BOLETO JÁ CONTABILIZADO", "status": "processada"},
+        ],
+    )
+
+    body = (await client.get(_pendencias_agrupadas_url(empresa.id))).json()
+    assert body["total_pendentes"] == 1
+    assert body["total_agrupadas"] == 1
+    assert body["total_grupos"] == 1
+    assert body["grupos"][0]["rotulo"] == "BOLETO AINDA PENDENTE"
+
+
+@pytest.mark.asyncio
+async def test_pendencias_rotulo_preserva_historico_real_mais_frequente(
+    client, db, tenant, usuario, empresa
+):
+    """O rótulo deve manter acento e caixa do histórico mais comum para que o
+    contador reconheça o extrato, sem expor a chave técnica normalizada.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(
+        db,
+        empresa,
+        [
+            {"historico": "TARIFA COM LIQUIDAÇÃO"},
+            {"historico": "TARIFA COM LIQUIDAÇÃO"},
+            {"historico": "Tarifa com R liquidacao"},
+        ],
+    )
+
+    body = (await client.get(_pendencias_agrupadas_url(empresa.id))).json()
+    grupo = body["grupos"][0]
+    assert grupo["padrao"] == "tarifa com liquidacao"
+    assert grupo["rotulo"] == "TARIFA COM LIQUIDAÇÃO"
+    assert grupo["rotulo"] != grupo["padrao"]
+    assert grupo["amostras"] == [
+        "TARIFA COM LIQUIDAÇÃO",
+        "Tarifa com R liquidacao",
+    ]
 
 
 # ── NEO processar

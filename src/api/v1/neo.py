@@ -14,12 +14,16 @@ from src.core.errors import ConflictError
 from src.db.models import NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
-from src.domain.neo.consultas import listar_decisoes as _listar_decisoes
+from src.domain.neo.consultas import (
+    agrupar_pendencias as _agrupar_pendencias,
+    listar_decisoes as _listar_decisoes,
+)
 from src.domain.neo.engine import NeoEngine
 from src.schemas.neo import (
     NeoAssociarManualRequest,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
+    NeoPendenciasAgrupadasResponse,
     NeoProcessarRequest,
     NeoResultado,
 )
@@ -104,6 +108,30 @@ async def listar_decisoes(
         valor_max=valor_max,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get(
+    "/pendencias/agrupadas",
+    response_model=NeoPendenciasAgrupadasResponse,
+)
+async def agrupar_pendencias(
+    empresa_id: UUID,
+    agencia_id: UUID | None = Query(default=None),
+    mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
+    tokens: int = Query(default=3, ge=1, le=6),
+    limite_grupos: int = Query(default=50, ge=1, le=200),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoPendenciasAgrupadasResponse:
+    """Resume a fila pendente por padrão bancário sem perder os IDs acionáveis."""
+    return await _agrupar_pendencias(
+        db,
+        empresa_id,
+        agencia_id=agencia_id,
+        mes=mes,
+        tokens=tokens,
+        limite_grupos=limite_grupos,
     )
 
 
