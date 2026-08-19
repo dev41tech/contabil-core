@@ -44,6 +44,9 @@ class NeoDecisaoResponse(BaseModel):
     agencia_id: UUID | None = None
     regra_id: UUID | None
     regra_descricao: str | None = None
+    conta_id: UUID | None = None
+    conta_codigo: str | None = None
+    conta_descricao: str | None = None
     resultado: str       # associada | sem_regra | erro
     estrategia: str | None
     motivo: str | None

@@ -3,9 +3,9 @@
 Existe porque `GET /neo/decisoes` só tinha `resultado`/`page`/`page_size` e o
 router fazia SELECT + batch-fetch direto (ver item 4 do PDF de feedback dos
 contadores: "seria possível colocar no NEO uma opção de busca/filtro?"). Os
-filtros usam apenas dados que já existem em `Transacao`/`Regra` — nada aqui
-depende de `Contraparte` porque o NEO ainda não persiste proveniência de
-contraparte (isso é shadow mode, só em log, ver `engine.py`).
+filtros usam apenas dados que já existem em `NeoDecisao`/`Transacao`/`Regra` —
+nada aqui depende de `Contraparte` porque a decisão persiste a conta aplicada,
+mas não a proveniência completa da contraparte.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import contains_eager
 
@@ -21,13 +21,15 @@ from src.core.dates import bounds_do_mes
 from src.core.errors import ValidationError
 from src.core.texto import normalizar_para_match, remover_acentos
 from src.db.functions import sem_acento
-from src.db.models import NeoDecisao, Regra, Transacao
+from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
 from src.schemas.neo import NeoDecisaoListResponse, NeoDecisaoResponse
 
 RESULTADOS_VALIDOS = ("associada", "sem_regra", "erro")
 ESTRATEGIAS_VALIDAS = (
     "exato",
     "substring",
+    # Legado inalcançável: continua aceito para links e filtros salvos não
+    # passarem a responder 422 depois da remoção da estratégia do motor.
     "prefixo",
     "todas_palavras",
     "manual",
@@ -94,6 +96,7 @@ async def listar_decisoes(
         select(NeoDecisao)
         .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
         .outerjoin(Regra, Regra.id == NeoDecisao.regra_id)
+        .outerjoin(PlanoConta, PlanoConta.id == NeoDecisao.conta_id)
         .where(NeoDecisao.empresa_id == empresa_id)
     )
 
@@ -112,7 +115,12 @@ async def listar_decisoes(
     if agencia_id:
         q = q.where(Transacao.agencia_id == agencia_id)
     if conta_id:
-        q = q.where(Regra.conta_id == conta_id)
+        q = q.where(
+            or_(
+                NeoDecisao.conta_id == conta_id,
+                and_(NeoDecisao.conta_id.is_(None), Regra.conta_id == conta_id),
+            )
+        )
     if mes:
         inicio, fim = bounds_do_mes(mes)
         q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
@@ -147,7 +155,9 @@ async def listar_decisoes(
         (
             await db.execute(
                 q.options(
-                    contains_eager(NeoDecisao.transacao), contains_eager(NeoDecisao.regra)
+                    contains_eager(NeoDecisao.transacao),
+                    contains_eager(NeoDecisao.regra),
+                    contains_eager(NeoDecisao.conta),
                 )
                 .order_by(NeoDecisao.processado_em.desc())
                 .offset((page - 1) * page_size)
@@ -167,6 +177,8 @@ async def listar_decisoes(
         item.transacao_dc = r.transacao.dc
         item.agencia_id = r.transacao.agencia_id
         item.regra_descricao = r.regra.descricao if r.regra else None
+        item.conta_codigo = r.conta.codigo if r.conta else None
+        item.conta_descricao = r.conta.descricao if r.conta else None
         items.append(item)
 
     return NeoDecisaoListResponse(items=items, total=total, page=page, page_size=page_size)

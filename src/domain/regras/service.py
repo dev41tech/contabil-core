@@ -35,6 +35,13 @@ logger = structlog.get_logger(__name__)
 
 
 class RegraService:
+    """Mantém as regras cadastradas e suas validações de negócio.
+
+    O tipo `manual` existe por compatibilidade com dados e integrações antigas,
+    mas não é carregado pelo motor NEO. Classificações feitas pelo contador
+    devem usar a associação manual do NEO.
+    """
+
     def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
         self._db = db
         self._empresa_id = empresa_id
@@ -98,6 +105,15 @@ class RegraService:
         )
         self._db.add(regra)
         await self._db.flush()
+
+        if data.tipo == "manual":
+            logger.warning(
+                "regra.manual_nao_aplicada_pelo_motor",
+                regra_id=str(regra.id),
+                empresa_id=str(self._empresa_id),
+                aviso="Esta regra manual não será aplicada pelo motor NEO.",
+                orientacao="Use a associação manual do NEO para classificar à mão.",
+            )
 
         logger.info(
             "regra.criada",
