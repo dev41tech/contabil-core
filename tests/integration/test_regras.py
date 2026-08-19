@@ -76,7 +76,6 @@ async def test_criar_regra_sucesso(client, db, tenant, usuario, empresa):
             "descricao": "Transferência Recebida",
             "historico": "TED RECEBIDA",
             "dc": "C",
-            "tipo": "automatica",
             "manter_historico": False,
         },
         headers={"X-CSRF-Token": csrf},
@@ -85,6 +84,7 @@ async def test_criar_regra_sucesso(client, db, tenant, usuario, empresa):
     body = r.json()
     assert body["historico"] == "TED RECEBIDA"
     assert body["dc"] == "C"
+    assert body["tipo"] == "automatica"
     assert body["ativa"] is True
 
 

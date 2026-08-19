@@ -63,14 +63,17 @@ async def listar_decisoes(
     ),
     estrategia: str | None = Query(
         default=None,
-        description="exato | substring | prefixo | todas_palavras | manual | contraparte",
+        description=(
+            "exato | substring | todas_palavras | manual | contraparte "
+            "(prefixo é aceito apenas como legado)"
+        ),
     ),
     dc: str | None = Query(
         default=None,
         description="D/débito ou C/crédito (aceita a letra ou a palavra por extenso)",
     ),
     agencia_id: UUID | None = Query(default=None),
-    conta_id: UUID | None = Query(default=None, description="Conta contábil usada na regra"),
+    conta_id: UUID | None = Query(default=None, description="Conta contábil da decisão"),
     mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
     valor_min: Decimal | None = Query(
         default=None, ge=0, description="Valor mínimo da transação (R$)"
@@ -200,6 +203,7 @@ async def associar_manual(
     # Atualiza a decisão
     decisao.resultado = "associada"
     decisao.estrategia = "manual"
+    decisao.conta_id = conta.id
     decisao.motivo = f"Associação manual: {body.descricao}"
 
     # Atualiza o status da transação
@@ -229,4 +233,6 @@ async def associar_manual(
     resp.transacao_valor = transacao.valor
     resp.transacao_dc = transacao.dc
     resp.agencia_id = transacao.agencia_id
+    resp.conta_codigo = conta.codigo
+    resp.conta_descricao = conta.descricao
     return resp

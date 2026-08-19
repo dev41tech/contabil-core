@@ -8,6 +8,12 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class RegraCreate(BaseModel):
+    """Dados para cadastrar uma regra de categorização.
+
+    `manual` permanece aceito por compatibilidade, mas não é aplicado pelo
+    motor NEO. Para classificar à mão, deve-se usar a associação manual do NEO.
+    """
+
     conta_id: UUID
     agencia_id: UUID
     descricao: str = Field(..., min_length=2, max_length=500)
@@ -18,7 +24,7 @@ class RegraCreate(BaseModel):
         description="Texto do extrato bancário que dispara esta regra.",
     )
     dc: str = Field(..., description="D = Débito, C = Crédito")
-    tipo: str = Field(..., description="automatica ou manual")
+    tipo: str = Field(default="automatica", description="automatica ou manual")
     manter_historico: bool = False
 
     @field_validator("dc")

@@ -710,6 +710,9 @@ class NeoDecisao(Base):
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
     transacao_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("transacoes.id"), nullable=False)
     regra_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("regras.id"), nullable=True)
+    conta_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("plano_contas.id"), nullable=True
+    )
     resultado: Mapped[str] = mapped_column(
         Enum("associada", "sem_regra", "erro", name="resultado_neo_enum"), nullable=False
     )
@@ -724,6 +727,7 @@ class NeoDecisao(Base):
 
     transacao: Mapped[Transacao] = relationship("Transacao")
     regra: Mapped[Regra | None] = relationship("Regra")
+    conta: Mapped[PlanoConta | None] = relationship("PlanoConta")
 
     __table_args__ = (
         Index("ix_neo_empresa_resultado", "empresa_id", "resultado"),

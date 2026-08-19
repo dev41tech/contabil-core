@@ -5,12 +5,11 @@ na forma canônica de `src.core.texto.normalizar_para_match` — minúsculas, se
 acento, sem pontuação, espaços colapsados:
   1. exato          — historico da transação == historico da regra
   2. substring      — historico da regra é substring do historico da transação
-  3. prefixo        — historico da transação começa com o historico da regra
-  4. todas_palavras — todas as palavras da regra aparecem no histórico, em
+  3. todas_palavras — todas as palavras da regra aparecem no histórico, em
                       qualquer ordem e não necessariamente coladas
 
 Desempate entre regras candidatas:
-  Nas estratégias `substring`, `prefixo` e `todas_palavras` mais de uma regra
+  Nas estratégias `substring` e `todas_palavras` mais de uma regra
   pode casar. Vence a mais específica — o histórico mais longo — e, em caso de
   empate, o menor `id`.
   A ordem vem do `ORDER BY` em `_carregar_regras`, não da ordem que o banco
@@ -256,15 +255,10 @@ class NeoEngine:
             if self._forma_de_match(regra)[0] in historico_t:
                 return regra, "substring"
 
-        # 3. Match por prefixo (transação começa com o histórico da regra)
-        for regra in candidatas:
-            if historico_t.startswith(self._forma_de_match(regra)[0]):
-                return regra, "prefixo"
-
-        # 4. Todas as palavras da regra aparecem no histórico, em qualquer
+        # 3. Todas as palavras da regra aparecem no histórico, em qualquer
         #    ordem e não necessariamente coladas. É o que faz a regra "TARIFA
         #    COM LIQUIDACAO" reconhecer "TARIFA COM R LIQUIDACAO" — a palavra
-        #    extra do banco no meio do histórico quebrava as três estratégias
+        #    extra do banco no meio do histórico quebrava as duas estratégias
         #    acima e obrigava o contador a cadastrar uma regra por variação.
         #
         #    Fica por último de propósito: é a estratégia mais permissiva, só
@@ -320,6 +314,7 @@ class NeoEngine:
             transacao,
             resultado="associada",
             regra_id=regra.id,
+            conta_id=regra.conta_id,
             estrategia=estrategia,
             motivo=f"Regra '{regra.historico}' ({estrategia})",
         )
@@ -451,6 +446,7 @@ class NeoEngine:
             transacao,
             resultado="associada",
             regra_id=None,
+            conta_id=contraparte.conta_contabil_id,
             estrategia="contraparte",
             motivo=(
                 f"Contraparte '{contraparte.razao_social}' identificada via "
@@ -659,6 +655,7 @@ class NeoEngine:
         *,
         resultado: str,
         regra_id: UUID | None,
+        conta_id: UUID | None,
         estrategia: str | None,
         motivo: str | None,
     ) -> None:
@@ -675,6 +672,7 @@ class NeoEngine:
         aberta = self._decisoes_sem_regra.get(transacao.id)
         if aberta is not None:
             aberta.regra_id = regra_id
+            aberta.conta_id = conta_id
             aberta.resultado = resultado
             aberta.estrategia = estrategia
             aberta.motivo = motivo
@@ -685,6 +683,7 @@ class NeoEngine:
             empresa_id=self._empresa_id,
             transacao_id=transacao.id,
             regra_id=regra_id,
+            conta_id=conta_id,
             resultado=resultado,
             estrategia=estrategia,
             motivo=motivo,
@@ -701,6 +700,7 @@ class NeoEngine:
             transacao,
             resultado="sem_regra",
             regra_id=None,
+            conta_id=None,
             estrategia=None,
             motivo=f"Nenhuma regra encontrada para '{transacao.historico}' (dc={transacao.dc})",
         )
@@ -711,6 +711,7 @@ class NeoEngine:
             transacao,
             resultado="erro",
             regra_id=None,
+            conta_id=None,
             estrategia=None,
             motivo=erro[:500],
         )
@@ -866,7 +867,8 @@ class NeoEngine:
     async def _carregar_regras(self, agencia_id: UUID | None) -> list[Regra]:
         """Carrega as regras já na ordem em que o matching deve considerá-las.
 
-        A ordem é parte do resultado: nas estratégias `substring` e `prefixo` a
+        A ordem é parte do resultado: nas estratégias `substring` e
+        `todas_palavras` a
         primeira regra que casar vence. Sem `ORDER BY`, a ordem é a que o Postgres
         devolveu — e a mesma transação pode cair em contas diferentes entre
         execuções. Ordenamos pela regra mais específica (histórico mais longo) e
