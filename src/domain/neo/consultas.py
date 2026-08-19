@@ -28,12 +28,25 @@ from src.core.texto import (
     remover_acentos,
 )
 from src.db.functions import sem_acento
-from src.db.models import NeoDecisao, PlanoConta, Regra, Transacao
+from src.db.models import (
+    AgenciaBancaria,
+    NeoDecisao,
+    PlanoConta,
+    Regra,
+    RegistroContabil,
+    Transacao,
+)
+from src.domain.neo.engine import estrategia_de_match
 from src.schemas.neo import (
+    NeoConflitoAmostra,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
     NeoPendenciaGrupoResponse,
     NeoPendenciasAgrupadasResponse,
+    NeoSimulacaoConflitos,
+    NeoSimulacaoQuantidade,
+    NeoSimulacaoResumo,
+    NeoSimularRegraResponse,
 )
 
 RESULTADOS_VALIDOS = ("associada", "sem_regra", "erro")
@@ -334,4 +347,108 @@ async def agrupar_pendencias(
         total_agrupadas=sum(grupo.quantidade for grupo in devolvidos),
         total_grupos=len(grupos),
         parcial=parcial,
+    )
+
+
+async def simular_regra(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    historico: str,
+    dc: str,
+    agencia_id: UUID,
+    conta_id: UUID,
+) -> NeoSimularRegraResponse:
+    """Mede o impacto de uma regra sem persistir qualquer alteração.
+
+    A varredura usa `estrategia_de_match`, a mesma função pura chamada por
+    `NeoEngine._encontrar_regra`. Fazer o filtro textual no banco seria mais
+    barato, mas criaria diferenças entre SQLite/Postgres e, principalmente,
+    uma segunda implementação da normalização que poderia mentir na prévia.
+    """
+    agencia_existe = (
+        await db.execute(
+            select(AgenciaBancaria.id).where(
+                AgenciaBancaria.id == agencia_id,
+                AgenciaBancaria.empresa_id == empresa_id,
+                AgenciaBancaria.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    conta_existe = (
+        await db.execute(
+            select(PlanoConta.id).where(
+                PlanoConta.id == conta_id,
+                PlanoConta.empresa_id == empresa_id,
+                PlanoConta.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if agencia_existe is None:
+        raise ValidationError(message="Agência bancária não encontrada nesta empresa.")
+    if conta_existe is None:
+        raise ValidationError(message="Conta contábil não encontrada nesta empresa.")
+
+    # O lançamento com o mesmo D/C da transação é a classificação; o outro é
+    # a contrapartida bancária e não pode ser tratado como conflito.
+    lancamento_classificacao = and_(
+        RegistroContabil.transacao_id == Transacao.id,
+        # Comparar duas colunas Enum distintas funciona no SQLite, mas o
+        # Postgres não possui operador entre `dc_registro_enum` e
+        # `dc_transacao_enum`. O literal já validado preserva a semântica nos
+        # dois bancos sem depender de cast específico de fornecedor.
+        RegistroContabil.dc == dc,
+        RegistroContabil.deleted_at.is_(None),
+    )
+    consulta = (
+        select(Transacao, RegistroContabil.conta_id)
+        .outerjoin(RegistroContabil, lancamento_classificacao)
+        .where(
+            Transacao.empresa_id == empresa_id,
+            Transacao.agencia_id == agencia_id,
+            Transacao.dc == dc,
+            Transacao.status.in_(("pendente", "processada")),
+        )
+        .order_by(Transacao.data.asc(), Transacao.id.asc())
+        .execution_options(yield_per=500)
+    )
+
+    pendencias = contabilizadas = conflitos = 0
+    amostras_pendencias: list[str] = []
+    amostras_conflitos: list[NeoConflitoAmostra] = []
+    resultado = await db.stream(consulta)
+    async for transacao, conta_lancada_id in resultado:
+        if estrategia_de_match(historico, transacao.historico) is None:
+            continue
+        if transacao.status == "pendente":
+            pendencias += 1
+            if transacao.historico not in amostras_pendencias and len(amostras_pendencias) < 5:
+                amostras_pendencias.append(transacao.historico)
+            continue
+        # Status processada sem partidas não é uma transação contabilizada e
+        # não deve inflar a prévia diante de um resíduo inconsistente.
+        if conta_lancada_id is None:
+            continue
+        contabilizadas += 1
+        if conta_lancada_id != conta_id:
+            conflitos += 1
+            if len(amostras_conflitos) < 5:
+                amostras_conflitos.append(
+                    NeoConflitoAmostra(
+                        transacao_id=transacao.id,
+                        historico=transacao.historico,
+                        conta_id=conta_lancada_id,
+                    )
+                )
+
+    return NeoSimularRegraResponse(
+        pendencias_atingidas=NeoSimulacaoResumo(
+            quantidade=pendencias, amostras=amostras_pendencias
+        ),
+        ja_contabilizadas_atingidas=NeoSimulacaoQuantidade(
+            quantidade=contabilizadas
+        ),
+        conflitos=NeoSimulacaoConflitos(
+            quantidade=conflitos, amostras=amostras_conflitos
+        ),
     )
