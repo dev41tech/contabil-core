@@ -82,6 +82,43 @@ _VALOR_TOLERANCIA = Decimal("0.01")   # diferença máxima de valor (R$)
 _DATA_TOLERANCIA_COMP = 3             # dias de tolerância para comprovantes
 _DATA_TOLERANCIA_NF = 7              # dias de tolerância para notas fiscais
 
+_ESTRATEGIAS_MATCH = ("exato", "substring", "todas_palavras")
+
+
+def estrategia_de_match_normalizado(regra: str, transacao: str) -> str | None:
+    """Como uma regra casa, com os dois lados **já** em forma canônica.
+
+    Fonte única das estratégias usadas pelo motor e pela prévia de impacto —
+    duas definições de match fariam a prévia mentir sobre o que o motor vai
+    fazer. A ordem entre várias regras continua sendo de `_encontrar_regra`,
+    que depende da lista ordenada vinda do banco.
+
+    Recebe texto já normalizado, e não cru, porque o motor compara cada
+    transação contra todas as regras candidatas: normalizar aqui dentro
+    refaria o trabalho sobre o mesmo histórico de regra a cada par. Medido em
+    50 regras × 1000 transações, a versão que normalizava por par ficou ~38x
+    mais lenta. Quem tem só um par na mão usa `estrategia_de_match`.
+    """
+    if transacao == regra:
+        return "exato"
+    if regra in transacao:
+        return "substring"
+    tokens_regra = regra.split()
+    if tokens_regra:
+        tokens_transacao = set(transacao.split())
+        if all(token in tokens_transacao for token in tokens_regra):
+            return "todas_palavras"
+    return None
+
+
+def estrategia_de_match(historico_regra: str, historico_transacao: str) -> str | None:
+    """Versão conveniente para texto cru — usada pela simulação de regra, que
+    avalia um histórico de regra por vez."""
+    return estrategia_de_match_normalizado(
+        normalizar_para_match(historico_regra),
+        normalizar_para_match(historico_transacao),
+    )
+
 
 @dataclass(frozen=True)
 class ResolucaoSombra:
@@ -119,7 +156,7 @@ class NeoEngine:
         self._comprovantes_consumidos: set[UUID] = set()
         self._notas_consumidas: set[UUID] = set()
         self._contas_bancarias: dict[UUID, PlanoConta] = {}
-        self._regras_normalizadas: dict[UUID, tuple[str, list[str]]] = {}
+        self._regras_normalizadas: dict[UUID, str] = {}
         self._decisoes_sem_regra: dict[UUID, NeoDecisao] = {}
         self._empresa_cnpj: str | None = None
 
@@ -211,17 +248,19 @@ class NeoEngine:
 
     # ── Matching ──────────────────────────────────────────────────────────────
 
-    def _forma_de_match(self, regra: Regra) -> tuple[str, list[str]]:
+    def _forma_de_match(self, regra: Regra) -> str:
         """Forma canônica do histórico da regra, memoizada por execução.
 
         Não usa `regra.historico_normalizado` (que é só `strip().lower()`, e
         existe para o índice único de unicidade) porque o matching precisa
-        ignorar também acento e pontuação — ver `normalizar_para_match`.
+        ignorar também acento e pontuação. Memoizar aqui importa: cada
+        transação é comparada contra todas as regras candidatas, então sem
+        isto o mesmo histórico de regra seria normalizado uma vez por
+        transação.
         """
         cacheado = self._regras_normalizadas.get(regra.id)
         if cacheado is None:
-            texto = normalizar_para_match(regra.historico)
-            cacheado = (texto, texto.split())
+            cacheado = normalizar_para_match(regra.historico)
             self._regras_normalizadas[regra.id] = cacheado
         return cacheado
 
@@ -236,38 +275,26 @@ class NeoEngine:
         LIQUIDACAO" e "TARIFA/LIQUIDAÇÃO" sem precisar de uma regra por
         variação.
         """
-        historico_t = normalizar_para_match(transacao.historico)
-        tokens_t = set(historico_t.split())
-
         # Filtra regras compatíveis com a agência e D/C da transação
         candidatas = [
             r for r in regras
             if r.agencia_id == transacao.agencia_id and r.dc == transacao.dc
         ]
 
-        # 1. Match exato
-        for regra in candidatas:
-            if historico_t == self._forma_de_match(regra)[0]:
-                return regra, "exato"
-
-        # 2. Match por substring (regra dentro da transação)
-        for regra in candidatas:
-            if self._forma_de_match(regra)[0] in historico_t:
-                return regra, "substring"
-
-        # 3. Todas as palavras da regra aparecem no histórico, em qualquer
-        #    ordem e não necessariamente coladas. É o que faz a regra "TARIFA
-        #    COM LIQUIDACAO" reconhecer "TARIFA COM R LIQUIDACAO" — a palavra
-        #    extra do banco no meio do histórico quebrava as duas estratégias
-        #    acima e obrigava o contador a cadastrar uma regra por variação.
-        #
-        #    Fica por último de propósito: é a estratégia mais permissiva, só
-        #    entra em jogo quando nenhuma das exatas casou, e a ordem de
-        #    `_carregar_regras` (mais específica primeiro) continua valendo.
-        for regra in candidatas:
-            tokens_r = self._forma_de_match(regra)[1]
-            if tokens_r and all(t in tokens_t for t in tokens_r):
-                return regra, "todas_palavras"
+        # Estratégia vence antes da ordem das regras: primeiro todas as exatas,
+        # depois substrings e por fim todas_palavras. A função pura chamada
+        # aqui também sustenta a simulação, evitando duas definições de match.
+        historico_t = normalizar_para_match(transacao.historico)
+        matches = {
+            regra.id: estrategia_de_match_normalizado(
+                self._forma_de_match(regra), historico_t
+            )
+            for regra in candidatas
+        }
+        for estrategia in _ESTRATEGIAS_MATCH:
+            for regra in candidatas:
+                if matches[regra.id] == estrategia:
+                    return regra, estrategia
 
         return None, None
 
@@ -553,6 +580,32 @@ class NeoEngine:
             tipo_regra="manual",
         )
 
+    async def classificar_manualmente_lote(
+        self, transacoes: list[Transacao], conta_id: UUID, descricao: str
+    ) -> list[NeoDecisao]:
+        """Classifica transações já travadas e encerra suas decisões abertas.
+
+        O chamador seleciona e trava apenas pendências da empresa. Concentrar
+        aqui partidas, status e decisão garante que os endpoints individual e
+        em lote não possam deixar uma decisão `sem_regra` órfã.
+        """
+        self._decisoes_sem_regra = await self._carregar_decisoes_sem_regra(transacoes)
+        decisoes: list[NeoDecisao] = []
+        for transacao in transacoes:
+            await self.registrar_partidas_manuais(transacao, conta_id, descricao)
+            transacao.status = "processada"
+            decisoes.append(
+                self._registrar_decisao(
+                    transacao,
+                    resultado="associada",
+                    regra_id=None,
+                    conta_id=conta_id,
+                    estrategia="manual",
+                    motivo=f"Associação manual: {descricao}",
+                )
+            )
+        return decisoes
+
     async def _registrar_partidas(
         self,
         transacao: Transacao,
@@ -658,7 +711,7 @@ class NeoEngine:
         conta_id: UUID | None,
         estrategia: str | None,
         motivo: str | None,
-    ) -> None:
+    ) -> NeoDecisao:
         """Grava o desfecho do NEO para esta transação.
 
         Se já existe uma decisão 'sem_regra' aberta para a transação, ela é
@@ -677,7 +730,7 @@ class NeoEngine:
             aberta.estrategia = estrategia
             aberta.motivo = motivo
             aberta.processado_em = datetime.now(UTC)
-            return
+            return aberta
 
         decisao = NeoDecisao(
             empresa_id=self._empresa_id,
@@ -694,6 +747,7 @@ class NeoEngine:
         # ser desfeita pelo savepoint desta transação, e reaproveitá-la depois
         # (no `_registrar_erro`) escreveria num objeto que o rollback já
         # descartou — o registro de erro simplesmente sumiria.
+        return decisao
 
     async def _registrar_sem_regra(self, transacao: Transacao) -> None:
         self._registrar_decisao(
