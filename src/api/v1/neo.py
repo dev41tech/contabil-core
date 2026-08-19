@@ -10,23 +10,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
-from src.core.errors import ConflictError
+from src.core.errors import ConflictError, ValidationError
 from src.db.models import NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.consultas import (
     agrupar_pendencias as _agrupar_pendencias,
     listar_decisoes as _listar_decisoes,
+    simular_regra as _simular_regra,
 )
 from src.domain.neo.engine import NeoEngine
+from src.domain.regras.service import RegraService
 from src.schemas.neo import (
     NeoAssociarManualRequest,
+    NeoClassificarLoteRequest,
+    NeoClassificarLoteResponse,
+    NeoCriarRegraEAplicarRequest,
+    NeoCriarRegraEAplicarResponse,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
     NeoPendenciasAgrupadasResponse,
     NeoProcessarRequest,
     NeoResultado,
+    NeoSimularRegraRequest,
+    NeoSimularRegraResponse,
 )
+from src.schemas.regras import RegraCreate
 from src.schemas.types import Competencia
 
 router = APIRouter(
@@ -136,6 +145,142 @@ async def agrupar_pendencias(
 
 
 @router.post(
+    "/pendencias/classificar-lote",
+    response_model=NeoClassificarLoteResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def classificar_lote(
+    empresa_id: UUID,
+    body: NeoClassificarLoteRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoClassificarLoteResponse:
+    """Classifica até 200 pendências sob os mesmos conta e histórico.
+
+    O teto acompanha o maior `page_size` da API: cobre uma seleção completa da
+    tela sem manter centenas ou milhares de locks até o commit. IDs ausentes,
+    de outra empresa ou já processados são ignorados porque o lote representa
+    uma fotografia que pode ter envelhecido entre a leitura e o clique.
+    """
+    conta = (
+        await db.execute(
+            select(PlanoConta).where(
+                PlanoConta.id == body.conta_id,
+                PlanoConta.empresa_id == empresa_id,
+                PlanoConta.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if conta is None:
+        raise HTTPException(
+            status_code=422, detail="Conta contábil não encontrada nesta empresa."
+        )
+
+    pendentes = (
+        await db.execute(
+            select(Transacao)
+            .where(
+                Transacao.id.in_(body.transacao_ids),
+                Transacao.empresa_id == empresa_id,
+                Transacao.status == "pendente",
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    por_id = {transacao.id: transacao for transacao in pendentes}
+    ordenadas = [por_id[id_] for id_ in body.transacao_ids if id_ in por_id]
+    ids_ignorados = [id_ for id_ in body.transacao_ids if id_ not in por_id]
+
+    engine = NeoEngine(db=db, empresa_id=empresa_id)
+    decisoes = await engine.classificar_manualmente_lote(
+        ordenadas, conta.id, body.descricao
+    )
+    await db.flush()
+    for transacao, decisao in zip(ordenadas, decisoes, strict=True):
+        await registrar_auditoria(
+            db,
+            tenant_id=ctx.tenant_id,
+            usuario_id=ctx.user_id,
+            empresa_id=empresa_id,
+            acao="neo.associacao_manual",
+            entidade="neo_decisao",
+            entidade_id=decisao.id,
+            dados_antes={
+                "resultado": "sem_regra",
+                "transacao_status": "pendente",
+            },
+            dados_depois={
+                "resultado": "associada",
+                "estrategia": "manual",
+                "motivo": decisao.motivo,
+                "transacao_id": transacao.id,
+                "transacao_status": transacao.status,
+                "conta_id": conta.id,
+            },
+        )
+
+    return NeoClassificarLoteResponse(
+        classificadas=len(ordenadas),
+        ignoradas=len(ids_ignorados),
+        ids_ignorados=ids_ignorados,
+    )
+
+
+@router.post(
+    "/pendencias/simular-regra",
+    response_model=NeoSimularRegraResponse,
+)
+async def simular_regra(
+    empresa_id: UUID,
+    body: NeoSimularRegraRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoSimularRegraResponse:
+    """Mostra o alcance e as contradições de uma regra sem persistir nada."""
+    return await _simular_regra(
+        db,
+        empresa_id,
+        historico=body.historico,
+        dc=body.dc,
+        agencia_id=body.agencia_id,
+        conta_id=body.conta_id,
+    )
+
+
+@router.post(
+    "/pendencias/criar-regra-e-aplicar",
+    response_model=NeoCriarRegraEAplicarResponse,
+    status_code=201,
+    dependencies=[Depends(require_csrf)],
+)
+async def criar_regra_e_aplicar(
+    empresa_id: UUID,
+    body: NeoCriarRegraEAplicarRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoCriarRegraEAplicarResponse:
+    """Cria a regra validada e executa o NEO só no escopo revisado na tela."""
+    # Regra `manual` não é aplicada pelo motor (`_carregar_regras` só carrega
+    # `automatica`). Num endpoint cujo contrato é "cria e aplica", aceitá-la
+    # seria devolver zero associações sem explicar por quê — a mesma armadilha
+    # que a Fase 1 documentou no cadastro de regras.
+    if body.tipo != "automatica":
+        raise ValidationError(
+            message=(
+                "Só regra automática pode ser criada e aplicada de uma vez: "
+                "regra manual não é usada pelo motor. Para classificar à mão, "
+                "use a associação manual da pendência."
+            )
+        )
+    dados_regra = RegraCreate.model_validate(body.model_dump(exclude={"mes"}))
+    regra = await RegraService(db=db, empresa_id=empresa_id).criar(dados_regra)
+    resultado = await NeoEngine(db=db, empresa_id=empresa_id).processar(
+        agencia_id=body.agencia_id, mes=body.mes
+    )
+    return NeoCriarRegraEAplicarResponse(regra=regra, resultado=resultado)
+
+
+@router.post(
     "/decisoes/{decisao_id}/associar-manual",
     response_model=NeoDecisaoResponse,
     dependencies=[Depends(require_csrf)],
@@ -226,16 +371,13 @@ async def associar_manual(
         "transacao_status": transacao.status,
     }
     engine = NeoEngine(db=db, empresa_id=empresa_id)
-    await engine.registrar_partidas_manuais(transacao, conta.id, body.descricao)
-
-    # Atualiza a decisão
-    decisao.resultado = "associada"
-    decisao.estrategia = "manual"
-    decisao.conta_id = conta.id
-    decisao.motivo = f"Associação manual: {body.descricao}"
-
-    # Atualiza o status da transação
-    transacao.status = "processada"
+    # O mesmo fluxo usado pelo lote encerra a decisão `sem_regra`; manter essa
+    # transição no motor evita que as duas rotas voltem a divergir.
+    decisao = (
+        await engine.classificar_manualmente_lote(
+            [transacao], conta.id, body.descricao
+        )
+    )[0]
 
     await registrar_auditoria(
         db,

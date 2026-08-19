@@ -156,6 +156,10 @@ def _processar_url(empresa_id) -> str:
     return f"/api/v1/empresas/{empresa_id}/neo/processar"
 
 
+def _pendencias_url(empresa_id, acao: str) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/pendencias/{acao}"
+
+
 # ── NEO pendências agrupadas
 
 
@@ -248,6 +252,315 @@ async def test_pendencias_separa_mesmo_padrao_por_dc(
         ("pix enviado cliente", "D"),
         ("pix enviado cliente", "C"),
     }
+
+
+# ── Ações em lote da fila do NEO
+
+
+@pytest.mark.asyncio
+async def test_classificar_lote_processa_pendentes_e_ignora_retrato_velho(
+    client, db, tenant, usuario, empresa
+):
+    """Um ID que saiu da fila não pode abortar as outras classificações.
+
+    Este comportamento trava o contrato de concorrência da tela: a seleção é
+    uma fotografia e pode envelhecer enquanto outro contador processa o NEO.
+    Também garante que a decisão `sem_regra` seja encerrada pelo fluxo comum
+    do motor, sem deixar a linha órfã que já ocorreu em produção.
+    """
+    csrf = await _login(client, tenant, usuario)
+    _, conta_id = await _setup_base(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    transacoes = (
+        await db.execute(
+            select(Transacao)
+            .where(Transacao.empresa_id == empresa.id)
+            .order_by(Transacao.historico)
+        )
+    ).scalars().all()
+    atual, velha = transacoes[:2]
+    velha.status = "processada"
+    await db.flush()
+
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(atual.id), str(velha.id)],
+            "conta_id": conta_id,
+            "descricao": "Classificação coletiva",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 200
+    assert resposta.json() == {
+        "classificadas": 1,
+        "ignoradas": 1,
+        "ids_ignorados": [str(velha.id)],
+    }
+    await db.refresh(atual)
+    assert atual.status == "processada"
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == atual.id)
+        )
+    ).scalar_one()
+    assert (decisao.resultado, decisao.estrategia, decisao.conta_id) == (
+        "associada",
+        "manual",
+        UUID(conta_id),
+    )
+    assert (
+        await db.execute(
+            select(AuditLog).where(
+                AuditLog.acao == "neo.associacao_manual",
+                AuditLog.entidade_id == str(decisao.id),
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_classificar_lote_recusa_mais_de_duzentos_ids(
+    client, tenant, usuario, empresa
+):
+    """O teto de 200 impede que um clique mantenha locks demais até o commit.
+
+    O teste trava o limite escolhido para que ele não seja removido por engano
+    e transforme uma ação de tela numa operação irrestrita sobre o banco.
+    """
+    csrf = await _login(client, tenant, usuario)
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(uuid4()) for _ in range(201)],
+            "conta_id": str(uuid4()),
+            "descricao": "Lote grande demais",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert resposta.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_simulacao_e_motor_concordam_no_mesmo_conjunto(
+    client, db, tenant, usuario, empresa
+):
+    """A prévia precisa atingir exatamente o que o motor classifica depois.
+
+    Este é o contrato central da simulação: acento, pontuação e palavra extra
+    não podem produzir conjuntos diferentes entre a confirmação e a execução.
+    A chamada deliberadamente não envia CSRF porque a prévia é somente leitura.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+    simulacao = await client.post(
+        _pendencias_url(empresa.id, "simular-regra"),
+        json={
+            "historico": "TARIFA COM LIQUIDACAO",
+            "dc": "D",
+            "agencia_id": agencia_id,
+            "conta_id": conta_id,
+        },
+    )
+    assert simulacao.status_code == 200
+    previa = simulacao.json()
+    assert previa["pendencias_atingidas"]["quantidade"] == 2
+
+    await _criar_regra(
+        client,
+        empresa,
+        agencia_id,
+        conta_id,
+        "TARIFA COM LIQUIDACAO",
+        "D",
+        csrf,
+    )
+    executada = await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    assert executada.json()["associadas"] == 2
+    classificadas = {
+        transacao.historico
+        for transacao in (
+            await db.execute(
+                select(Transacao).where(
+                    Transacao.empresa_id == empresa.id,
+                    Transacao.status == "processada",
+                )
+            )
+        ).scalars().all()
+    }
+    assert classificadas == set(previa["pendencias_atingidas"]["amostras"])
+
+
+@pytest.mark.asyncio
+async def test_simular_regra_conta_contabilizadas_e_conflito_sem_contrapartida(
+    client, db, tenant, usuario, empresa
+):
+    """Conflito compara a conta classificada, nunca a contrapartida bancária.
+
+    A prévia deve distinguir uma classificação já feita na conta proposta de
+    outra que a contradiz; contar a segunda partida faria todas parecerem
+    conflitantes e inutilizaria o aviso ao contador.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    transacoes = (
+        await db.execute(
+            select(Transacao)
+            .where(Transacao.empresa_id == empresa.id)
+            .order_by(Transacao.id)
+        )
+    ).scalars().all()
+    conta_divergente = PlanoConta(
+        empresa_id=empresa.id,
+        codigo="4.1.99",
+        descricao="Outra despesa",
+        tipo="despesa",
+    )
+    db.add(conta_divergente)
+    await db.flush()
+    for transacao, destino in zip(
+        transacoes[:2], (conta_id, str(conta_divergente.id)), strict=True
+    ):
+        resposta = await client.post(
+            _pendencias_url(empresa.id, "classificar-lote"),
+            json={
+                "transacao_ids": [str(transacao.id)],
+                "conta_id": destino,
+                "descricao": "Tarifa revisada",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resposta.json()["classificadas"] == 1
+
+    simulacao = (
+        await client.post(
+            _pendencias_url(empresa.id, "simular-regra"),
+            json={
+                "historico": "TARIFA",
+                "dc": "D",
+                "agencia_id": agencia_id,
+                "conta_id": conta_id,
+            },
+        )
+    ).json()
+    assert simulacao["pendencias_atingidas"]["quantidade"] == 1
+    assert simulacao["ja_contabilizadas_atingidas"]["quantidade"] == 2
+    assert simulacao["conflitos"]["quantidade"] == 1
+    assert simulacao["conflitos"]["amostras"][0]["conta_id"] == str(
+        conta_divergente.id
+    )
+
+
+@pytest.mark.asyncio
+async def test_criar_regra_e_aplicar_restringe_agencia_e_mes(
+    client, db, tenant, usuario, empresa
+):
+    """Criar uma regra não autoriza reprocessar outras agências ou competências.
+
+    O teste trava o escopo revisado no modal: só a pendência de março da agência
+    da regra é resolvida, mesmo havendo históricos idênticos fora dele.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencias = [
+        AgenciaBancaria(
+            empresa_id=empresa.id,
+            banco_sigla="ITAU",
+            agencia=f"77{indice}",
+            numero=f"7700{indice}",
+        )
+        for indice in range(2)
+    ]
+    conta = PlanoConta(
+        empresa_id=empresa.id,
+        codigo="4.1.77",
+        descricao="Tarifas do escopo",
+        tipo="despesa",
+    )
+    db.add_all([*agencias, conta])
+    await db.flush()
+    transacoes = [
+        Transacao(
+            empresa_id=empresa.id,
+            agencia_id=agencia.id,
+            data=data,
+            valor=Decimal("10.00"),
+            historico="TARIFA ESCOPO",
+            dc="D",
+            hash_dedup=f"neo-escopo-{indice}",
+        )
+        for indice, (agencia, data) in enumerate(
+            (
+                (agencias[0], datetime(2024, 3, 10, tzinfo=UTC)),
+                (agencias[0], datetime(2024, 4, 10, tzinfo=UTC)),
+                (agencias[1], datetime(2024, 3, 10, tzinfo=UTC)),
+            )
+        )
+    ]
+    db.add_all(transacoes)
+    await db.flush()
+
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "criar-regra-e-aplicar"),
+        json={
+            "conta_id": str(conta.id),
+            "agencia_id": str(agencias[0].id),
+            "descricao": "Tarifa bancária",
+            "historico": "TARIFA ESCOPO",
+            "dc": "D",
+            "tipo": "automatica",
+            "manter_historico": False,
+            "mes": "2024-03",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 201
+    body = resposta.json()
+    assert body["regra"]["agencia_id"] == str(agencias[0].id)
+    assert body["resultado"]["total_pendentes"] == 1
+    assert body["resultado"]["associadas"] == 1
+    await db.refresh(transacoes[0])
+    await db.refresh(transacoes[1])
+    await db.refresh(transacoes[2])
+    assert [transacao.status for transacao in transacoes] == [
+        "processada",
+        "pendente",
+        "pendente",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_novas_mutacoes_em_lote_exigem_csrf(client, tenant, usuario, empresa):
+    """As duas ações que escrevem não podem herdar a exceção da simulação.
+
+    O teste trava a fronteira de segurança: prévia é leitura, classificação e
+    criação/aplicação continuam protegidas contra requisições forjadas.
+    """
+    await _login(client, tenant, usuario)
+    lote = await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(uuid4())],
+            "conta_id": str(uuid4()),
+            "descricao": "Tentativa sem token",
+        },
+    )
+    criar = await client.post(
+        _pendencias_url(empresa.id, "criar-regra-e-aplicar"),
+        json={
+            "conta_id": str(uuid4()),
+            "agencia_id": str(uuid4()),
+            "descricao": "Tentativa sem token",
+            "historico": "TARIFA TESTE",
+            "dc": "D",
+        },
+    )
+    assert lote.status_code == 403
+    assert criar.status_code == 403
 
 
 @pytest.mark.asyncio
