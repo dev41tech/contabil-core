@@ -236,6 +236,36 @@ async def test_neo_processa_substring(client, db, tenant, usuario, empresa):
 
 
 @pytest.mark.asyncio
+async def test_historico_iniciado_pela_regra_continua_sendo_substring(
+    client, db, tenant, usuario, empresa
+):
+    """Começar pelo texto da regra não cria uma estratégia distinta.
+
+    `prefixo` era inalcançável porque esse mesmo histórico sempre casa antes
+    por substring. O teste impede que o bloco redundante volte antes de
+    `substring` e passe a gravar uma estratégia que nunca existiu de fato.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "BOLETO", "D", csrf)
+
+    resposta = await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    assert resposta.status_code == 200
+
+    decisoes = (
+        await db.execute(
+            select(NeoDecisao)
+            .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
+            .where(Transacao.historico == "BOLETO ENERGIA ELETRICA")
+        )
+    ).scalars().all()
+    assert len(decisoes) == 1
+    assert decisoes[0].estrategia == "substring"
+
+
+@pytest.mark.asyncio
 async def test_neo_desempata_pela_regra_mais_especifica(client, db, tenant, usuario, empresa):
     """Com duas regras candidatas, vence a mais específica — não a que o banco devolveu primeiro.
 
@@ -304,6 +334,55 @@ async def test_neo_sem_regra_registra(client, db, tenant, usuario, empresa):
     assert r.status_code == 200
     assert r.json()["sem_regra"] >= 1
     assert r.json()["associadas"] == 0
+
+
+@pytest.mark.asyncio
+async def test_regra_manual_nao_classifica_transacao_no_neo(
+    client, db, tenant, usuario, empresa
+):
+    """Uma regra `manual` aceita pela API não pode agir como automática.
+
+    O cadastro historicamente aceitava esse tipo sem avisar que o motor o
+    ignora. O teste documenta a armadilha e impede que uma mudança na carga de
+    regras passe a classificar silenciosamente dados legados como manuais.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    criada = await client.post(
+        f"/api/v1/empresas/{empresa.id}/regras",
+        json={
+            "conta_id": conta_id,
+            "agencia_id": agencia_id,
+            "descricao": "Boleto manual legado",
+            "historico": "BOLETO ENERGIA ELETRICA",
+            "dc": "D",
+            "tipo": "manual",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert criada.status_code == 201
+
+    resposta = await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    assert resposta.status_code == 200
+
+    transacao = (
+        await db.execute(
+            select(Transacao).where(
+                Transacao.empresa_id == empresa.id,
+                Transacao.historico == "BOLETO ENERGIA ELETRICA",
+            )
+        )
+    ).scalar_one()
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+    assert transacao.status == "pendente"
+    assert decisao.resultado == "sem_regra"
+    assert decisao.regra_id is None
 
 
 @pytest.mark.asyncio
@@ -1200,6 +1279,18 @@ async def test_listar_decisoes_filtro_agencia_e_conta(client, db, tenant, usuari
     await _criar_regra(client, empresa, agencia_id, conta_id, "TED RECEBIDA CLIENTE ALFA", "C", csrf)
     await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
 
+    # Reproduz uma linha anterior à migration: o filtro ainda precisa inferir
+    # a conta pela regra quando o backfill não estiver presente nessa cópia.
+    decisao_legada = (
+        await db.execute(
+            select(NeoDecisao)
+            .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
+            .where(Transacao.historico == "TED RECEBIDA CLIENTE ALFA")
+        )
+    ).scalar_one()
+    decisao_legada.conta_id = None
+    await db.flush()
+
     por_agencia = await client.get(_decisoes_url(empresa.id) + f"?agencia_id={agencia_id}")
     assert por_agencia.json()["items"]
 
@@ -1213,6 +1304,82 @@ async def test_listar_decisoes_filtro_agencia_e_conta(client, db, tenant, usuari
     vazio = await client.get(_decisoes_url(empresa.id) + f"?agencia_id={agencia_inexistente}")
     assert vazio.status_code == 200
     assert vazio.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_filtro_conta_encontra_decisoes_manual_e_por_contraparte(
+    client, db, tenant, usuario, empresa
+):
+    """O filtro deve usar a conta aplicada mesmo quando não existe regra.
+
+    Antes, o filtro comparava apenas `Regra.conta_id`: decisões manuais e por
+    contraparte têm `regra_id` nulo e desapareciam, embora seus lançamentos
+    estivessem contabilizados na conta pesquisada.
+    """
+    csrf = await _login(client, tenant, usuario)
+    _, conta_id = await _setup_base(client, db, empresa, csrf)
+    conta = (
+        await db.execute(select(PlanoConta).where(PlanoConta.id == UUID(conta_id)))
+    ).scalar_one()
+    transacoes = {
+        transacao.historico: transacao
+        for transacao in (
+            await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id))
+        ).scalars().all()
+    }
+    deposito = transacoes["DEPOSITO AVULSO DESCONHECIDO"]
+    db.add(
+        NotaFiscal(
+            empresa_id=empresa.id,
+            tipo="nfe",
+            numero="NF-FILTRO-CONTA",
+            cnpj_emitente=empresa.cnpj,
+            cnpj_destinatario="52.540.787/0001-88",
+            valor=deposito.valor,
+            data_emissao=deposito.data,
+            dedup_key="teste-filtro-conta-contraparte",
+        )
+    )
+    await _criar_contraparte(
+        db,
+        empresa,
+        conta,
+        documento="52540787000188",
+        tipo="cliente",
+        razao_social="Cliente do filtro",
+    )
+    await db.flush()
+
+    processada = await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    assert processada.status_code == 200
+    assert processada.json()["classificadas_por_contraparte"] == 1
+
+    sem_regra = (
+        await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")
+    ).json()["items"]
+    boleto = next(
+        item for item in sem_regra
+        if item["transacao_descricao"] == "BOLETO ENERGIA ELETRICA"
+    )
+    associada = await client.post(
+        _decisoes_url(empresa.id) + f"/{boleto['id']}/associar-manual",
+        json={"conta_id": conta_id, "descricao": "Boleto classificado à mão"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert associada.status_code == 200
+    assert associada.json()["conta_id"] == conta_id
+
+    filtradas = (
+        await client.get(_decisoes_url(empresa.id) + f"?conta_id={conta_id}")
+    ).json()["items"]
+    por_estrategia = {item["estrategia"]: item for item in filtradas}
+    assert {"manual", "contraparte"} <= por_estrategia.keys()
+    for estrategia in ("manual", "contraparte"):
+        assert por_estrategia[estrategia]["conta_id"] == conta_id
+        assert por_estrategia[estrategia]["conta_codigo"] == conta.codigo
+        assert por_estrategia[estrategia]["conta_descricao"] == conta.descricao
 
 
 @pytest.mark.asyncio
