@@ -86,10 +86,25 @@ def _reset_stuck_processando() -> None:
         _startup_logger.warning("concilpro.startup.reset_stuck_failed", error=str(exc))
 
 
+async def _recuperar_jobs_sem_heartbeat() -> None:
+    """Recupera jobs realmente órfãos sem interferir nos demais workers."""
+    try:
+        from src.domain.jobs import recuperar_jobs_sem_heartbeat
+
+        recuperados = await recuperar_jobs_sem_heartbeat()
+        if recuperados:
+            _startup_logger.warning("jobs.startup.recuperados", count=recuperados)
+    except Exception as exc:
+        # Falha de manutenção não deve impedir o serviço de subir; o próximo
+        # worker/startup terá outra oportunidade de executar o mesmo predicado.
+        _startup_logger.warning("jobs.startup.recuperacao_falhou", error=str(exc))
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Eventos de ciclo de vida da aplicação."""
     _reset_stuck_processando()
+    await _recuperar_jobs_sem_heartbeat()
     yield
     rate_limiter = getattr(app.state, "login_rate_limiter", None)
     if rate_limiter is not None:

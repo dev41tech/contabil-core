@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
+from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.db.models import Job
 from src.db.session import get_db
+from src.domain.jobs import JobRuntime, executar_importacao_extrato
 from src.domain.extrato.service import ExtratoService
 from src.schemas.extrato import (
     ExtratoPendentesResponse,
-    ImportacaoResult,
     TransacaoFiltro,
     TransacaoResponse,
 )
+from src.schemas.jobs import JobResponse
 
 router = APIRouter(
     prefix="/empresas/{empresa_id}/extrato",
@@ -31,49 +33,44 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> ExtratoService:
 
 @router.post(
     "/importar",
-    response_model=ImportacaoResult,
-    status_code=201,
+    response_model=JobResponse,
+    status_code=202,
     dependencies=[Depends(require_csrf)],
 )
 async def importar_extrato(
     empresa_id: UUID,
+    background_tasks: BackgroundTasks,
+    request: Request,
     agencia_id: UUID = Query(..., description="UUID da agência bancária"),
     arquivo: UploadFile = File(..., description="Arquivo OFX ou PDF de extrato bancário"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
-) -> ImportacaoResult:
-    """Importa um arquivo OFX ou PDF e persiste as transações novas (deduplicação automática)."""
+) -> Job:
+    """Enfileira a importação OFX/PDF sem manter a requisição pendurada."""
     conteudo_bytes = await ler_upload_limitado(arquivo)
     nome = (arquivo.filename or "").lower()
-    svc = _svc(empresa_id, db)
-
-    if nome.endswith(".pdf"):
-        from starlette.concurrency import run_in_threadpool
-
-        from src.core.config import get_settings
-        from src.core.errors import ValidationError as AppValidationError
-        from src.domain.extrato.pdf_parser import PDFParseError, parse_pdf
-
-        try:
-            timeout = get_settings().pdf_parse_timeout_seconds + 5
-            transacoes_pdf = await asyncio.wait_for(
-                run_in_threadpool(parse_pdf, conteudo_bytes),
-                timeout=timeout,
-            )
-        except TimeoutError:
-            raise AppValidationError(
-                message="Processamento do PDF excedeu o tempo limite."
-            ) from None
-        except PDFParseError as e:
-            raise AppValidationError(message=f"Arquivo PDF inválido: {e}") from e
-        return await svc.importar_transacoes_raw(transacoes_pdf, agencia_id)
-    else:
-        # OFX (padrão)
-        try:
-            conteudo = conteudo_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            conteudo = conteudo_bytes.decode("latin-1")
-        return await svc.importar_ofx(conteudo, agencia_id)
+    runtime: JobRuntime = getattr(request.app.state, "job_runtime", JobRuntime())
+    job = Job(
+        empresa_id=empresa_id,
+        tipo="extrato_importar",
+        status="na_fila",
+        criado_por=ctx.user_id,
+        heartbeat_em=datetime.now(UTC),
+    )
+    db.add(job)
+    await db.flush()
+    if runtime.commit:
+        await db.commit()
+    background_tasks.add_task(
+        executar_importacao_extrato,
+        job.id,
+        empresa_id,
+        agencia_id,
+        nome,
+        conteudo_bytes,
+        runtime,
+    )
+    return job
 
 
 @router.get("", response_model=ExtratoPendentesResponse)

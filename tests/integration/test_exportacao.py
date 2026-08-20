@@ -474,7 +474,7 @@ async def _setup_extrato(client, empresa, csrf) -> str:
         files={"arquivo": ("e.ofx", io.BytesIO(_OFX_TRES_TX.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r.status_code == 201
+    assert r.status_code == 202
     return agencia["id"]
 
 

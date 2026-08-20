@@ -83,7 +83,7 @@ async def _setup_base(client, db, empresa, csrf):
         files={"arquivo": ("e.ofx", io.BytesIO(_OFX_TED.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r.status_code == 201
+    assert r.status_code == 202
 
     return agencia["id"], str(conta.id)
 
@@ -154,6 +154,22 @@ def _pendencias_agrupadas_url(empresa_id) -> str:
 
 def _processar_url(empresa_id) -> str:
     return f"/api/v1/empresas/{empresa_id}/neo/processar"
+
+
+async def _resultado_do_job(client, empresa_id, resposta) -> dict:
+    """Lê o resultado persistido porque o POST agora trava o contrato 202/job.
+
+    No transporte ASGI o BackgroundTasks termina antes de o ``post`` devolver
+    ao teste, permitindo validar o ciclo completo sem espera artificial.
+    """
+    assert resposta.status_code == 202
+    job = (
+        await client.get(
+            f"/api/v1/empresas/{empresa_id}/jobs/{resposta.json()['id']}"
+        )
+    ).json()
+    assert job["status"] in {"concluido", "concluido_com_alertas"}
+    return job["resultado"]
 
 
 def _pendencias_url(empresa_id, acao: str) -> str:
@@ -379,7 +395,7 @@ async def test_simulacao_e_motor_concordam_no_mesmo_conjunto(
     executada = await client.post(
         _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
     )
-    assert executada.json()["associadas"] == 2
+    assert (await _resultado_do_job(client, empresa.id, executada))["associadas"] == 2
     classificadas = {
         transacao.historico
         for transacao in (
@@ -666,8 +682,7 @@ async def test_neo_processa_com_match(client, db, tenant, usuario, empresa):
         json={},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r.status_code == 200
-    body = r.json()
+    body = await _resultado_do_job(client, empresa.id, r)
     assert body["associadas"] >= 1
     assert "total_pendentes" in body
     assert "sem_regra" in body
@@ -725,8 +740,7 @@ async def test_neo_processar_filtra_por_mes(client, db, tenant, usuario, empresa
         json={"mes": "2024-03"},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r_marco.status_code == 200
-    body_marco = r_marco.json()
+    body_marco = await _resultado_do_job(client, empresa.id, r_marco)
     assert body_marco["total_pendentes"] == 1
     assert body_marco["associadas"] == 1
 
@@ -742,8 +756,7 @@ async def test_neo_processar_filtra_por_mes(client, db, tenant, usuario, empresa
         json={"mes": "2024-04"},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r_abril.status_code == 200
-    assert r_abril.json()["associadas"] == 1
+    assert (await _resultado_do_job(client, empresa.id, r_abril))["associadas"] == 1
 
     pendentes_depois = (
         await db.execute(select(Transacao).where(Transacao.empresa_id == empresa.id, Transacao.status == "pendente"))
@@ -772,8 +785,7 @@ async def test_neo_processa_substring(client, db, tenant, usuario, empresa):
     await _criar_regra(client, empresa, agencia_id, conta_id, "BOLETO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    assert r.json()["associadas"] >= 1
+    assert (await _resultado_do_job(client, empresa.id, r))["associadas"] >= 1
 
 
 @pytest.mark.asyncio
@@ -793,7 +805,7 @@ async def test_historico_iniciado_pela_regra_continua_sendo_substring(
     resposta = await client.post(
         _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
     )
-    assert resposta.status_code == 200
+    assert resposta.status_code == 202
 
     decisoes = (
         await db.execute(
@@ -832,7 +844,7 @@ async def test_neo_desempata_pela_regra_mais_especifica(client, db, tenant, usua
     )
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
+    assert r.status_code == 202
 
     decisoes = (
         await client.get(f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=associada")
@@ -872,9 +884,9 @@ async def test_neo_sem_regra_registra(client, db, tenant, usuario, empresa):
     # Não cria nenhuma regra
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    assert r.json()["sem_regra"] >= 1
-    assert r.json()["associadas"] == 0
+    resultado = await _resultado_do_job(client, empresa.id, r)
+    assert resultado["sem_regra"] >= 1
+    assert resultado["associadas"] == 0
 
 
 @pytest.mark.asyncio
@@ -906,7 +918,7 @@ async def test_regra_manual_nao_classifica_transacao_no_neo(
     resposta = await client.post(
         _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
     )
-    assert resposta.status_code == 200
+    assert resposta.status_code == 202
 
     transacao = (
         await db.execute(
@@ -935,13 +947,13 @@ async def test_neo_idempotente(client, db, tenant, usuario, empresa):
 
     r1 = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
     r2 = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r1.status_code == 200
-    assert r2.status_code == 200
+    resultado1 = await _resultado_do_job(client, empresa.id, r1)
+    resultado2 = await _resultado_do_job(client, empresa.id, r2)
 
     # A transação que foi associada na 1ª execução não gera nova associação na 2ª.
     # (sem_regra permanecem pendentes para poder ser recuperadas quando novas regras forem criadas.)
-    assert r1.json()["associadas"] >= 1
-    assert r2.json()["associadas"] == 0
+    assert resultado1["associadas"] >= 1
+    assert resultado2["associadas"] == 0
 
 
 @pytest.mark.asyncio
@@ -955,7 +967,7 @@ async def test_neo_cria_duas_partidas_balanceadas(client, db, tenant, usuario, e
     resposta = await client.post(
         _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
     )
-    assert resposta.status_code == 200
+    assert resposta.status_code == 202
 
     transacao = (
         await db.execute(
@@ -1035,7 +1047,7 @@ async def test_neo_sem_regra_nao_duplica_decisao(client, db, tenant, usuario, em
         resposta = await client.post(
             _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
         )
-        assert resposta.status_code == 200
+        assert resposta.status_code == 202
 
     transacao = (
         await db.execute(
@@ -1538,7 +1550,7 @@ async def test_shadow_mode_nao_altera_lancamento_real(
     await _criar_regra(client, empresa, agencia_id, conta_regra, "BOLETO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
+    assert r.status_code == 202
 
     partidas = (
         await db.execute(
@@ -1658,8 +1670,7 @@ async def test_neo_classifica_sem_regra_via_contraparte(
     )
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    body = r.json()
+    body = await _resultado_do_job(client, empresa.id, r)
     assert body["classificadas_por_contraparte"] == 1
     assert body["associadas"] >= 1
     assert body["sem_regra"] == 2  # as outras 2 transações do OFX continuam sem regra/contraparte
@@ -1729,8 +1740,8 @@ async def test_neo_classificacao_por_contraparte_nunca_disputa_com_regra_existen
     await _criar_regra(client, empresa, agencia_id, conta_regra, "BOLETO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    assert r.json()["classificadas_por_contraparte"] == 0
+    resultado = await _resultado_do_job(client, empresa.id, r)
+    assert resultado["classificadas_por_contraparte"] == 0
 
     partidas = (
         await db.execute(
@@ -1758,8 +1769,8 @@ async def test_shadow_sem_regra_sem_contraparte_nao_quebra_processamento(
     await _setup_base(client, db, empresa, csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    assert r.json()["sem_regra"] >= 1
+    resultado = await _resultado_do_job(client, empresa.id, r)
+    assert resultado["sem_regra"] >= 1
 
 
 @pytest.mark.asyncio
@@ -2059,8 +2070,8 @@ async def test_filtro_conta_encontra_decisoes_manual_e_por_contraparte(
     processada = await client.post(
         _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
     )
-    assert processada.status_code == 200
-    assert processada.json()["classificadas_por_contraparte"] == 1
+    resultado = await _resultado_do_job(client, empresa.id, processada)
+    assert resultado["classificadas_por_contraparte"] == 1
 
     sem_regra = (
         await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")
@@ -2186,7 +2197,7 @@ async def _setup_tarifas(client, db, empresa, csrf):
         files={"arquivo": ("t.ofx", io.BytesIO(_OFX_TARIFAS.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r.status_code == 201
+    assert r.status_code == 202
     return agencia["id"], str(conta.id)
 
 
@@ -2205,9 +2216,9 @@ async def test_uma_regra_por_palavra_chave_cobre_todas_as_variacoes(
     await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
-    assert r.json()["associadas"] == 3
-    assert r.json()["sem_regra"] == 0
+    resultado = await _resultado_do_job(client, empresa.id, r)
+    assert resultado["associadas"] == 3
+    assert resultado["sem_regra"] == 0
 
 
 @pytest.mark.asyncio
@@ -2219,7 +2230,7 @@ async def test_regra_com_acento_casa_historico_sem_acento(client, db, tenant, us
     await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDAÇÃO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
+    assert r.status_code == 202
 
     decisoes = (
         await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
@@ -2243,7 +2254,7 @@ async def test_palavra_extra_no_meio_do_historico_ainda_casa(
     await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDACAO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
+    assert r.status_code == 202
 
     decisoes = (
         await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
@@ -2275,7 +2286,7 @@ async def test_todas_palavras_nao_atropela_regra_mais_especifica(
     )
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 200
+    assert r.status_code == 202
 
     decisoes = (
         await client.get(_decisoes_url(empresa.id) + "?resultado=associada")
@@ -2304,14 +2315,14 @@ async def test_transacao_classificada_depois_sai_da_lista_sem_regra(
     agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.json()["sem_regra"] == 3
+    assert (await _resultado_do_job(client, empresa.id, r))["sem_regra"] == 3
 
     sem_regra = (await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")).json()
     assert sem_regra["total"] == 3
 
     await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA", "D", csrf)
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
-    assert r.json()["associadas"] == 3
+    assert (await _resultado_do_job(client, empresa.id, r))["associadas"] == 3
 
     sem_regra = (await client.get(_decisoes_url(empresa.id) + "?resultado=sem_regra")).json()
     assert sem_regra["total"] == 0, "decisão 'sem_regra' ficou órfã depois da classificação"

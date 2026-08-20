@@ -50,6 +50,7 @@ Seleção vs. vinculação de comprovante/nota fiscal:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -161,12 +162,22 @@ class NeoEngine:
         self._empresa_cnpj: str | None = None
 
     async def processar(
-        self, agencia_id: UUID | None = None, mes: str | None = None
+        self,
+        agencia_id: UUID | None = None,
+        mes: str | None = None,
+        progresso: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> NeoResultado:
         """Processa as transações pendentes da empresa (opcionalmente restrito a
-        uma agência e/ou a um mês específico, formato 'AAAA-MM')."""
+        uma agência e/ou a um mês específico, formato 'AAAA-MM').
+
+        ``progresso`` recebe (processados, total), sem conhecer persistência ou
+        o modelo Job. Assim o motor continua reutilizável em rotas e testes, e
+        quem o orquestra decide quando agrupar escritas no banco.
+        """
         regras = await self._carregar_regras(agencia_id)
         pendentes = await self._carregar_pendentes(agencia_id, mes)
+        if progresso is not None:
+            await progresso(0, len(pendentes))
         self._decisoes_sem_regra = await self._carregar_decisoes_sem_regra(pendentes)
         self._comprovantes_consumidos.clear()
         self._notas_consumidas.clear()
@@ -180,7 +191,7 @@ class NeoEngine:
         comprovantes_associados = notas_associadas = 0
         classificadas_por_contraparte = 0
 
-        for transacao in pendentes:
+        for indice, transacao in enumerate(pendentes, start=1):
             try:
                 teve_match = associou_comprovante = associou_nota = False
                 associou_por_contraparte = False
@@ -219,6 +230,8 @@ class NeoEngine:
                 await self._registrar_erro(transacao, str(exc))
                 await self._db.flush()
                 erros += 1
+            if progresso is not None:
+                await progresso(indice, len(pendentes))
 
         await self._db.flush()
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -29,6 +30,7 @@ from src.core.config import get_settings  # noqa: E402
 from src.core.security import hash_password  # noqa: E402
 from src.db.models import Base, Empresa, Tenant, Usuario  # noqa: E402
 from src.db.session import get_db  # noqa: E402
+from src.domain.jobs import JobRuntime  # noqa: E402
 
 # Limpa o cache do Settings para aplicar as variáveis de ambiente acima
 get_settings.cache_clear()
@@ -60,6 +62,14 @@ async def db(engine) -> AsyncGenerator[AsyncSession, None]:
 async def client(db: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     app = create_app()
     app.dependency_overrides[get_db] = lambda: db
+
+    @asynccontextmanager
+    async def job_session_scope():
+        # BackgroundTasks roda inline no transporte ASGI. Usar a sessão isolada
+        # do teste preserva o rollback por caso; produção sempre abre outra.
+        yield db
+
+    app.state.job_runtime = JobRuntime(session_scope=job_session_scope, commit=False)
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
