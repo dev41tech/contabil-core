@@ -42,6 +42,15 @@ from src.db.models import (
     RegistroContabil,
     Transacao,
 )
+from src.domain.exportacao.formatos import (
+    COLUNAS_LANCAMENTOS_IMPORTACAO,
+    _celula_segura,
+    _dicts_to_csv,
+    _dicts_to_txt,
+    _dicts_to_xlsx,
+    _new_workbook,
+    _save_workbook,
+)
 from src.schemas.contabil import ExportJobCreate, ExportJobResponse
 
 logger = structlog.get_logger(__name__)
@@ -51,16 +60,6 @@ logger = structlog.get_logger(__name__)
 _COLUNAS_LANCAMENTOS = [
     "id", "data_lancamento", "historico", "historico_extrato",
     "dc", "valor", "tipo_regra", "conta_id", "agencia_id", "transacao_id",
-]
-
-# Layout padrão de importação de lançamentos contábeis (débito e crédito
-# pareados na mesma linha). Cabeçalhos e grafia acompanham exatamente o
-# modelo fornecido pelo escritório para import no sistema contábil — não
-# alterar sem confirmar que o sistema de destino aceita a mudança.
-_COLUNAS_LANCAMENTOS_IMPORTACAO = [
-    "Data", "Cód. Conta Debito", "Cód. Conta Credito", "Valor",
-    "Cód. Histórico", "Complemento Histórico", "Inicia Lote",
-    "Código Matriz/Filial", "Centro de Custo Débito", "Centro de Custo Crédito",
 ]
 
 _COLUNAS_NOTAS = [
@@ -105,26 +104,6 @@ def _as_decimal(value: Decimal | int | float | str | None) -> Decimal:
 
 def _valor_assinado(value: Decimal, dc: str) -> Decimal:
     return -value if dc == "D" else value
-
-
-def _formatar_valor_br(value: object) -> str:
-    """'700.00' -> '700'; '1.19' -> '1,19'; '583.61' -> '583,61'.
-
-    Only used pelo layout .txt de importação — o modelo do escritório não
-    preenche zeros à direita e usa vírgula decimal. `Decimal.normalize()` não
-    serve aqui: joga números redondos pra notação científica ('7E+2').
-    """
-    texto = f"{Decimal(str(value)):f}"
-    if "." in texto:
-        texto = texto.rstrip("0").rstrip(".")
-    return texto.replace(".", ",")
-
-
-def _celula_segura(value: object) -> object:
-    """Neutraliza fórmulas em qualquer texto antes de cruzar a borda CSV/XLSX."""
-    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
-        return "'" + value
-    return value
 
 
 class ExportacaoService:
@@ -338,12 +317,12 @@ class ExportacaoService:
             })
 
         if fmt == "csv":
-            conteudo = self._dicts_to_csv(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
+            conteudo = self._dicts_to_csv(linhas, COLUNAS_LANCAMENTOS_IMPORTACAO)
         elif fmt == "txt":
-            conteudo = self._dicts_to_txt(linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO)
+            conteudo = self._dicts_to_txt(linhas, COLUNAS_LANCAMENTOS_IMPORTACAO)
         else:
             conteudo = self._dicts_to_xlsx(
-                linhas, _COLUNAS_LANCAMENTOS_IMPORTACAO, "Importação Lançamentos"
+                linhas, COLUNAS_LANCAMENTOS_IMPORTACAO, "Importação Lançamentos"
             )
         return linhas, conteudo
 
@@ -615,34 +594,13 @@ class ExportacaoService:
     # ── helpers xlsx / csv ────────────────────────────────────────────────────
 
     def _new_workbook(self, title: str, colunas: list[str]):
-        try:
-            import openpyxl
-            from openpyxl.styles import Font
-        except ImportError as exc:
-            raise ValidationError(message="openpyxl não instalado. Use formato csv.") from exc
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = title
-        ws.append(colunas)
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        return wb, ws
+        return _new_workbook(title, colunas)
 
     def _save_workbook(self, wb) -> bytes:
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
+        return _save_workbook(wb)
 
     def _dicts_to_csv(self, linhas: list[dict], colunas: list[str]) -> bytes:
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=colunas, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(
-            {chave: _celula_segura(valor) for chave, valor in linha.items()}
-            for linha in linhas
-        )
-        return buf.getvalue().encode("utf-8-sig")
+        return _dicts_to_csv(linhas, colunas)
 
     def _dicts_to_txt(self, linhas: list[dict], colunas: list[str]) -> bytes:
         """Layout exato do arquivo modelo fornecido pelo escritório para
@@ -654,22 +612,9 @@ class ExportacaoService:
         podem ter ponto de verdade (ex: '3.4.2.05.0009') e não podem ser
         tocadas.
         """
-        buf = io.StringIO()
-        w = csv.writer(buf, delimiter=";")
-        for linha in linhas:
-            row = []
-            for col in colunas:
-                valor = linha.get(col, "")
-                if col == "Valor":
-                    valor = _formatar_valor_br(valor)
-                row.append(_celula_segura(valor))
-            w.writerow(row)
-        return buf.getvalue().encode("utf-8-sig")
+        return _dicts_to_txt(linhas, colunas)
 
     def _dicts_to_xlsx(
         self, linhas: list[dict], colunas: list[str], sheet_name: str
     ) -> bytes:
-        wb, ws = self._new_workbook(sheet_name, colunas)
-        for linha in linhas:
-            ws.append([_celula_segura(linha.get(col, "")) for col in colunas])
-        return self._save_workbook(wb)
+        return _dicts_to_xlsx(linhas, colunas, sheet_name)
