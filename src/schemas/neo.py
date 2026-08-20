@@ -63,6 +63,41 @@ class NeoDecisaoListResponse(BaseModel):
     page_size: int
 
 
+class NeoDivergenciaPorContaResponse(BaseModel):
+    conta_regra_id: UUID
+    conta_regra_codigo: str
+    conta_regra_descricao: str
+    conta_contraparte_id: UUID
+    conta_contraparte_codigo: str
+    conta_contraparte_descricao: str
+    quantidade: int
+    valor_total: Decimal
+
+
+class NeoDivergenciaAmostraResponse(BaseModel):
+    decisao_id: UUID
+    transacao_id: UUID
+    historico: str
+    valor: Decimal
+    origem_evidencia: str
+    contraparte_id: UUID
+    conta_regra_id: UUID
+    conta_regra_codigo: str
+    conta_regra_descricao: str
+    conta_contraparte_id: UUID
+    conta_contraparte_codigo: str
+    conta_contraparte_descricao: str
+
+
+class NeoDivergenciasResponse(BaseModel):
+    total_avaliadas: int
+    total_divergentes: int
+    percentual_divergentes: float
+    valor_total_divergente: Decimal
+    por_conta: list[NeoDivergenciaPorContaResponse]
+    amostra: list[NeoDivergenciaAmostraResponse]
+
+
 class NeoPendenciaGrupoResponse(BaseModel):
     padrao: str
     rotulo: str

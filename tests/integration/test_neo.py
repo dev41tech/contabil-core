@@ -1322,6 +1322,49 @@ async def _criar_contraparte(db, empresa, conta, documento="52540787000188", **o
     return contraparte
 
 
+async def _criar_medicao_shadow(
+    db,
+    empresa,
+    agencia,
+    conta_regra,
+    contraparte,
+    *,
+    valor: str,
+    data: datetime,
+    divergente: bool | None,
+    sufixo: str,
+) -> NeoDecisao:
+    """Monta uma medição persistida para os testes isolarem a consulta agregada."""
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=agencia.id,
+        data=data,
+        valor=Decimal(valor),
+        historico=f"CASO SHADOW {sufixo}",
+        dc="D",
+        status="processada",
+        hash_dedup=f"shadow-relatorio-{sufixo}",
+    )
+    db.add(transacao)
+    await db.flush()
+    decisao = NeoDecisao(
+        empresa_id=empresa.id,
+        transacao_id=transacao.id,
+        conta_id=conta_regra.id,
+        resultado="associada",
+        estrategia="substring",
+        contraparte_id=contraparte.id if divergente is not None else None,
+        conta_contraparte_id=(
+            contraparte.conta_contabil_id if divergente is not None else None
+        ),
+        origem_evidencia="nota_fiscal" if divergente is not None else None,
+        conta_divergente=divergente,
+    )
+    db.add(decisao)
+    await db.flush()
+    return decisao
+
+
 @pytest.mark.asyncio
 async def test_shadow_resolve_contraparte_por_nota_fiscal(
     client, db, tenant, usuario, empresa
@@ -1464,8 +1507,8 @@ async def test_shadow_mode_nao_altera_lancamento_real(
     client, db, tenant, usuario, empresa
 ):
     """Fim a fim: mesmo com uma contraparte cadastrada apontando pra outra
-    conta, o lançamento criado pelo processamento continua usando a conta e
-    o histórico decididos pela regra — shadow mode só observa."""
+    conta, o lançamento continua na conta da regra e a divergência fica na
+    mesma decisão — trava que shadow mode só observa e nunca classifica."""
     csrf = await _login(client, tenant, usuario)
     agencia_id, conta_regra = await _setup_base(client, db, empresa, csrf)
     conta_contraparte = await _criar_conta_generica(db, empresa, codigo="4.9.3")
@@ -1489,7 +1532,9 @@ async def test_shadow_mode_nao_altera_lancamento_real(
     )
     db.add(nota)
     await db.flush()
-    await _criar_contraparte(db, empresa, conta_contraparte, documento="52540787000188")
+    contraparte = await _criar_contraparte(
+        db, empresa, conta_contraparte, documento="52540787000188"
+    )
     await _criar_regra(client, empresa, agencia_id, conta_regra, "BOLETO", "D", csrf)
 
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
@@ -1511,6 +1556,15 @@ async def test_shadow_mode_nao_altera_lancamento_real(
     await db.refresh(nota)
     assert nota.transacao_id == debito.id
     assert nota.status == "associada"
+
+    decisao = (
+        await db.execute(select(NeoDecisao).where(NeoDecisao.transacao_id == debito.id))
+    ).scalar_one()
+    assert decisao.conta_id == UUID(conta_regra)
+    assert decisao.contraparte_id == contraparte.id
+    assert decisao.conta_contraparte_id == conta_contraparte.id
+    assert decisao.origem_evidencia == "nota_fiscal"
+    assert decisao.conta_divergente is True
 
 
 @pytest.mark.asyncio
@@ -1706,6 +1760,117 @@ async def test_shadow_sem_regra_sem_contraparte_nao_quebra_processamento(
     r = await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
     assert r.status_code == 200
     assert r.json()["sem_regra"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_divergencias_agrega_valor_ordena_pares_e_respeita_filtros(
+    client, db, tenant, usuario, empresa
+):
+    """O relatório precisa contar FALSE como avaliado, ignorar NULL e priorizar
+    os pares de maior valor; trava também que mês e agência recortam todos os
+    números, pois misturar medições fora do filtro mudaria a decisão de produto."""
+    await _login(client, tenant, usuario)
+    agencias = [
+        AgenciaBancaria(
+            empresa_id=empresa.id,
+            banco_sigla="ITAU",
+            agencia=f"000{indice}",
+            numero=f"1000{indice}",
+        )
+        for indice in (1, 2)
+    ]
+    contas = [
+        PlanoConta(
+            empresa_id=empresa.id,
+            codigo=f"4.8.{indice}",
+            descricao=f"Conta relatório {indice}",
+            tipo="despesa",
+        )
+        for indice in range(1, 5)
+    ]
+    db.add_all([*agencias, *contas])
+    await db.flush()
+    contraparte_maior = await _criar_contraparte(
+        db, empresa, contas[1], documento="11111111000111"
+    )
+    contraparte_menor = await _criar_contraparte(
+        db, empresa, contas[3], documento="22222222000122"
+    )
+    contraparte_concordante = await _criar_contraparte(
+        db, empresa, contas[0], documento="33333333000133"
+    )
+
+    marco = datetime(2024, 3, 15, tzinfo=UTC)
+    await _criar_medicao_shadow(
+        db, empresa, agencias[0], contas[0], contraparte_maior,
+        valor="50000.00", data=marco, divergente=True, sufixo="maior",
+    )
+    await _criar_medicao_shadow(
+        db, empresa, agencias[0], contas[0], contraparte_concordante,
+        valor="20.00", data=marco, divergente=False, sufixo="concordante",
+    )
+    await _criar_medicao_shadow(
+        db, empresa, agencias[0], contas[2], contraparte_menor,
+        valor="20.00", data=marco, divergente=True, sufixo="menor",
+    )
+    # Ausência de medição não é concordância, mesmo com valor muito alto.
+    await _criar_medicao_shadow(
+        db, empresa, agencias[0], contas[0], contraparte_maior,
+        valor="99999.00", data=marco, divergente=None, sufixo="nao-avaliado",
+    )
+    await _criar_medicao_shadow(
+        db, empresa, agencias[1], contas[0], contraparte_maior,
+        valor="1000.00", data=marco, divergente=True, sufixo="outra-agencia",
+    )
+    await _criar_medicao_shadow(
+        db, empresa, agencias[0], contas[0], contraparte_maior,
+        valor="300.00", data=datetime(2024, 4, 1, tzinfo=UTC),
+        divergente=True, sufixo="outro-mes",
+    )
+
+    resposta = await client.get(
+        f"/api/v1/empresas/{empresa.id}/neo/divergencias"
+        f"?mes=2024-03&agencia_id={agencias[0].id}"
+    )
+
+    assert resposta.status_code == 200
+    body = resposta.json()
+    assert body["total_avaliadas"] == 3
+    assert body["total_divergentes"] == 2
+    assert body["percentual_divergentes"] == 66.67
+    assert Decimal(body["valor_total_divergente"]) == Decimal("50020.00")
+    assert [Decimal(item["valor_total"]) for item in body["por_conta"]] == [
+        Decimal("50000.00"),
+        Decimal("20.00"),
+    ]
+    assert [item["quantidade"] for item in body["por_conta"]] == [1, 1]
+    assert [item["historico"] for item in body["amostra"]] == [
+        "CASO SHADOW maior",
+        "CASO SHADOW menor",
+    ]
+    assert body["amostra"][0]["conta_regra_id"] == str(contas[0].id)
+    assert body["amostra"][0]["conta_contraparte_id"] == str(contas[1].id)
+
+
+@pytest.mark.asyncio
+async def test_divergencias_sem_medicao_retorna_agregado_vazio(
+    client, db, tenant, usuario, empresa
+):
+    """Sem shadow avaliado o endpoint deve devolver zeros e listas vazias;
+    trava a semântica de que ausência de medição não vira conflito nem 100%."""
+    await _login(client, tenant, usuario)
+
+    resposta = await client.get(f"/api/v1/empresas/{empresa.id}/neo/divergencias")
+
+    assert resposta.status_code == 200
+    assert resposta.json() == {
+        "total_avaliadas": 0,
+        "total_divergentes": 0,
+        "percentual_divergentes": 0.0,
+        "valor_total_divergente": "0.00",
+        "por_conta": [],
+        "amostra": [],
+    }
 
 
 # ── Listar decisões
