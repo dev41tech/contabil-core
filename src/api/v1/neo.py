@@ -122,6 +122,8 @@ async def listar_decisoes(
     )
 
 
+# A consulta foi criada nesta semana para a futura tela de conflitos; retirar a
+# capacidade só porque essa tela ainda não chegou inverteria a dependência.
 @router.get("/divergencias", response_model=NeoDivergenciasResponse)
 async def consultar_divergencias(
     empresa_id: UUID,

@@ -70,6 +70,9 @@ class NotaFiscalResponse(BaseModel):
     data_emissao: datetime
     status: str
     transacao_id: UUID | None
+    transacao_descricao: str | None = None
+    transacao_valor: Decimal | None = None
+    transacao_dc: str | None = None
     chave_acesso: str | None
     observacao: str | None
     origem: str

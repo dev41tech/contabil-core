@@ -20,7 +20,7 @@ from io import BytesIO
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -111,22 +111,30 @@ class NotaService:
 
         rows = (
             await self._db.execute(
-                q.order_by(NotaFiscal.data_emissao.desc())
+                q.add_columns(Transacao)
+                .outerjoin(
+                    Transacao,
+                    and_(
+                        NotaFiscal.transacao_id == Transacao.id,
+                        Transacao.empresa_id == self._empresa_id,
+                    ),
+                )
+                .order_by(NotaFiscal.data_emissao.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )
-        ).scalars().all()
+        ).all()
 
         return NotaFiscalListResponse(
-            items=[NotaFiscalResponse.model_validate(n) for n in rows],
+            items=[self._resposta(nota, transacao) for nota, transacao in rows],
             total=total,
             page=page,
             page_size=page_size,
         )
 
     async def obter(self, nota_id: UUID) -> NotaFiscalResponse:
-        nota = await self._get_or_404(nota_id)
-        return NotaFiscalResponse.model_validate(nota)
+        nota, transacao = await self._get_com_transacao_or_404(nota_id)
+        return self._resposta(nota, transacao)
 
     async def criar(self, data: NotaFiscalCreate) -> NotaFiscalResponse:
         chave_acesso = _normalizar_chave_acesso(data.chave_acesso)
@@ -193,7 +201,8 @@ class NotaService:
                 Transacao.empresa_id == self._empresa_id,
             )
         )
-        if not result.scalar_one_or_none():
+        transacao = result.scalar_one_or_none()
+        if not transacao:
             raise NotFoundError(message="Transação não encontrada nesta empresa.")
 
         nota.transacao_id = req.transacao_id
@@ -205,7 +214,7 @@ class NotaService:
             nota_id=str(nota_id),
             transacao_id=str(req.transacao_id),
         )
-        return NotaFiscalResponse.model_validate(nota)
+        return self._resposta(nota, transacao)
 
     async def desassociar_transacao(self, nota_id: UUID) -> NotaFiscalResponse:
         nota = await self._get_or_404(nota_id)
@@ -359,6 +368,40 @@ class NotaService:
         if not nota:
             raise NotFoundError(message="Nota fiscal não encontrada.")
         return nota
+
+    async def _get_com_transacao_or_404(
+        self, nota_id: UUID
+    ) -> tuple[NotaFiscal, Transacao | None]:
+        result = await self._db.execute(
+            select(NotaFiscal, Transacao)
+            .outerjoin(
+                Transacao,
+                and_(
+                    NotaFiscal.transacao_id == Transacao.id,
+                    Transacao.empresa_id == self._empresa_id,
+                ),
+            )
+            .where(
+                NotaFiscal.id == nota_id,
+                NotaFiscal.empresa_id == self._empresa_id,
+                NotaFiscal.deleted_at == None,
+            )
+        )
+        row = result.one_or_none()
+        if not row:
+            raise NotFoundError(message="Nota fiscal não encontrada.")
+        return row[0], row[1]
+
+    @staticmethod
+    def _resposta(
+        nota: NotaFiscal, transacao: Transacao | None = None
+    ) -> NotaFiscalResponse:
+        resposta = NotaFiscalResponse.model_validate(nota)
+        if transacao is not None:
+            resposta.transacao_descricao = transacao.historico
+            resposta.transacao_valor = transacao.valor
+            resposta.transacao_dc = transacao.dc
+        return resposta
 
 
 _MAX_ZIP_ENTRADAS = 1_000

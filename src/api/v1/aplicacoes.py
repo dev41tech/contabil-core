@@ -38,6 +38,8 @@ async def listar_aplicacoes(
     return await _svc(empresa_id, db).listar(apenas_ativas=apenas_ativas)
 
 
+# O GET unitário preserva a forma REST necessária a uma futura tela de detalhe;
+# removê-lo pela ausência temporária de UI criaria retrabalho sem ganho real.
 @router.get("/{aplicacao_id}", response_model=AplicacaoFinanceiraResponse)
 async def obter_aplicacao(
     empresa_id: UUID,

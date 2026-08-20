@@ -47,6 +47,8 @@ async def listar_empresas(
     return await _svc(ctx, db).listar(page=page, page_size=page_size)
 
 
+# Sustenta a tarefa aberta de levantar com o escritório os 70 CNPJs inválidos;
+# não ter tela ainda não torna dispensável essa consulta operacional.
 # Precisa vir antes de /{empresa_id} — senão o path param captura "cnpj-invalidos"
 # e a rota morre num 422 de UUID inválido.
 @router.get("/cnpj-invalidos", response_model=CnpjInvalidoListResponse)
@@ -62,6 +64,8 @@ async def listar_cnpj_invalidos(
     return await _svc(ctx, db).listar_cnpj_invalidos()
 
 
+# Consultar, editar e excluir uma empresa são lacunas de tela já mapeadas. As
+# rotas ficam como contrato do domínio enquanto a UI administrativa não chega.
 @router.get("/{empresa_id}", response_model=EmpresaResponse)
 async def obter_empresa(
     empresa_id: UUID,

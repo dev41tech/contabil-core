@@ -58,6 +58,8 @@ async def listar_contas(
     return await _svc(empresa_id, db).listar()
 
 
+# A árvore e o GET unitário são representações naturais do recurso e serão úteis
+# assim que houver navegação hierárquica/detalhe, mesmo sem consumidor hoje.
 @router.get("/arvore", response_model=PlanoContaTreeResponse)
 async def arvore_contas(
     empresa_id: UUID,

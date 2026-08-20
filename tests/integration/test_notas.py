@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 
+from decimal import Decimal
+
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Empresa, Tenant, Usuario
@@ -151,6 +154,53 @@ async def test_listar_notas(client, tenant, usuario, empresa):
     r = await client.get(_url(empresa.id))
     assert r.status_code == 200
     assert r.json()["total"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_listar_notas_resume_transacao_em_um_unico_join(
+    client, engine, tenant, usuario, empresa
+):
+    """Trava o resumo em lote porque trocar o N+1 do front por um SELECT por nota manteria o problema."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    transacao_id = await _criar_transacao(client, empresa, agencia["id"], csrf)
+
+    for numero in ("RESUMO-1", "RESUMO-2"):
+        nota = (
+            await client.post(
+                _url(empresa.id),
+                json={**_NOTA_PAYLOAD, "numero": numero},
+                headers={"X-CSRF-Token": csrf},
+            )
+        ).json()
+        resposta = await client.post(
+            _url(empresa.id, nota["id"], "/associar"),
+            json={"transacao_id": transacao_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resposta.status_code == 200
+
+    joins_transacao = []
+
+    def registrar_join(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "JOIN transacoes" in statement:
+            joins_transacao.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", registrar_join)
+    try:
+        resposta = await client.get(_url(empresa.id), params={"numero": "RESUMO-"})
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", registrar_join)
+
+    assert resposta.status_code == 200
+    assert len(joins_transacao) == 1
+    for item in resposta.json()["items"]:
+        assert item["transacao_descricao"] == "PAGTO FORNECEDOR NF"
+        # Compara numericamente: `Numeric` volta como Decimal no Postgres
+        # (serializado como string) e como int/float no SQLite da suíte.
+        # Afirmar a string literal travaria a serialização de um dialeto só.
+        assert Decimal(str(item["transacao_valor"])) == Decimal("800")
+        assert item["transacao_dc"] == "D"
 
 
 @pytest.mark.asyncio

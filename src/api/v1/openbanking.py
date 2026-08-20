@@ -80,6 +80,8 @@ async def sincronizar(
     return await svc.sincronizar(conexao_id, body)
 
 
+# Reconectar é uma capacidade real para conexões expiradas; a ausência do botão
+# na UI é uma lacuna de exposição, não sinal de que o fluxo esteja morto.
 @router.post(
     "/conexoes/{conexao_id}/reconectar",
     response_model=ConnectTokenResponse,

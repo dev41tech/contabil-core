@@ -45,6 +45,8 @@ async def listar_regras(
     )
 
 
+# Mesmo sem tela de detalhe hoje, o GET unitário preserva a forma REST natural
+# para edição/inspeção futura e tem custo de manutenção desprezível.
 @router.get("/{regra_id}", response_model=RegraResponse)
 async def obter_regra(
     empresa_id: UUID,
@@ -84,16 +86,3 @@ async def atualizar_regra(
 ) -> RegraResponse:
     return await _svc(empresa_id, db).atualizar(regra_id, body)
 
-
-@router.delete(
-    "/{regra_id}",
-    status_code=204,
-    dependencies=[Depends(require_csrf)],
-)
-async def desativar_regra(
-    empresa_id: UUID,
-    regra_id: UUID,
-    ctx: AuthContext = Depends(get_company_context),
-    db: AsyncSession = Depends(get_db),
-) -> None:
-    await _svc(empresa_id, db).desativar(regra_id)

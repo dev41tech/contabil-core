@@ -17,6 +17,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import AgenciaBancaria, Comprovante, Empresa, Tenant, Transacao, Usuario
@@ -106,6 +107,42 @@ async def test_criar_e_obter(
     r = await client.get(_url(empresa.id, f"/{criado['id']}"))
     assert r.status_code == 200
     assert r.json()["id"] == criado["id"]
+
+
+@pytest.mark.asyncio
+async def test_listar_comprovantes_resume_transacao_em_um_unico_join(
+    client: AsyncClient,
+    engine,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+    transacao: Transacao,
+):
+    """Trava o resumo em lote porque consultar o extrato por comprovante recriaria o N+1 no backend."""
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, favorecido="LOTE A", transacao_id=str(transacao.id))
+    await _criar(client, empresa, csrf, favorecido="LOTE B", transacao_id=str(transacao.id))
+    joins_transacao = []
+
+    def registrar_join(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "JOIN transacoes" in statement:
+            joins_transacao.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", registrar_join)
+    try:
+        resposta = await client.get(_url(empresa.id))
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", registrar_join)
+
+    assert resposta.status_code == 200
+    assert len(joins_transacao) == 1
+    for item in resposta.json()["items"]:
+        assert item["transacao_descricao"] == "PAGAMENTO FORNECEDOR ACME"
+        # Compara numericamente: `Numeric` volta como Decimal no Postgres
+        # (serializado como string) e como int/float no SQLite da suíte.
+        # Afirmar a string literal travaria a serialização de um dialeto só.
+        assert Decimal(str(item["transacao_valor"])) == Decimal("1500")
+        assert item["transacao_dc"] == "D"
 
 
 @pytest.mark.asyncio
