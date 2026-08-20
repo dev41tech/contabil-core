@@ -5,6 +5,8 @@ from fastapi import APIRouter
 from src.api.v1.agencias import router as agencias_router
 from src.api.v1.aplicacoes import router as aplicacoes_router
 from src.api.v1.auth import router as auth_router
+from src.api.v1.auditoria import router as auditoria_router
+from src.api.v1.carteira import router as carteira_router
 from src.api.v1.comprovantes import router as comprovantes_router
 from src.api.v1.contabil import router as contabil_router
 from src.api.v1.contrapartes import router as contrapartes_router
@@ -26,8 +28,10 @@ from src.api.v1.concilpro import router as concilpro_router
 router = APIRouter(prefix="/api/v1")
 
 router.include_router(auth_router)
+router.include_router(carteira_router)
 router.include_router(usuarios_router)
 router.include_router(empresas_router)
+router.include_router(auditoria_router)
 router.include_router(agencias_router)
 router.include_router(aplicacoes_router)
 router.include_router(plano_contas_router)

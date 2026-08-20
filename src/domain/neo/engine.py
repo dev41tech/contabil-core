@@ -83,6 +83,7 @@ _DATA_TOLERANCIA_COMP = 3             # dias de tolerância para comprovantes
 _DATA_TOLERANCIA_NF = 7              # dias de tolerância para notas fiscais
 
 _ESTRATEGIAS_MATCH = ("exato", "substring", "todas_palavras")
+_ERROS_DE_PROGRAMACAO = (AttributeError, TypeError, NameError, ImportError, KeyError)
 
 
 def estrategia_de_match_normalizado(regra: str, transacao: str) -> str | None:
@@ -211,6 +212,13 @@ class NeoEngine:
                 else:
                     sem_regra += 1
             except Exception as exc:
+                # Estes tipos apontam para contrato quebrado no próprio código, não
+                # para uma transação ruim. Convertê-los em decisão `erro` esconderia
+                # a causa e repetiria o mesmo defeito em todo o extrato. Se um parser
+                # tiver um caso legítimo desses, ele deve capturá-lo na fronteira e
+                # traduzi-lo para uma exceção de domínio antes de chegar ao motor.
+                if isinstance(exc, _ERROS_DE_PROGRAMACAO):
+                    raise
                 logger.error(
                     "neo.erro_transacao",
                     transacao_id=str(transacao.id),

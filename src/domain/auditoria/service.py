@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.context import get_trace_id, get_user_id
-from src.db.models import AuditLog, Empresa
+from src.core.periodos import limites_competencia
+from src.db.models import AuditLog, Empresa, Usuario
+from src.schemas.auditoria import AuditoriaItemResponse, AuditoriaListResponse
 
 
 def _json_default(value: object) -> str:
@@ -82,3 +85,83 @@ async def registrar_auditoria(
     db.add(log)
     await db.flush()
     return log
+
+
+def _desserializar(dados: str | None) -> dict[str, Any] | None:
+    return json.loads(dados) if dados is not None else None
+
+
+async def listar_auditoria(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    empresa_id: UUID,
+    usuario_id: UUID | None = None,
+    acao: str | None = None,
+    entidade: str | None = None,
+    mes: str | None = None,
+    data_de: date | None = None,
+    data_ate: date | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> AuditoriaListResponse:
+    """Lista eventos da empresa com o ator resolvido na mesma consulta."""
+    filtros = [
+        AuditLog.tenant_id == tenant_id,
+        AuditLog.empresa_id == empresa_id,
+    ]
+    if usuario_id is not None:
+        filtros.append(AuditLog.usuario_id == usuario_id)
+    if acao is not None:
+        filtros.append(AuditLog.acao == acao)
+    if entidade is not None:
+        filtros.append(AuditLog.entidade == entidade)
+    if mes is not None:
+        inicio_mes, fim_mes = limites_competencia(mes)
+        filtros.extend((AuditLog.created_at >= inicio_mes, AuditLog.created_at < fim_mes))
+    if data_de is not None:
+        filtros.append(AuditLog.created_at >= datetime.combine(data_de, time.min, tzinfo=UTC))
+    if data_ate is not None:
+        # Limite exclusivo no dia seguinte inclui qualquer horário de `data_ate`
+        # sem depender da precisão de timestamp de SQLite ou PostgreSQL.
+        proximo_dia = datetime.combine(data_ate, time.min, tzinfo=UTC) + timedelta(days=1)
+        filtros.append(AuditLog.created_at < proximo_dia)
+
+    total = (
+        await db.execute(select(func.count()).select_from(AuditLog).where(*filtros))
+    ).scalar_one()
+    consulta = (
+        select(AuditLog, Usuario.nome, Usuario.email)
+        .outerjoin(
+            Usuario,
+            and_(
+                Usuario.id == AuditLog.usuario_id,
+                Usuario.tenant_id == AuditLog.tenant_id,
+            ),
+        )
+        .where(*filtros)
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    linhas = (await db.execute(consulta)).all()
+    return AuditoriaListResponse(
+        items=[
+            AuditoriaItemResponse(
+                id=log.id,
+                usuario_id=log.usuario_id,
+                usuario_nome=usuario_nome,
+                usuario_email=usuario_email,
+                quando=log.created_at,
+                acao=log.acao,
+                entidade=log.entidade,
+                entidade_id=log.entidade_id,
+                dados_antes=_desserializar(log.dados_antes),
+                dados_depois=_desserializar(log.dados_depois),
+            )
+            for log, usuario_nome, usuario_email in linhas
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
