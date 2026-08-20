@@ -16,6 +16,7 @@ from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.consultas import (
     agrupar_pendencias as _agrupar_pendencias,
+    consultar_divergencias as _consultar_divergencias,
     listar_decisoes as _listar_decisoes,
     simular_regra as _simular_regra,
 )
@@ -29,6 +30,7 @@ from src.schemas.neo import (
     NeoCriarRegraEAplicarResponse,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
+    NeoDivergenciasResponse,
     NeoPendenciasAgrupadasResponse,
     NeoProcessarRequest,
     NeoResultado,
@@ -117,6 +119,23 @@ async def listar_decisoes(
         valor_max=valor_max,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/divergencias", response_model=NeoDivergenciasResponse)
+async def consultar_divergencias(
+    empresa_id: UUID,
+    mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
+    agencia_id: UUID | None = Query(default=None),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoDivergenciasResponse:
+    """Agrega conflitos medidos entre a conta da regra e a da contraparte."""
+    return await _consultar_divergencias(
+        db,
+        empresa_id,
+        mes=mes,
+        agencia_id=agencia_id,
     )
 
 

@@ -3,9 +3,9 @@
 Existe porque `GET /neo/decisoes` só tinha `resultado`/`page`/`page_size` e o
 router fazia SELECT + batch-fetch direto (ver item 4 do PDF de feedback dos
 contadores: "seria possível colocar no NEO uma opção de busca/filtro?"). Os
-filtros usam apenas dados que já existem em `NeoDecisao`/`Transacao`/`Regra` —
-nada aqui depende de `Contraparte` porque a decisão persiste a conta aplicada,
-mas não a proveniência completa da contraparte.
+filtros usam apenas dados persistidos em `NeoDecisao`/`Transacao`/`Regra`.
+Desde a migration 0023, a decisão também guarda a medição de contraparte do
+shadow mode; isso permite o relatório agregado sem reler documentos fiscais.
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import contains_eager
+from sqlalchemy.orm import aliased, contains_eager
 
 from src.core.dates import bounds_do_mes
 from src.core.errors import ValidationError
@@ -41,6 +41,9 @@ from src.schemas.neo import (
     NeoConflitoAmostra,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
+    NeoDivergenciaAmostraResponse,
+    NeoDivergenciaPorContaResponse,
+    NeoDivergenciasResponse,
     NeoPendenciaGrupoResponse,
     NeoPendenciasAgrupadasResponse,
     NeoSimulacaoConflitos,
@@ -51,6 +54,7 @@ from src.schemas.neo import (
 
 RESULTADOS_VALIDOS = ("associada", "sem_regra", "erro")
 TETO_PENDENCIAS_AGRUPAMENTO = 10_000
+LIMITE_AMOSTRA_DIVERGENCIAS = 10
 ESTRATEGIAS_VALIDAS = (
     "exato",
     "substring",
@@ -62,10 +66,18 @@ ESTRATEGIAS_VALIDAS = (
     "contraparte",
 )
 
-# O front manda ora "D"/"C", ora a palavra por extenso (com ou sem acento).
-# Antes, qualquer coisa diferente de "D"/"C" virava um WHERE que não casava com
-# nada e a tela mostrava lista vazia sem dizer por quê — era o "filtro de
-# crédito/débito não funciona" relatado pelo escritório.
+# Aceita a letra e a palavra por extenso, com ou sem acento.
+#
+# Correção de rota: este bloco nasceu com a hipótese de que o front mandava
+# "débito"/"crédito" por extenso e que era isso o "filtro de crédito/débito não
+# funciona" relatado pelo escritório. Era falso — o front sempre mandou "D"/"C",
+# e havia teste cobrindo. A queixa real era outra: a tabela do NEO não exibia
+# valor nem D/C, então filtrar não mudava nada visível na tela e parecia
+# quebrado. Resolvido no front, com as colunas.
+#
+# A tolerância aqui fica porque é barata e vale por si: antes, qualquer valor
+# diferente de "D"/"C" virava um WHERE que não casava com nada e a tela
+# devolvia lista vazia sem dizer por quê. Hoje valor desconhecido responde 422.
 _DC_ACEITOS = {
     "d": "D",
     "debito": "D",
@@ -208,6 +220,159 @@ async def listar_decisoes(
         items.append(item)
 
     return NeoDecisaoListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+async def consultar_divergencias(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    mes: str | None = None,
+    agencia_id: UUID | None = None,
+) -> NeoDivergenciasResponse:
+    """Resume as medições reais do shadow mode e seus conflitos financeiros.
+
+    `conta_divergente IS NOT NULL` é o marcador de que houve medição. Em
+    especial, FALSE entra em `total_avaliadas`: filtrá-lo como truthy faria o
+    denominador conter só conflitos e produzir um percentual enganoso.
+    """
+    filtros = [
+        NeoDecisao.empresa_id == empresa_id,
+        NeoDecisao.conta_divergente.is_not(None),
+    ]
+    if agencia_id is not None:
+        filtros.append(Transacao.agencia_id == agencia_id)
+    if mes is not None:
+        inicio, fim = bounds_do_mes(mes)
+        filtros.extend((Transacao.data >= inicio, Transacao.data <= fim))
+
+    resumo = (
+        await db.execute(
+            select(
+                func.count(NeoDecisao.id),
+                func.sum(
+                    case((NeoDecisao.conta_divergente.is_(True), 1), else_=0)
+                ),
+                func.sum(
+                    case(
+                        (NeoDecisao.conta_divergente.is_(True), Transacao.valor),
+                        else_=Decimal("0"),
+                    )
+                ),
+            )
+            .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
+            .where(*filtros)
+        )
+    ).one()
+    total_avaliadas = int(resumo[0] or 0)
+    total_divergentes = int(resumo[1] or 0)
+    valor_total_divergente = Decimal(str(resumo[2] or Decimal("0.00")))
+
+    conta_regra = aliased(PlanoConta)
+    conta_contraparte = aliased(PlanoConta)
+    grupos = (
+        await db.execute(
+            select(
+                NeoDecisao.conta_id,
+                conta_regra.codigo,
+                conta_regra.descricao,
+                NeoDecisao.conta_contraparte_id,
+                conta_contraparte.codigo,
+                conta_contraparte.descricao,
+                func.count(NeoDecisao.id),
+                func.sum(Transacao.valor),
+            )
+            .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
+            .join(conta_regra, conta_regra.id == NeoDecisao.conta_id)
+            .join(
+                conta_contraparte,
+                conta_contraparte.id == NeoDecisao.conta_contraparte_id,
+            )
+            .where(*filtros, NeoDecisao.conta_divergente.is_(True))
+            .group_by(
+                NeoDecisao.conta_id,
+                conta_regra.codigo,
+                conta_regra.descricao,
+                NeoDecisao.conta_contraparte_id,
+                conta_contraparte.codigo,
+                conta_contraparte.descricao,
+            )
+            .order_by(func.sum(Transacao.valor).desc())
+        )
+    ).all()
+    por_conta = [
+        NeoDivergenciaPorContaResponse(
+            conta_regra_id=row[0],
+            conta_regra_codigo=row[1],
+            conta_regra_descricao=row[2],
+            conta_contraparte_id=row[3],
+            conta_contraparte_codigo=row[4],
+            conta_contraparte_descricao=row[5],
+            quantidade=row[6],
+            valor_total=row[7],
+        )
+        for row in grupos
+    ]
+
+    casos = (
+        await db.execute(
+            select(
+                NeoDecisao.id,
+                Transacao.id,
+                Transacao.historico,
+                Transacao.valor,
+                NeoDecisao.origem_evidencia,
+                NeoDecisao.contraparte_id,
+                NeoDecisao.conta_id,
+                conta_regra.codigo,
+                conta_regra.descricao,
+                NeoDecisao.conta_contraparte_id,
+                conta_contraparte.codigo,
+                conta_contraparte.descricao,
+            )
+            .join(Transacao, Transacao.id == NeoDecisao.transacao_id)
+            .join(conta_regra, conta_regra.id == NeoDecisao.conta_id)
+            .join(
+                conta_contraparte,
+                conta_contraparte.id == NeoDecisao.conta_contraparte_id,
+            )
+            .where(*filtros, NeoDecisao.conta_divergente.is_(True))
+            # Os maiores valores são os casos mais úteis para uma decisão de
+            # produto; IDs estabilizam o desempate entre valores iguais.
+            .order_by(Transacao.valor.desc(), NeoDecisao.id.asc())
+            .limit(LIMITE_AMOSTRA_DIVERGENCIAS)
+        )
+    ).all()
+    amostra = [
+        NeoDivergenciaAmostraResponse(
+            decisao_id=row[0],
+            transacao_id=row[1],
+            historico=row[2],
+            valor=row[3],
+            origem_evidencia=row[4],
+            contraparte_id=row[5],
+            conta_regra_id=row[6],
+            conta_regra_codigo=row[7],
+            conta_regra_descricao=row[8],
+            conta_contraparte_id=row[9],
+            conta_contraparte_codigo=row[10],
+            conta_contraparte_descricao=row[11],
+        )
+        for row in casos
+    ]
+
+    percentual = (
+        round(total_divergentes * 100 / total_avaliadas, 2)
+        if total_avaliadas
+        else 0.0
+    )
+    return NeoDivergenciasResponse(
+        total_avaliadas=total_avaliadas,
+        total_divergentes=total_divergentes,
+        percentual_divergentes=percentual,
+        valor_total_divergente=valor_total_divergente,
+        por_conta=por_conta,
+        amostra=amostra,
+    )
 
 
 def _escapar_ilike(termo: str) -> str:

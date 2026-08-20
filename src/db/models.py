@@ -702,7 +702,11 @@ class ConexaoBancaria(Base, TimestampMixin):
 
 
 class NeoDecisao(Base):
-    """Rastreia por que cada transação foi ou não associada a uma regra pelo NEO."""
+    """Rastreia o desfecho do NEO e, quando avaliada, sua resolução sombra.
+
+    `conta_divergente=None` significa shadow não avaliado; `False` significa
+    que houve evidência e as contas da regra e da contraparte concordaram.
+    """
 
     __tablename__ = "neo_decisoes"
 
@@ -713,6 +717,17 @@ class NeoDecisao(Base):
     conta_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("plano_contas.id"), nullable=True
     )
+    contraparte_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("contrapartes.id"), nullable=True
+    )
+    conta_contraparte_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("plano_contas.id"), nullable=True
+    )
+    origem_evidencia: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # NULL quer dizer que o shadow não foi avaliado; False é uma medição real
+    # em que regra e contraparte concordaram. Colapsar os dois estados faria o
+    # relatório tratar falta de evidência como concordância.
+    conta_divergente: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     resultado: Mapped[str] = mapped_column(
         Enum("associada", "sem_regra", "erro", name="resultado_neo_enum"), nullable=False
     )
@@ -727,7 +742,13 @@ class NeoDecisao(Base):
 
     transacao: Mapped[Transacao] = relationship("Transacao")
     regra: Mapped[Regra | None] = relationship("Regra")
-    conta: Mapped[PlanoConta | None] = relationship("PlanoConta")
+    conta: Mapped[PlanoConta | None] = relationship(
+        "PlanoConta", foreign_keys=[conta_id]
+    )
+    contraparte: Mapped[Contraparte | None] = relationship("Contraparte")
+    conta_contraparte: Mapped[PlanoConta | None] = relationship(
+        "PlanoConta", foreign_keys=[conta_contraparte_id]
+    )
 
     __table_args__ = (
         Index("ix_neo_empresa_resultado", "empresa_id", "resultado"),

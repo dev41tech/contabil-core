@@ -322,7 +322,7 @@ class NeoEngine:
         comprovante_candidato = await self._selecionar_comprovante_candidato(transacao)
         nota_candidata = await self._selecionar_nota_candidata(transacao)
 
-        await self._logar_resolucao_sombra(
+        resolucao_sombra = await self._logar_resolucao_sombra(
             transacao, regra, historico_saida, comprovante_candidato, nota_candidata
         )
 
@@ -344,6 +344,7 @@ class NeoEngine:
             conta_id=regra.conta_id,
             estrategia=estrategia,
             motivo=f"Regra '{regra.historico}' ({estrategia})",
+            resolucao_sombra=resolucao_sombra,
         )
 
         associou_comprovante = False
@@ -375,12 +376,18 @@ class NeoEngine:
         historico_regra: str,
         comprovante_candidato: Comprovante | None,
         nota_candidata: NotaFiscal | None,
-    ) -> None:
+    ) -> ResolucaoSombra | None:
+        """Resolve e registra a medição paralela sem aplicar sua conta.
+
+        A resolução é devolvida para que `_registrar_decisao` persista os
+        atributos na mesma linha do desfecho. Este método não altera partidas,
+        transação ou regra: shadow continua sendo apenas observação.
+        """
         resolucao = await self._resolver_contraparte_sombra(
             transacao, regra, comprovante_candidato, nota_candidata
         )
         if resolucao is None:
-            return
+            return None
 
         logger.info(
             "neo.shadow.contraparte_encontrada",
@@ -402,6 +409,7 @@ class NeoEngine:
                 conta_regra_id=str(regra.conta_id),
                 conta_contraparte_id=str(resolucao.conta_contraparte_id),
             )
+        return resolucao
 
     async def _resolver_contraparte_sombra(
         self,
@@ -711,6 +719,7 @@ class NeoEngine:
         conta_id: UUID | None,
         estrategia: str | None,
         motivo: str | None,
+        resolucao_sombra: ResolucaoSombra | None = None,
     ) -> NeoDecisao:
         """Grava o desfecho do NEO para esta transação.
 
@@ -729,6 +738,18 @@ class NeoEngine:
             aberta.resultado = resultado
             aberta.estrategia = estrategia
             aberta.motivo = motivo
+            aberta.contraparte_id = (
+                resolucao_sombra.contraparte_id if resolucao_sombra else None
+            )
+            aberta.conta_contraparte_id = (
+                resolucao_sombra.conta_contraparte_id if resolucao_sombra else None
+            )
+            aberta.origem_evidencia = (
+                resolucao_sombra.origem_evidencia if resolucao_sombra else None
+            )
+            aberta.conta_divergente = (
+                resolucao_sombra.conta_divergente if resolucao_sombra else None
+            )
             aberta.processado_em = datetime.now(UTC)
             return aberta
 
@@ -740,6 +761,18 @@ class NeoEngine:
             resultado=resultado,
             estrategia=estrategia,
             motivo=motivo,
+            contraparte_id=(
+                resolucao_sombra.contraparte_id if resolucao_sombra else None
+            ),
+            conta_contraparte_id=(
+                resolucao_sombra.conta_contraparte_id if resolucao_sombra else None
+            ),
+            origem_evidencia=(
+                resolucao_sombra.origem_evidencia if resolucao_sombra else None
+            ),
+            conta_divergente=(
+                resolucao_sombra.conta_divergente if resolucao_sombra else None
+            ),
         )
         self._db.add(decisao)
         # A linha nova não entra em `_decisoes_sem_regra`: esse índice é só das já
