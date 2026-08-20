@@ -13,7 +13,7 @@ import io
 import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
@@ -32,6 +32,12 @@ from src.db.models import (
     CpConciliacao as ConciliacaoInterna,
 )
 from src.db.session import SyncSessionLocal, get_db
+from src.domain.exportacao.formatos import (
+    COLUNAS_LANCAMENTOS_IMPORTACAO,
+    _dicts_to_csv,
+    _dicts_to_txt,
+    _dicts_to_xlsx,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -878,23 +884,11 @@ async def exportar_excel(
     )
 
 
-# Layout padrão de importação de lançamentos contábeis (débito e crédito
-# pareados na mesma linha). Cabeçalhos e grafia espelham exatamente
-# `_COLUNAS_LANCAMENTOS_IMPORTACAO` em src/domain/exportacao/service.py — os
-# dois exports geram o mesmo layout de destino a partir de fontes de dados
-# diferentes (aqui, o Razão de Fornecedores do ConciliaPro). Mudar aqui sem
-# mudar lá quebra essa equivalência.
-_COLUNAS_LANCAMENTOS_IMPORTACAO = [
-    "Data", "Cód. Conta Debito", "Cód. Conta Credito", "Valor",
-    "Cód. Histórico", "Complemento Histórico", "Inicia Lote",
-    "Código Matriz/Filial", "Centro de Custo Débito", "Centro de Custo Crédito",
-]
-
-
 @router.get("/export/lancamentos/{arquivo_id}")
 async def exportar_lancamentos_importacao(
     empresa_id: UUID,
     arquivo_id: int,
+    formato: Literal["xlsx", "csv", "txt"] = Query("xlsx"),
     db: AsyncSession = Depends(get_db),
 ):
     """Exporta os lançamentos do Razão (um por linha original) no layout
@@ -908,9 +902,6 @@ async def exportar_lancamentos_importacao(
     trazia essa coluna; quando ausente, sai em branco — não há cadastro de
     conta bancária/caixa no ConciliaPro para preencher essa lacuna.
     """
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill
-
     result = await db.execute(
         select(ArquivoImportado).where(
             ArquivoImportado.id == arquivo_id,
@@ -929,20 +920,10 @@ async def exportar_lancamentos_importacao(
         )
         .order_by(LancamentoFornecedor.data_lancamento, Fornecedor.nome_fornecedor)
     )
-    linhas = (await db.execute(stmt)).all()
+    lancamentos = (await db.execute(stmt)).all()
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Importação Lançamentos"
-
-    header_font = Font(color="FFFFFF", bold=True)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    for col, h in enumerate(_COLUNAS_LANCAMENTOS_IMPORTACAO, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-
-    for row, (lanc, codigo_conta_fornecedor) in enumerate(linhas, 2):
+    linhas = []
+    for lanc, codigo_conta_fornecedor in lancamentos:
         debito_fornecedor = lanc.valor_debito and lanc.valor_debito != 0
         if debito_fornecedor:
             conta_debito, conta_credito = codigo_conta_fornecedor, lanc.conta_partida
@@ -951,28 +932,46 @@ async def exportar_lancamentos_importacao(
             conta_credito, conta_debito = codigo_conta_fornecedor, lanc.conta_partida
             valor = lanc.valor_credito
 
-        ws.cell(row=row, column=1, value=lanc.data_lancamento.strftime("%d/%m/%Y"))
-        ws.cell(row=row, column=2, value=_celula_texto_segura(conta_debito))
-        ws.cell(row=row, column=3, value=_celula_texto_segura(conta_credito))
-        ws.cell(row=row, column=4, value=valor or Decimal("0.00"))
-        ws.cell(row=row, column=5, value=None)
-        ws.cell(row=row, column=6, value=_celula_texto_segura(lanc.historico))
-        ws.cell(row=row, column=7, value=_celula_texto_segura(lanc.lote))
-        ws.cell(row=row, column=8, value=None)
-        ws.cell(row=row, column=9, value=None)
-        ws.cell(row=row, column=10, value=None)
+        linhas.append({
+            "Data": lanc.data_lancamento.strftime("%d/%m/%Y"),
+            "Cód. Conta Debito": conta_debito or "",
+            "Cód. Conta Credito": conta_credito or "",
+            "Valor": valor or Decimal("0.00"),
+            "Cód. Histórico": "",
+            "Complemento Histórico": lanc.historico or "",
+            "Inicia Lote": lanc.lote or "",
+            "Código Matriz/Filial": "",
+            "Centro de Custo Débito": "",
+            "Centro de Custo Crédito": "",
+        })
 
-    for col in range(1, len(_COLUNAS_LANCAMENTOS_IMPORTACAO) + 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 22
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
+    if formato == "csv":
+        conteudo = _dicts_to_csv(linhas, COLUNAS_LANCAMENTOS_IMPORTACAO)
+        media_type = "text/csv; charset=utf-8"
+    elif formato == "txt":
+        conteudo = _dicts_to_txt(linhas, COLUNAS_LANCAMENTOS_IMPORTACAO)
+        media_type = "text/plain; charset=utf-8"
+    else:
+        # Estes parâmetros preservam a identidade visual já entregue pelo
+        # ConcilPro, embora a estrutura e a escrita sejam compartilhadas.
+        conteudo = _dicts_to_xlsx(
+            linhas,
+            COLUNAS_LANCAMENTOS_IMPORTACAO,
+            "Importação Lançamentos",
+            # Identidade visual que o escritório já recebe neste relatório;
+            # mudá-la seria alteração visível que ninguém pediu.
+            cabecalho_cor_fundo="4472C4",
+            cabecalho_cor_texto="FFFFFF",
+            largura_colunas=22,
+        )
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        io.BytesIO(conteudo),
+        media_type=media_type,
         headers={
-            "Content-Disposition": f"attachment; filename=lancamentos_importacao_{arquivo_id}.xlsx"
+            "Content-Disposition": (
+                f"attachment; filename=lancamentos_importacao_{arquivo_id}.{formato}"
+            )
         },
     )

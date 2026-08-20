@@ -364,7 +364,7 @@ async def test_exportar_lancamentos_importacao_em_txt(client, db, tenant, usuari
 @pytest.mark.asyncio
 async def test_formatar_valor_br_segue_o_modelo_do_escritorio():
     """Casos reais do arquivo modelo: zeros à direita somem, fração usa vírgula."""
-    from src.domain.exportacao.service import _formatar_valor_br
+    from src.domain.exportacao.formatos import _formatar_valor_br
 
     assert _formatar_valor_br(Decimal("700.00")) == "700"
     assert _formatar_valor_br(Decimal("1518.00")) == "1518"
