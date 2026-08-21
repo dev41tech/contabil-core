@@ -160,3 +160,12 @@ async def get_company_context(
         company_id=empresa_id,
     )
     return ctx
+
+
+async def get_admin_company_context(
+    ctx: AuthContext = Depends(get_company_context),
+) -> AuthContext:
+    """Exige acesso à empresa e papel administrativo no escritório."""
+    if ctx.role != "admin":
+        raise ForbiddenError(message="Apenas administradores podem consultar a auditoria.")
+    return ctx
