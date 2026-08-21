@@ -15,6 +15,7 @@ MODULOS_VALIDOS = frozenset(
         "contrapartes",
         "exportacao",
         "extrato",
+        "jobs",
         "neo",
         "notas",
         "openbanking",
@@ -34,7 +35,7 @@ class PermissaoCreate(BaseModel):
         description=(
             "Módulos separados por vírgula. '*' = acesso total. "
             "Opções: agencias, cartoes, comprovantes, contabil, contrapartes, exportacao, "
-            "extrato, neo, notas, openbanking, plano_contas, regras, relatorios, stats"
+            "extrato, jobs, neo, notas, openbanking, plano_contas, regras, relatorios, stats"
         ),
     )
 

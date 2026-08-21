@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.core.errors import ConflictError, ValidationError
-from src.db.models import NeoDecisao, PlanoConta, Transacao
+from src.db.models import Job, NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.consultas import (
@@ -21,6 +22,7 @@ from src.domain.neo.consultas import (
     simular_regra as _simular_regra,
 )
 from src.domain.neo.engine import NeoEngine
+from src.domain.jobs import JobRuntime, executar_neo
 from src.domain.regras.service import RegraService
 from src.schemas.neo import (
     NeoAssociarManualRequest,
@@ -37,6 +39,7 @@ from src.schemas.neo import (
     NeoSimularRegraRequest,
     NeoSimularRegraResponse,
 )
+from src.schemas.jobs import JobResponse
 from src.schemas.regras import RegraCreate
 from src.schemas.types import Competencia
 
@@ -48,23 +51,47 @@ router = APIRouter(
 
 @router.post(
     "/processar",
-    response_model=NeoResultado,
+    response_model=JobResponse,
+    status_code=202,
     dependencies=[Depends(require_csrf)],
 )
 async def processar(
     empresa_id: UUID,
     body: NeoProcessarRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
-) -> NeoResultado:
-    """Executa o motor de matching nas transações pendentes.
+) -> Job:
+    """Enfileira o motor de matching e devolve imediatamente o job persistido.
 
     Idempotente — transações já processadas são ignoradas.
     Se agencia_id for informado, processa apenas aquela agência.
     Se mes for informado (AAAA-MM), processa apenas transações daquele mês.
     """
-    engine = NeoEngine(db=db, empresa_id=empresa_id)
-    return await engine.processar(agencia_id=body.agencia_id, mes=body.mes)
+    runtime: JobRuntime = getattr(request.app.state, "job_runtime", JobRuntime())
+    job = Job(
+        empresa_id=empresa_id,
+        tipo="neo_processar",
+        status="na_fila",
+        criado_por=ctx.user_id,
+        heartbeat_em=datetime.now(UTC),
+    )
+    db.add(job)
+    await db.flush()
+    # O worker precisa enxergar a linha antes de a tarefa começar. Nos testes o
+    # runtime inline usa a própria transação isolada e portanto só faz flush.
+    if runtime.commit:
+        await db.commit()
+    background_tasks.add_task(
+        executar_neo,
+        job.id,
+        empresa_id,
+        body.agencia_id,
+        body.mes,
+        runtime,
+    )
+    return job
 
 
 @router.get("/decisoes", response_model=NeoDecisaoListResponse)

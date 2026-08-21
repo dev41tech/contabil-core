@@ -151,7 +151,14 @@ async def get_company_context(
             if permissao
             else set()
         )
-        if not permissao or ("*" not in modulos and modulo not in modulos):
+        modulos_aceitos = {modulo}
+        if modulo == "jobs":
+            # Quem pode iniciar NEO/extrato precisa acompanhar o job resultante.
+            # A rota de jobs ainda filtra cada tipo para não expor o outro módulo.
+            modulos_aceitos.update({"neo", "extrato"})
+        if not permissao or (
+            "*" not in modulos and modulos.isdisjoint(modulos_aceitos)
+        ):
             raise TenantAccessDeniedError()
 
     set_request_context(

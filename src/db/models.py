@@ -19,6 +19,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -763,11 +764,16 @@ class NeoDecisao(Base):
     )
 
 
-# ─────────────────────────────────────────────────────────────── Job de Exportação
+# ─────────────────────────────────────────────────────────────── Registro de Exportação
 
 
 class ExportJob(Base):
-    """Controla jobs de exportação assíncrona para ERP."""
+    """Registra o histórico de uma exportação concluída para ERP.
+
+    Apesar do nome legado, esta linha não representa trabalho assíncrono: a
+    rota gera e devolve o arquivo na mesma requisição e só então persiste o
+    registro como concluído. Jobs persistentes de fato ficam em ``jobs``.
+    """
 
     __tablename__ = "export_jobs"
 
@@ -793,6 +799,48 @@ class ExportJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("ix_export_job_empresa", "empresa_id", "status"),)
+
+
+class Job(Base):
+    """Execução longa persistente, acompanhável mesmo após mudar de tela."""
+
+    __tablename__ = "jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    empresa_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("empresas.id"), nullable=True
+    )
+    tipo: Mapped[str] = mapped_column(
+        Enum("neo_processar", "extrato_importar", name="job_tipo_enum"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        Enum(
+            "na_fila",
+            "processando",
+            "concluido",
+            "concluido_com_alertas",
+            "falhou",
+            name="job_status_enum",
+        ),
+        default="na_fila",
+        nullable=False,
+    )
+    total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    processados: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resultado: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    erro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    criado_por: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    iniciado_em: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    concluido_em: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_em: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_jobs_empresa_created", "empresa_id", "created_at"),
+        Index("ix_jobs_status_heartbeat", "status", "heartbeat_em"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────── Auditoria

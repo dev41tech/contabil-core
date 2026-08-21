@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 
 import pytest
 from httpx import AsyncClient
@@ -86,6 +87,16 @@ async def _importar(client, empresa, agencia_id, csrf, conteudo=None) -> dict:
         files={"arquivo": ("extrato.ofx", io.BytesIO(conteudo.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
+    if r.status_code == 202:
+        job = (
+            await client.get(
+                f"/api/v1/empresas/{empresa.id}/jobs/{r.json()['id']}"
+            )
+        ).json()
+        # Os testes abaixo exercitam deduplicação/validação do domínio. O teste
+        # específico de jobs valida separadamente o envelope persistente.
+        if job["resultado"] is not None:
+            r._content = json.dumps(job["resultado"]).encode()
     return r
 
 
@@ -98,7 +109,7 @@ async def test_importar_ofx_sucesso(client, tenant, usuario, empresa):
     agencia = await _criar_agencia(client, empresa, csrf)
 
     r = await _importar(client, empresa, agencia["id"], csrf)
-    assert r.status_code == 201
+    assert r.status_code == 202
     body = r.json()
     assert body["importadas"] == 2
     assert body["duplicadas"] == 0
@@ -112,11 +123,11 @@ async def test_importar_ofx_deduplicacao(client, tenant, usuario, empresa):
     agencia = await _criar_agencia(client, empresa, csrf)
 
     r1 = await _importar(client, empresa, agencia["id"], csrf)
-    assert r1.status_code == 201
+    assert r1.status_code == 202
     assert r1.json()["importadas"] == 2
 
     r2 = await _importar(client, empresa, agencia["id"], csrf)
-    assert r2.status_code == 201
+    assert r2.status_code == 202
     body2 = r2.json()
     assert body2["importadas"] == 0
     assert body2["duplicadas"] == 2
@@ -130,7 +141,7 @@ async def test_fitid_repetido_no_mesmo_lote_e_deduplicado(client, tenant, usuari
 
     r = await _importar(client, empresa, agencia["id"], csrf, repetido)
 
-    assert r.status_code == 201
+    assert r.status_code == 202
     assert r.json()["total_no_arquivo"] == 2
     assert r.json()["importadas"] == 1
     assert r.json()["duplicadas"] == 1
@@ -145,7 +156,7 @@ async def test_bloco_ofx_rejeitado_aparece_na_contagem_de_erros(client, tenant, 
 
     r = await _importar(client, empresa, agencia["id"], csrf, conteudo)
 
-    assert r.status_code == 201
+    assert r.status_code == 202
     assert r.json()["total_no_arquivo"] == 3
     assert r.json()["importadas"] == 2
     assert r.json()["erros"] == 1
@@ -153,12 +164,18 @@ async def test_bloco_ofx_rejeitado_aparece_na_contagem_de_erros(client, tenant, 
 
 @pytest.mark.asyncio
 async def test_importar_ofx_invalido_rejeita(client, tenant, usuario, empresa):
+    """Arquivo inválido falha no job para a requisição não voltar a ser síncrona."""
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)
 
     conteudo_invalido = "isso nao e um arquivo ofx valido !!!"
     r = await _importar(client, empresa, agencia["id"], csrf, conteudo=conteudo_invalido)
-    assert r.status_code == 422
+    assert r.status_code == 202
+    job = await client.get(
+        f"/api/v1/empresas/{empresa.id}/jobs/{r.json()['id']}"
+    )
+    assert job.json()["status"] == "falhou"
+    assert job.json()["erro"]
 
 
 @pytest.mark.asyncio
@@ -272,7 +289,7 @@ async def test_transacao_com_saldo_no_lugar_do_valor_nao_e_importada(
     agencia = await _criar_agencia(client, empresa, csrf)
 
     r = await _importar(client, empresa, agencia["id"], csrf, conteudo=_OFX_LINHA_CRUA)
-    assert r.status_code == 201
+    assert r.status_code == 202
     body = r.json()
 
     assert body["importadas"] == 1

@@ -56,8 +56,11 @@ async def _criar_transacao(client, empresa, agencia_id, csrf) -> str:
         files={"arquivo": ("extrato.ofx", io.BytesIO(_OFX_SIMPLES.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
-    assert r.status_code == 201
-    return r.json()["transacoes"][0]["id"]
+    assert r.status_code == 202
+    job = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/jobs/{r.json()['id']}")
+    ).json()
+    return job["resultado"]["transacoes"][0]["id"]
 
 
 def _url(empresa_id, nota_id=None, extra="") -> str:
