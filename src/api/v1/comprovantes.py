@@ -53,6 +53,8 @@ async def listar_comprovantes(
     )
 
 
+# O GET unitário é a forma REST natural e prepara a futura tela de detalhe; seu
+# baixo custo não justifica acoplar a API às telas existentes neste momento.
 @router.get("/{comprovante_id}", response_model=ComprovanteResponse)
 async def obter_comprovante(
     empresa_id: UUID,

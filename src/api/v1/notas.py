@@ -65,6 +65,8 @@ async def listar_notas(
     )
 
 
+# O GET unitário é a forma REST natural e viabiliza uma futura tela de detalhe
+# sem obrigar o cliente a localizar a nota dentro de uma página da listagem.
 @router.get("/{nota_id}", response_model=NotaFiscalResponse)
 async def obter_nota(
     empresa_id: UUID,

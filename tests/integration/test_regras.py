@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
 
@@ -225,7 +227,8 @@ async def test_atualizar_regra(client, db, tenant, usuario, empresa):
 
 
 @pytest.mark.asyncio
-async def test_desativar_regra(client, db, tenant, usuario, empresa):
+async def test_desativar_regra_via_patch(client, db, tenant, usuario, empresa):
+    """Trava o caminho usado pelo front porque PATCH ativa=false é a única forma de desativação exposta."""
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)
     conta = await _criar_conta(db, empresa)
@@ -245,13 +248,28 @@ async def test_desativar_regra(client, db, tenant, usuario, empresa):
         )
     ).json()
 
-    r = await client.delete(_url(empresa.id, criada["id"]), headers={"X-CSRF-Token": csrf})
-    assert r.status_code == 204
+    r = await client.patch(
+        _url(empresa.id, criada["id"]),
+        json={"ativa": False},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200
+    assert r.json()["ativa"] is False
 
     # Regra desativada não aparece em apenas_ativas
     lista = await client.get(_url(empresa.id) + "?apenas_ativas=true")
     ids = [i["id"] for i in lista.json()["items"]]
     assert criada["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_delete_regra_nao_e_mais_exposto(client, tenant, usuario, empresa):
+    """Trava a remoção da rota redundante para não voltarem duas maneiras de executar o mesmo soft delete."""
+    csrf = await _login(client, tenant, usuario)
+    r = await client.delete(
+        _url(empresa.id, uuid.uuid4()), headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 405
 
 
 @pytest.mark.asyncio

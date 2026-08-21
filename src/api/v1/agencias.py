@@ -41,6 +41,8 @@ async def listar_agencias(
     return await _svc(empresa_id, ctx, db).listar(apenas_ativas=apenas_ativas)
 
 
+# O recurso unitário é o contrato natural para detalhe/edição futura; a lacuna
+# atual é de tela, e não uma indicação de que a capacidade deva ser podada.
 @router.get("/{agencia_id}", response_model=AgenciaResponse)
 async def obter_agencia(
     empresa_id: UUID,

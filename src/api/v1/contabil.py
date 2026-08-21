@@ -48,6 +48,8 @@ async def listar_registros(
     )
 
 
+# O GET unitário mantém o contrato REST pronto para uma tela de detalhe e custa
+# pouco comparado a obrigar todo consumidor futuro a vasculhar a listagem.
 @router.get("/{registro_id}", response_model=RegistroContabilResponse)
 async def obter_registro(
     empresa_id: UUID,

@@ -12,7 +12,7 @@ from __future__ import annotations
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError
@@ -58,22 +58,33 @@ class ComprovanteService:
 
         rows = (
             await self._db.execute(
-                q.order_by(Comprovante.data_pagamento.desc())
+                q.add_columns(Transacao)
+                .outerjoin(
+                    Transacao,
+                    and_(
+                        Comprovante.transacao_id == Transacao.id,
+                        Transacao.empresa_id == self._empresa_id,
+                    ),
+                )
+                .order_by(Comprovante.data_pagamento.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )
-        ).scalars().all()
+        ).all()
 
         return ComprovanteListResponse(
-            items=[ComprovanteResponse.from_orm_custom(c) for c in rows],
+            items=[
+                ComprovanteResponse.from_orm_custom(comprovante, transacao)
+                for comprovante, transacao in rows
+            ],
             total=total,
             page=page,
             page_size=page_size,
         )
 
     async def obter(self, comprovante_id: UUID) -> ComprovanteResponse:
-        comprovante = await self._get_or_404(comprovante_id)
-        return ComprovanteResponse.from_orm_custom(comprovante)
+        comprovante, transacao = await self._get_com_transacao_or_404(comprovante_id)
+        return ComprovanteResponse.from_orm_custom(comprovante, transacao)
 
     async def criar(self, data: ComprovanteCreate) -> ComprovanteResponse:
         if data.agencia_id:
@@ -90,6 +101,7 @@ class ComprovanteService:
                 raise NotFoundError(message="Agência bancária não encontrada nesta empresa.")
 
         # Valida que a transação pertence à empresa (se informada)
+        transacao = None
         if data.transacao_id:
             result = await self._db.execute(
                 select(Transacao).where(
@@ -97,7 +109,8 @@ class ComprovanteService:
                     Transacao.empresa_id == self._empresa_id,
                 )
             )
-            if not result.scalar_one_or_none():
+            transacao = result.scalar_one_or_none()
+            if not transacao:
                 raise NotFoundError(message="Transação não encontrada nesta empresa.")
 
         comprovante = Comprovante(
@@ -126,7 +139,7 @@ class ComprovanteService:
             empresa_id=str(self._empresa_id),
             valor_pago=str(comprovante.valor_pago),
         )
-        return ComprovanteResponse.from_orm_custom(comprovante)
+        return ComprovanteResponse.from_orm_custom(comprovante, transacao)
 
     async def associar_transacao(
         self, comprovante_id: UUID, req: AssociarTransacaoRequest
@@ -145,7 +158,8 @@ class ComprovanteService:
                 Transacao.empresa_id == self._empresa_id,
             )
         )
-        if not result.scalar_one_or_none():
+        transacao = result.scalar_one_or_none()
+        if not transacao:
             raise NotFoundError(message="Transação não encontrada nesta empresa.")
 
         comprovante.transacao_id = req.transacao_id
@@ -156,7 +170,7 @@ class ComprovanteService:
             comprovante_id=str(comprovante_id),
             transacao_id=str(req.transacao_id),
         )
-        return ComprovanteResponse.from_orm_custom(comprovante)
+        return ComprovanteResponse.from_orm_custom(comprovante, transacao)
 
     async def desassociar_transacao(self, comprovante_id: UUID) -> ComprovanteResponse:
         comprovante = await self._get_or_404(comprovante_id)
@@ -191,3 +205,26 @@ class ComprovanteService:
         if not comprovante:
             raise NotFoundError(message="Comprovante não encontrado.")
         return comprovante
+
+    async def _get_com_transacao_or_404(
+        self, comprovante_id: UUID
+    ) -> tuple[Comprovante, Transacao | None]:
+        result = await self._db.execute(
+            select(Comprovante, Transacao)
+            .outerjoin(
+                Transacao,
+                and_(
+                    Comprovante.transacao_id == Transacao.id,
+                    Transacao.empresa_id == self._empresa_id,
+                ),
+            )
+            .where(
+                Comprovante.id == comprovante_id,
+                Comprovante.empresa_id == self._empresa_id,
+                Comprovante.deleted_at == None,
+            )
+        )
+        row = result.one_or_none()
+        if not row:
+            raise NotFoundError(message="Comprovante não encontrado.")
+        return row[0], row[1]

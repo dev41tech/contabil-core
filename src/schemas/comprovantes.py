@@ -31,6 +31,9 @@ class ComprovanteResponse(BaseModel):
     empresa_id: UUID
     agencia_id: UUID | None
     transacao_id: UUID | None
+    transacao_descricao: str | None = None
+    transacao_valor: Decimal | None = None
+    transacao_dc: str | None = None
     favorecido: str | None
     cpf_cnpj: str | None
     data_pagamento: datetime | None
@@ -47,9 +50,13 @@ class ComprovanteResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_orm_custom(cls, obj) -> "ComprovanteResponse":
+    def from_orm_custom(cls, obj, transacao=None) -> "ComprovanteResponse":
         data = cls.model_validate(obj)
         data.tem_arquivo = bool(obj.arquivo_base64)
+        if transacao is not None:
+            data.transacao_descricao = transacao.historico
+            data.transacao_valor = transacao.valor
+            data.transacao_dc = transacao.dc
         return data
 
 
