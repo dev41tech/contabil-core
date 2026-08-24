@@ -64,6 +64,14 @@ class ExportJobCreate(BaseModel):
     status: str | None = Field(
         default=None, description="extrato: pendente | processada | erro"
     )
+    historico: str | None = Field(
+        default=None, description="extrato: busca parcial no histórico do banco"
+    )
+    dc: str | None = Field(default=None, pattern="^[DC]$", description="extrato: D ou C")
+    # `Transacao.valor` é sempre positivo — o sinal mora em `dc`. A faixa é sobre
+    # o módulo do lançamento, igual ao filtro da tela.
+    valor_min: Decimal | None = Field(default=None, ge=0)
+    valor_max: Decimal | None = Field(default=None, ge=0)
 
     @field_validator("mes")
     @classmethod

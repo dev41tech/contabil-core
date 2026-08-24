@@ -765,3 +765,51 @@ async def test_exportar_extrato_ordena_por_data(client, tenant, usuario, empresa
     )
     datas = [l.split(",")[0] for l in _linhas_csv(r)[1:]]
     assert datas == ["01/05/2024", "10/06/2024", "15/07/2024"]
+
+
+@pytest.mark.asyncio
+async def test_exportacao_extrato_respeita_os_filtros_da_tela(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario,
+    empresa: Empresa,
+):
+    """O arquivo tem de trazer as MESMAS linhas que a lista mostra.
+
+    Enquanto histórico, D/C e faixa de valor não chegavam ao exportador, o
+    contador filtrava na tela, exportava, e recebia um arquivo mais largo do que
+    tinha acabado de conferir.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = AgenciaBancaria(
+        empresa_id=empresa.id, banco_sigla="BB", agencia="0001", numero="99999"
+    )
+    db.add(agencia)
+    await db.flush()
+
+    for i, (hist, valor, dc) in enumerate([
+        ("TARIFA COM R LIQUIDACAO", Decimal("1.19"), "D"),
+        ("PAGAMENTO PIX FORNECEDOR", Decimal("5000.00"), "D"),
+        ("TED RECEBIDA CLIENTE", Decimal("9000.00"), "C"),
+    ]):
+        db.add(
+            Transacao(
+                empresa_id=empresa.id, agencia_id=agencia.id,
+                data=date(2026, 4, 10), valor=valor, historico=hist, dc=dc,
+                ordem=i, hash_dedup=f"hash_exp_filtro_{i}",
+            )
+        )
+    await db.flush()
+
+    async def _linhas(**filtros) -> int:
+        r = await client.post(
+            f"/api/v1/empresas/{empresa.id}/exportacao/gerar",
+            json={"formato": "csv", "tipo": "extrato", **filtros},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert r.status_code == 200, r.text
+        texto = r.content.decode("utf-8-sig")
+        return len([l for l in texto.splitlines() if l.strip()]) - 1  # menos cabeçalho
+
+    assert await _linhas() == 3
+    assert await _linhas(historico="tarifa") == 1
+    assert await _linhas(dc="C") == 1
+    assert await _linhas(valor_min=1000, valor_max=6000) == 1
