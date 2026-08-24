@@ -7,7 +7,7 @@ sinal de saldo por natureza da conta, identidade do balancete, saldo acumulado.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -343,14 +343,14 @@ async def test_livro_caixa_saldo_inicial_vem_do_que_antecede_o_periodo(
     db.add(
         Transacao(
             empresa_id=empresa.id, agencia_id=agencia.id,
-            data=datetime(2026, 2, 10, tzinfo=UTC), valor=5_000,
+            data=date(2026, 2, 10), valor=5_000,
             historico="SALDO ANTERIOR", dc="C", hash_dedup="hash_anterior",
         )
     )
     db.add(
         Transacao(
             empresa_id=empresa.id, agencia_id=agencia.id,
-            data=datetime(2026, 3, 5, tzinfo=UTC), valor=1_000,
+            data=date(2026, 3, 5), valor=1_000,
             historico="PAGAMENTO", dc="D", hash_dedup="hash_no_periodo",
         )
     )
@@ -360,7 +360,9 @@ async def test_livro_caixa_saldo_inicial_vem_do_que_antecede_o_periodo(
     body = (
         await client.get(
             _url(empresa.id, "livro-caixa"),
-            params={"data_de": "2026-03-01T00:00:00Z", "data_ate": "2026-03-31T23:59:59Z"},
+            # Data pura, como a tela envia. Passar "23:59:59" era o que mascarava
+            # o filtro que descartava o último dia do período.
+            params={"data_de": "2026-03-01", "data_ate": "2026-03-31"},
         )
     ).json()
 

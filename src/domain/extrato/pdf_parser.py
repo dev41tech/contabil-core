@@ -25,7 +25,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
@@ -81,8 +81,12 @@ _SALDO_RE = re.compile(r"\bSALDO\b|\bBALANCE\b|\bTOTAL\b", re.IGNORECASE)
 _BARCODE_RE = re.compile(r"^\d{17,20}")   # código de barras / nosso número Bradesco
 
 
-def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
-    """Aceita DD/MM/AAAA, DD/MM/AA ou DD/MM (sem ano)."""
+def _parse_data(s: str, referencia_ano: int | None = None) -> date | None:
+    """Aceita DD/MM/AAAA, DD/MM/AA ou DD/MM (sem ano).
+
+    Devolve data de calendário: é literalmente o que está impresso na linha do
+    extrato, sem hora e sem fuso para um consumidor reinterpretar.
+    """
     s = s.strip()
     m = _DATE_FULL_RE.search(s)
     if m:
@@ -90,7 +94,7 @@ def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
         if len(y) == 2:
             y = "20" + y
         try:
-            return datetime(int(y), int(mo), int(d), tzinfo=UTC)
+            return date(int(y), int(mo), int(d))
         except ValueError:
             pass
     m2 = _DATE_SHORT_RE.search(s)
@@ -98,7 +102,7 @@ def _parse_data(s: str, referencia_ano: int | None = None) -> datetime | None:
         d, mo = m2.group(1), m2.group(2)
         ano = referencia_ano or datetime.now(UTC).year
         try:
-            return datetime(ano, int(mo), int(d), tzinfo=UTC)
+            return date(ano, int(mo), int(d))
         except ValueError:
             pass
     return None
@@ -122,7 +126,7 @@ def _parse_valor(s: str) -> Decimal | None:
     return -val if negative else val
 
 
-def _gerar_fitid(data: datetime, historico: str, valor: Decimal, idx: int) -> str:
+def _gerar_fitid(data: date, historico: str, valor: Decimal, idx: int) -> str:
     raw = f"{data.isoformat()}{historico}{valor}{idx}"
     return "PDF" + hashlib.md5(raw.encode()).hexdigest()[:12].upper()
 
@@ -213,7 +217,7 @@ def _parse_linhas_multipagina(
     """
     transacoes: list[TransacaoOFX] = []
     idx = 0
-    last_date: datetime | None = None
+    last_date: date | None = None
     pending_desc: str | None = None
 
     for raw in lines:
@@ -499,7 +503,7 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
         data = _parse_data(data_str)
         if data is None and data_str:
             try:
-                data = datetime.fromisoformat(data_str.replace("/", "-")).replace(tzinfo=UTC)
+                data = datetime.fromisoformat(data_str.replace("/", "-")).date()
             except (ValueError, TypeError):
                 pass
         if data is None:

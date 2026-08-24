@@ -135,7 +135,8 @@ class StatsService:
                     func.count().label("total"),
                 ).where(
                     Transacao.empresa_id == self._empresa_id,
-                    Transacao.data >= inicio,
+                    # `Transacao.data` é `Date`: compara com data, não com instante.
+                    Transacao.data >= inicio.date(),
                     Transacao.deleted_at.is_(None),
                 ).group_by("mes")
             )

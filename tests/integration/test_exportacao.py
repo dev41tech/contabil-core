@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
@@ -498,7 +498,7 @@ async def test_conferencia_compara_somas_e_expoe_divergencia_com_direcao(
     debito = Transacao(
         empresa_id=empresa.id,
         agencia_id=agencia.id,
-        data=datetime(2024, 8, 1, tzinfo=UTC),
+        data=date(2024, 8, 1),
         valor=Decimal("10.00"),
         historico="PAGAMENTO DIVERGENTE",
         dc="D",
@@ -507,7 +507,7 @@ async def test_conferencia_compara_somas_e_expoe_divergencia_com_direcao(
     credito = Transacao(
         empresa_id=empresa.id,
         agencia_id=agencia.id,
-        data=datetime(2024, 8, 2, tzinfo=UTC),
+        data=date(2024, 8, 2),
         valor=Decimal("125.00"),
         historico="RECEBIMENTO CONCILIADO",
         dc="C",

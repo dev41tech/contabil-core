@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -50,7 +50,7 @@ def _transacao(empresa, agencia, *, status: str, valor: str, hash_dedup: str) ->
     return Transacao(
         empresa_id=empresa.id,
         agencia_id=agencia.id,
-        data=datetime(2026, 8, 10, tzinfo=UTC),
+        data=date(2026, 8, 10),
         valor=Decimal(valor),
         historico=f"MOVIMENTO {hash_dedup}",
         dc="D",

@@ -9,11 +9,12 @@ Regras:
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -422,7 +423,11 @@ class Transacao(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
-    data: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Data de calendário do lançamento, não instante: é o dia impresso no extrato.
+    # Como `timestamptz` guardava meia-noite UTC, a tela renderizava 21h do dia
+    # anterior em Brasília e mostrava sempre um dia a menos — enquanto o export,
+    # que formatava as partes em UTC, acertava. `Date` remove o fuso da equação.
+    data: Mapped[date] = mapped_column(Date, nullable=False)
     valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     # Saldo da conta APÓS este lançamento, como impresso no extrato. NULL quando a
     # origem não informa (OFX não traz saldo) — é estado permanente, não pendência.

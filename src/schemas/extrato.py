@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
@@ -13,7 +13,9 @@ class TransacaoResponse(BaseModel):
     id: UUID
     empresa_id: UUID
     agencia_id: UUID
-    data: datetime
+    # Serializa como "2026-07-01", sem hora e sem "Z". Enquanto era datetime, o
+    # front recebia meia-noite UTC e renderizava o dia anterior em Brasília.
+    data: date
     valor: Decimal
     # Saldo da conta após o lançamento, como impresso no extrato. `null` quando a
     # origem não informa (importação por OFX) — a tela deve exibir vazio, não zero.
@@ -51,5 +53,14 @@ class ExtratoPendentesResponse(BaseModel):
 class TransacaoFiltro(BaseModel):
     status: str | None = None          # pendente | processada | erro
     agencia_id: UUID | None = None
-    data_de: datetime | None = None
-    data_ate: datetime | None = None
+    # Busca parcial no histórico do banco, sem diferenciar maiúsculas.
+    historico: str | None = None
+    dc: str | None = None              # D | C
+    # `Transacao.valor` é sempre positivo — o sinal mora em `dc`. A faixa,
+    # portanto, é sobre o módulo do lançamento.
+    valor_min: Decimal | None = None
+    valor_max: Decimal | None = None
+    # Datas de calendário, inclusivas nas duas pontas. Como `datetime`,
+    # `data_ate=2026-01-31` virava 00:00 e descartava o último dia inteiro.
+    data_de: date | None = None
+    data_ate: date | None = None

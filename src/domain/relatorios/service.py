@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -251,10 +251,15 @@ class RelatoriosService:
 
     async def livro_caixa(
         self,
-        data_de: datetime | None = None,
-        data_ate: datetime | None = None,
+        data_de: date | None = None,
+        data_ate: date | None = None,
     ) -> LivroCaixaResponse:
-        """Livro Caixa — movimentação cronológica por agência com saldo acumulado."""
+        """Livro Caixa — movimentação cronológica por agência com saldo acumulado.
+
+        Filtra `Transacao.data`, que é data de calendário — daí `date` e não
+        `datetime`. Com `datetime`, `data_ate` virava 00:00 e o último dia do
+        período ficava de fora do livro.
+        """
         # Busca agências da empresa
         ag_q = select(AgenciaBancaria).where(
             AgenciaBancaria.empresa_id == self._empresa_id,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -54,7 +54,7 @@ async def transacao(db: AsyncSession, empresa: Empresa) -> Transacao:
     t = Transacao(
         empresa_id=empresa.id,
         agencia_id=ag.id,
-        data=datetime(2026, 4, 10, tzinfo=UTC),
+        data=date(2026, 4, 10),
         valor=2_500,
         historico="PAGAMENTO FATURA CARTAO",
         dc="D",
