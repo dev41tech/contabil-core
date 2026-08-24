@@ -270,7 +270,15 @@ class ExtratoService:
 
         rows = (
             await self._db.execute(
-                q.order_by(Transacao.data.desc())
+                # Ordem crescente: o extrato é lido como o papel do banco, do mais
+                # antigo para o mais recente, e é assim que o saldo faz sentido
+                # de uma linha para a outra.
+                #
+                # `id` é desempate, não enfeite: `data` é só um dia, e um extrato
+                # tem vários lançamentos no mesmo dia. Sem critério estável, o
+                # banco pode devolver ordens diferentes entre uma página e outra,
+                # e a paginação passa a repetir e pular linhas.
+                q.order_by(Transacao.data.asc(), Transacao.id.asc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )

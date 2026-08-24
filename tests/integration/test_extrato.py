@@ -437,3 +437,57 @@ async def test_transacao_apagada_some_da_listagem(client, db, tenant, usuario, e
 
     assert depois["total"] == antes["total"] - 1
     assert str(alvo.id) not in {i["id"] for i in depois["items"]}
+
+
+@pytest.mark.asyncio
+async def test_lista_da_data_mais_antiga_para_a_mais_recente(
+    client, db, tenant, usuario, empresa
+):
+    """Extrato se lê como o papel do banco: do mais antigo para o mais recente."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa)
+
+    assert [i["data"] for i in body["items"]] == [
+        "2026-03-01",
+        "2026-03-15",
+        "2026-03-31",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_paginacao_nao_repete_nem_pula_no_mesmo_dia(
+    client, db, tenant, usuario, empresa
+):
+    """Vários lançamentos no mesmo dia precisam de desempate estável.
+
+    `data` é só um dia; sem `id` como critério secundário o banco pode devolver
+    ordens diferentes entre páginas, repetindo e pulando linhas.
+    """
+    from datetime import date
+    from uuid import UUID
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    for i in range(10):
+        db.add(
+            Transacao(
+                empresa_id=empresa.id,
+                agencia_id=UUID(agencia["id"]),
+                data=date(2026, 5, 4),          # todos no MESMO dia
+                valor=Decimal("10.00"),
+                historico=f"LANCAMENTO {i}",
+                dc="D",
+                hash_dedup=f"hash_pag_{i}",
+            )
+        )
+    await db.flush()
+
+    p1 = await _listar(client, empresa, page=1, page_size=4)
+    p2 = await _listar(client, empresa, page=2, page_size=4)
+    p3 = await _listar(client, empresa, page=3, page_size=4)
+
+    vistos = [i["id"] for i in p1["items"] + p2["items"] + p3["items"]]
+    assert len(vistos) == len(set(vistos)) == 10
