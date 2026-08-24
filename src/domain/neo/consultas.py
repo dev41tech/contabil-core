@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -119,6 +119,9 @@ async def listar_decisoes(
     agencia_id: UUID | None = None,
     conta_id: UUID | None = None,
     mes: str | None = None,
+    data_de: date | None = None,
+    data_ate: date | None = None,
+    motivo: str | None = None,
     valor_min: Decimal | None = None,
     valor_max: Decimal | None = None,
     page: int = 1,
@@ -159,9 +162,27 @@ async def listar_decisoes(
                 and_(NeoDecisao.conta_id.is_(None), Regra.conta_id == conta_id),
             )
         )
+    # `mes` e o intervalo se ACUMULAM, não competem. A competência é global na
+    # aplicação — o contador a escolhe uma vez e ela vale em todas as telas —,
+    # então um intervalo informado aqui é um recorte DENTRO dela, mais
+    # específico. Dar precedência ao mês descartaria justamente a escolha mais
+    # explícita; pedir mês e intervalo incompatíveis devolve vazio, que é a
+    # resposta honesta.
     if mes:
         inicio, fim = bounds_do_mes_data(mes)
         q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
+    if data_de is not None and data_ate is not None and data_de > data_ate:
+        raise ValidationError(message="data_de não pode ser maior que data_ate.")
+    if data_de is not None:
+        q = q.where(Transacao.data >= data_de)
+    if data_ate is not None:
+        q = q.where(Transacao.data <= data_ate)
+    if motivo:
+        # O motivo é escrito pelo motor, sem acento inconsistente, mas passa
+        # pela mesma normalização do `termo` para o contador não precisar saber
+        # disso.
+        motivo_like = f"%{_escapar_ilike(remover_acentos(motivo.strip()).lower())}%"
+        q = q.where(sem_acento(NeoDecisao.motivo).like(motivo_like, escape="\\"))
     if valor_min is not None and valor_max is not None and valor_min > valor_max:
         raise ValidationError(message="valor_min não pode ser maior que valor_max.")
     # `Transacao.valor` é gravado em módulo pelo importador de extrato (o sinal
@@ -213,6 +234,7 @@ async def listar_decisoes(
         item.transacao_descricao = r.transacao.historico
         item.transacao_valor = r.transacao.valor
         item.transacao_dc = r.transacao.dc
+        item.transacao_data = r.transacao.data
         item.agencia_id = r.transacao.agencia_id
         item.regra_descricao = r.regra.descricao if r.regra else None
         item.conta_codigo = r.conta.codigo if r.conta else None

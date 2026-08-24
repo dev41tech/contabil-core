@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -117,6 +117,17 @@ async def listar_decisoes(
     agencia_id: UUID | None = Query(default=None),
     conta_id: UUID | None = Query(default=None, description="Conta contábil da decisão"),
     mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
+    data_de: date | None = Query(
+        default=None,
+        description="AAAA-MM-DD, inclusivo. Ignorado quando `mes` é informado.",
+    ),
+    data_ate: date | None = Query(
+        default=None,
+        description="AAAA-MM-DD, inclusivo. Ignorado quando `mes` é informado.",
+    ),
+    motivo: str | None = Query(
+        default=None, description="Busca parcial no motivo registrado pelo motor"
+    ),
     valor_min: Decimal | None = Query(
         default=None, ge=0, description="Valor mínimo da transação (R$)"
     ),
@@ -142,6 +153,9 @@ async def listar_decisoes(
         agencia_id=agencia_id,
         conta_id=conta_id,
         mes=mes,
+        data_de=data_de,
+        data_ate=data_ate,
+        motivo=motivo,
         valor_min=valor_min,
         valor_max=valor_max,
         page=page,
