@@ -228,9 +228,27 @@ async def listar_decisoes(
         .all()
     )
 
+    # Resolve o lançamento vigente em lote — a alternativa é uma query por linha.
+    # Só as decisões que viraram partida têm lançamento; as pendentes ficam com
+    # None, e a tela usa isso para saber quando oferecer "Desfazer".
+    lancamento_por_transacao: dict[UUID, UUID] = {}
+    transacao_ids = [r.transacao_id for r in rows]
+    if transacao_ids:
+        vinculos = (
+            await db.execute(
+                select(RegistroContabil.transacao_id, RegistroContabil.lancamento_id)
+                .where(
+                    RegistroContabil.transacao_id.in_(transacao_ids),
+                    RegistroContabil.deleted_at.is_(None),
+                )
+            )
+        ).all()
+        lancamento_por_transacao = {t_id: l_id for t_id, l_id in vinculos}
+
     items = []
     for r in rows:
         item = NeoDecisaoResponse.model_validate(r)
+        item.lancamento_id = lancamento_por_transacao.get(r.transacao_id)
         item.transacao_descricao = r.transacao.historico
         item.transacao_valor = r.transacao.valor
         item.transacao_dc = r.transacao.dc

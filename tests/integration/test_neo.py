@@ -2711,3 +2711,119 @@ async def test_cancelamento_fica_na_trilha_de_auditoria(
     assert "lancado na conta errada" in (log.dados_depois or "")
     # O que havia antes precisa estar guardado — é o que permite reconstruir.
     assert "partidas" in (log.dados_antes or "")
+
+
+# ── Contraparte reconhecida pelo nome no histórico ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_classifica_pelo_nome_da_contraparte_no_historico(
+    client, db, tenant, usuario, empresa
+):
+    """O caso do relatório: fornecedor cadastrado, nome no extrato, e mesmo
+    assim a transação ficava pendente para sempre.
+
+    Não há nota nem comprovante — só o nome na linha do banco, que é
+    exatamente a situação que a cadeia por documento nunca alcançava.
+    """
+    from src.db.models import Contraparte
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "ITAU", "agencia": "0011", "numero": "11111"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.7", descricao="Planos de Saúde", tipo="despesa"
+    )
+    db.add(conta)
+    await db.flush()
+    db.add(
+        Contraparte(
+            empresa_id=empresa.id,
+            tipo="fornecedor",
+            documento="12345678000199",
+            razao_social="Unimed Curitiba Ltda",
+            conta_contabil_id=conta.id,
+            ativa=True,
+        )
+    )
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia["id"]),
+        data=date(2026, 5, 10),
+        valor=Decimal("1250.00"),
+        historico="PAGAMENTO PIX UNIMED CURITIBA",
+        dc="D",
+        hash_dedup="hash_contraparte_nome",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    await db.refresh(transacao)
+
+    assert transacao.status == "processada"
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalars().first()
+    assert decisao.estrategia == "contraparte"
+    assert decisao.conta_id == conta.id
+
+
+@pytest.mark.asyncio
+async def test_nome_ambiguo_deixa_pendente_em_vez_de_adivinhar(
+    client, db, tenant, usuario, empresa
+):
+    """Dois cadastros casando o mesmo histórico: classificar seria adivinhar.
+
+    Pendente aparece na fila e o contador resolve; classificado errado entra no
+    razão em silêncio.
+    """
+    from src.db.models import Contraparte
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "ITAU", "agencia": "0012", "numero": "22222"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.6", descricao="Fretes", tipo="despesa"
+    )
+    db.add(conta)
+    await db.flush()
+    for i, razao in enumerate(["Transportes Silva", "Transportes Silva Junior"]):
+        db.add(
+            Contraparte(
+                empresa_id=empresa.id,
+                tipo="fornecedor",
+                documento=f"9999999900019{i}",
+                razao_social=razao,
+                conta_contabil_id=conta.id,
+                ativa=True,
+            )
+        )
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia["id"]),
+        data=date(2026, 5, 11),
+        valor=Decimal("800.00"),
+        historico="TED TRANSPORTES SILVA JUNIOR",
+        dc="D",
+        hash_dedup="hash_contraparte_ambigua",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+    await db.refresh(transacao)
+
+    assert transacao.status == "pendente"

@@ -23,8 +23,11 @@ Ao encontrar match:
 
 Classificação por contraparte (itens 1+2 do PDF de feedback dos contadores):
   Quando NENHUMA regra casa, antes de desistir o motor tenta achar a
-  contraparte (fornecedor/cliente cadastrado por CNPJ/CPF) a partir do
-  comprovante/nota fiscal candidato. Se achar, classifica exatamente como um
+  contraparte (fornecedor/cliente cadastrado) por duas vias, nesta ordem:
+  primeiro o CNPJ/CPF do comprovante ou nota fiscal candidato; depois, se isso
+  não resolver, o NOME da contraparte dentro do histórico do extrato. Nome é
+  evidência mais fraca que documento e recusa em qualquer ambiguidade — ver
+  `contraparte_por_nome.py`. Se achar, classifica exatamente como um
   match de regra faria — conta da contraparte, histórico no formato "PGTO/
   RECEBIMENTO REF [NF ...] RAZÃO SOCIAL" — com `estrategia="contraparte"` e
   `regra_id=None`. Isso NUNCA disputa com uma regra já existente: só entra em
@@ -62,6 +65,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.dates import bounds_do_mes_data
 from src.core.texto import normalizar_historico_contabil, normalizar_para_match
+from src.domain.neo.contraparte_por_nome import (
+    CandidataPorNome,
+    casar_por_nome,
+    nucleo_do_nome,
+)
 from src.db.models import (
     AgenciaBancaria,
     Comprovante,
@@ -131,7 +139,7 @@ class ResolucaoSombra:
 
     contraparte_id: UUID
     documento: str
-    origem_evidencia: str  # "nota_fiscal" | "comprovante"
+    origem_evidencia: str  # "nota_fiscal" | "comprovante" | "nome"
     conta_contraparte_id: UUID
     conta_divergente: bool
     historico_sugerido: str
@@ -566,24 +574,82 @@ class NeoEngine:
                 documento = comprovante_candidato.cpf_cnpj
                 origem_evidencia = "comprovante"
 
-        if documento is None:
-            return None
+        if documento is not None:
+            digitos = self._somente_digitos(documento)
+            if digitos:
+                contraparte = await self._buscar_contraparte_por_documento(digitos)
+                if contraparte is not None:
+                    return contraparte, origem_evidencia, numero_nf
+                logger.debug(
+                    "neo.contraparte_nao_encontrada",
+                    transacao_id=str(transacao.id),
+                    documento=digitos,
+                    origem_evidencia=origem_evidencia,
+                )
 
-        digitos = self._somente_digitos(documento)
-        if not digitos:
-            return None
+        # Sem evidência documental, tenta o nome no histórico do extrato.
+        #
+        # Nome é evidência MAIS FRACA que documento: o CNPJ bate ou não bate,
+        # enquanto o nome depende de como o banco escreveu. Por isso só entra
+        # aqui, depois de o documento não ter resolvido, e recusa em qualquer
+        # ambiguidade — pendente aparece na fila, classificado errado entra no
+        # razão em silêncio.
+        por_nome = await self._buscar_contraparte_por_nome(transacao)
+        if por_nome is not None:
+            return por_nome, "nome", numero_nf
+        return None
 
-        contraparte = await self._buscar_contraparte_por_documento(digitos)
-        if contraparte is None:
-            logger.debug(
-                "neo.contraparte_nao_encontrada",
-                transacao_id=str(transacao.id),
-                documento=digitos,
-                origem_evidencia=origem_evidencia,
+    async def _buscar_contraparte_por_nome(
+        self, transacao: Transacao
+    ) -> Contraparte | None:
+        """Casa razão social ou nome fantasia com o histórico do lançamento."""
+        contrapartes = (
+            (
+                await self._db.execute(
+                    select(Contraparte).where(
+                        Contraparte.empresa_id == self._empresa_id,
+                        Contraparte.ativa == True,  # noqa: E712
+                        Contraparte.deleted_at.is_(None),
+                        Contraparte.conta_contabil_id.is_not(None),
+                    )
+                )
             )
+            .scalars()
+            .all()
+        )
+        if not contrapartes:
             return None
 
-        return contraparte, origem_evidencia, numero_nf
+        candidatas: list[CandidataPorNome] = []
+        por_id: dict[UUID, Contraparte] = {}
+        for contraparte in contrapartes:
+            por_id[contraparte.id] = contraparte
+            for nome in (contraparte.razao_social, contraparte.nome_fantasia):
+                nucleo = nucleo_do_nome(nome)
+                if nucleo:
+                    candidatas.append(
+                        CandidataPorNome(contraparte_id=contraparte.id, nucleo=nucleo)
+                    )
+
+        achada, motivo_conflito = casar_por_nome(transacao.historico or "", candidatas)
+        if achada is None:
+            if motivo_conflito:
+                # Quase-acerto recusado precisa virar texto na fila, senão a
+                # transação parece simplesmente ignorada pelo motor.
+                logger.info(
+                    "neo.contraparte_por_nome_ambigua",
+                    transacao_id=str(transacao.id),
+                    motivo=motivo_conflito,
+                )
+            return None
+
+        logger.info(
+            "neo.contraparte_por_nome",
+            transacao_id=str(transacao.id),
+            contraparte_id=str(achada.contraparte_id),
+            nucleo=achada.nucleo,
+        )
+        return por_id[achada.contraparte_id]
 
     async def _buscar_contraparte_por_documento(self, documento: str) -> Contraparte | None:
         result = await self._db.execute(
