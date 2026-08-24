@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -124,9 +124,7 @@ async def _registrar_fila_agrupada(db, empresa, entradas: list[dict]):
         transacao = Transacao(
             empresa_id=empresa.id,
             agencia_id=agencias[entrada.get("agencia", 0)].id,
-            data=entrada.get(
-                "data", datetime(2024, 3, indice + 1, tzinfo=UTC)
-            ),
+            data=entrada.get("data", date(2024, 3, indice + 1)),
             valor=Decimal(str(entrada.get("valor", "10.00"))),
             historico=entrada["historico"],
             dc=entrada.get("dc", "D"),
@@ -2432,3 +2430,120 @@ async def test_busca_por_termo_ignora_acento(client, db, tenant, usuario, empres
     com_acento = (await client.get(_decisoes_url(empresa.id) + "?termo=LIQUIDAÇÃO")).json()
     assert sem_acento["total"] == 2
     assert com_acento["total"] == 2
+
+
+# ── Filtros novos da fila de decisões ────────────────────────────────────────
+
+
+async def _decisoes(client, empresa, **params) -> dict:
+    from urllib.parse import urlencode
+
+    r = await client.get(
+        f"/api/v1/empresas/{empresa.id}/neo/decisoes?{urlencode(params)}"
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_decisao_traz_a_data_do_lancamento(client, db, tenant, usuario, empresa):
+    """A fila mostra "Data | Histórico | Valor".
+
+    Sem a data na resposta, a tela precisaria buscar transação por transação —
+    um N+1 para exibir uma coluna.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(
+        db, empresa, [{"historico": "TARIFA MENSAL", "data": date(2026, 5, 7)}]
+    )
+
+    body = await _decisoes(client, empresa)
+
+    assert body["items"][0]["transacao_data"] == "2026-05-07"
+
+
+@pytest.mark.asyncio
+async def test_filtra_decisoes_por_intervalo_de_datas(
+    client, db, tenant, usuario, empresa
+):
+    """Intervalo livre, inclusivo nas duas pontas — não só competência fechada."""
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(db, empresa, [
+        {"historico": "ANTES", "data": date(2026, 5, 1)},
+        {"historico": "DENTRO", "data": date(2026, 5, 15)},
+        {"historico": "ULTIMO DIA", "data": date(2026, 5, 31)},
+        {"historico": "DEPOIS", "data": date(2026, 6, 1)},
+    ])
+
+    body = await _decisoes(client, empresa, data_de="2026-05-15", data_ate="2026-05-31")
+
+    historicos = {i["transacao_descricao"] for i in body["items"]}
+    assert historicos == {"DENTRO", "ULTIMO DIA"}
+
+
+@pytest.mark.asyncio
+async def test_intervalo_invertido_responde_422(client, db, tenant, usuario, empresa):
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(db, empresa, [{"historico": "QUALQUER"}])
+
+    from urllib.parse import urlencode
+
+    r = await client.get(
+        f"/api/v1/empresas/{empresa.id}/neo/decisoes?"
+        + urlencode({"data_de": "2026-05-31", "data_ate": "2026-05-01"})
+    )
+
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_intervalo_recorta_dentro_da_competencia(
+    client, db, tenant, usuario, empresa
+):
+    """Competência e intervalo se acumulam — o intervalo é recorte, não disputa.
+
+    A competência é global na aplicação; um intervalo informado na tela é mais
+    específico e não pode ser descartado por ela.
+    """
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(db, empresa, [
+        {"historico": "INICIO DO MES", "data": date(2026, 5, 2)},
+        {"historico": "MEIO DO MES", "data": date(2026, 5, 20)},
+        {"historico": "OUTRO MES", "data": date(2026, 6, 20)},
+    ])
+
+    body = await _decisoes(
+        client, empresa, mes="2026-05", data_de="2026-05-15", data_ate="2026-05-31"
+    )
+
+    assert {i["transacao_descricao"] for i in body["items"]} == {"MEIO DO MES"}
+
+
+@pytest.mark.asyncio
+async def test_competencia_e_intervalo_incompativeis_devolvem_vazio(
+    client, db, tenant, usuario, empresa
+):
+    """Pedir junho e um intervalo de maio é contraditório — vazio é honesto."""
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(db, empresa, [
+        {"historico": "JUNHO", "data": date(2026, 6, 10)},
+    ])
+
+    body = await _decisoes(
+        client, empresa, mes="2026-06", data_de="2026-05-01", data_ate="2026-05-31"
+    )
+
+    assert body["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_filtra_decisoes_por_motivo(client, db, tenant, usuario, empresa):
+    """O motivo é o que explica por que o lançamento parou na fila."""
+    await _login(client, tenant, usuario)
+    await _registrar_fila_agrupada(db, empresa, [{"historico": "PIX ENVIADO"}])
+
+    achou = await _decisoes(client, empresa, motivo="agrupamento")
+    nao_achou = await _decisoes(client, empresa, motivo="inexistente")
+
+    assert achou["total"] == 1
+    assert nao_achou["total"] == 0

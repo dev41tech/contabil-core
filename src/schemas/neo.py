@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -42,6 +42,10 @@ class NeoDecisaoResponse(BaseModel):
     # Campos extras para popular os modais de ação manual
     transacao_valor: Decimal | None = None
     transacao_dc: str | None = None
+    # A data do lançamento vem junto porque a fila de classificação mostra
+    # "Data | Histórico | Valor": sem ela a tela teria de buscar transação por
+    # transação, um N+1 para exibir uma coluna.
+    transacao_data: date | None = None
     agencia_id: UUID | None = None
     regra_id: UUID | None
     regra_descricao: str | None = None
