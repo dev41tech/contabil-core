@@ -24,12 +24,15 @@ from src.domain.neo.consultas import (
 from src.domain.neo.engine import NeoEngine
 from src.domain.jobs import JobRuntime, executar_neo
 from src.domain.regras.service import RegraService
+from src.domain.neo.cancelamento import cancelar_lancamento
 from src.schemas.neo import (
     NeoAssociarManualRequest,
     NeoClassificarLoteRequest,
     NeoClassificarLoteResponse,
     NeoCriarRegraEAplicarRequest,
     NeoCriarRegraEAplicarResponse,
+    NeoCancelarLancamentoRequest,
+    NeoCancelarLancamentoResponse,
     NeoDecisaoListResponse,
     NeoDecisaoResponse,
     NeoDivergenciasResponse,
@@ -468,3 +471,35 @@ async def associar_manual(
     resp.conta_codigo = conta.codigo
     resp.conta_descricao = conta.descricao
     return resp
+
+
+@router.post(
+    "/lancamentos/{lancamento_id}/cancelar",
+    response_model=NeoCancelarLancamentoResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def cancelar_lancamento_endpoint(
+    empresa_id: UUID,
+    lancamento_id: UUID,
+    body: NeoCancelarLancamentoRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoCancelarLancamentoResponse:
+    """Desfaz um lançamento e devolve a transação para a fila de classificação.
+
+    Recebe `lancamento_id` — o par de partidas —, nunca o id de um registro
+    isolado: cancelar meia partida deixaria o razão desbalanceado.
+    """
+    resultado = await cancelar_lancamento(
+        db,
+        empresa_id=empresa_id,
+        lancamento_id=lancamento_id,
+        motivo=body.motivo,
+        usuario_id=ctx.user_id,
+    )
+    return NeoCancelarLancamentoResponse(
+        transacao_id=resultado.transacao_id,
+        partidas_canceladas=resultado.partidas_canceladas,
+        notas_desvinculadas=resultado.notas_desvinculadas,
+        comprovantes_desvinculados=resultado.comprovantes_desvinculados,
+    )
