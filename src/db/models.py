@@ -435,6 +435,11 @@ class Transacao(Base, TimestampMixin):
         Numeric(15, 2, asdecimal=True), nullable=True
     )
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
+    # Posição da linha no arquivo de origem. Desempata lançamentos do MESMO dia:
+    # a data é só um dia, e ordenar por saldo ou valor não reproduz o extrato.
+    # Só a ordem relativa dentro do dia importa. NULL em linhas anteriores a 0027
+    # que o backfill não alcançou.
+    ordem: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_transacao_enum"), nullable=False)
     status: Mapped[str] = mapped_column(
         Enum("pendente", "processada", "erro", name="status_transacao_enum"),

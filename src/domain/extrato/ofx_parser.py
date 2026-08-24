@@ -30,6 +30,8 @@ class TransacaoOFX:
     # essa informação por lançamento; só o extrato em PDF a tem. Fica no fim,
     # com default, para não quebrar as construções posicionais existentes.
     saldo_apos: Decimal | None = None
+    # Posição da linha na origem — desempata lançamentos do mesmo dia.
+    ordem: int | None = None
 
 
 class OFXParseError(Exception):
@@ -80,7 +82,7 @@ def _parse_sgml(conteudo: str) -> OFXParseResult:
 
     for indice, bloco in enumerate(blocos, start=1):
         try:
-            transacoes.append(_parse_bloco(bloco))
+            transacoes.append(_parse_bloco(bloco, ordem=indice))
         except (OFXParseError, ValueError) as exc:
             erros.append(f"Transação {indice}: {exc}")
 
@@ -106,7 +108,7 @@ def _parse_xml(conteudo: str) -> OFXParseResult:
     for indice, stmttrn in enumerate(blocos, start=1):
         bloco = ET.tostring(stmttrn, encoding="unicode")
         try:
-            transacoes.append(_parse_bloco(bloco))
+            transacoes.append(_parse_bloco(bloco, ordem=indice))
         except (OFXParseError, ValueError) as exc:
             erros.append(f"Transação {indice}: {exc}")
     return OFXParseResult(transacoes=transacoes, total_blocos=len(blocos), erros=erros)
@@ -117,7 +119,7 @@ def _get_tag(bloco: str, tag: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _parse_bloco(bloco: str) -> TransacaoOFX:
+def _parse_bloco(bloco: str, ordem: int | None = None) -> TransacaoOFX:
     fitid = _get_tag(bloco, "FITID")
     dtposted = _get_tag(bloco, "DTPOSTED")
     trnamt = _get_tag(bloco, "TRNAMT")
@@ -154,6 +156,7 @@ def _parse_bloco(bloco: str) -> TransacaoOFX:
         valor=valor,
         historico=memo.strip(),
         tipo_ofx=trntype.upper(),
+        ordem=ordem,
     )
 
 
