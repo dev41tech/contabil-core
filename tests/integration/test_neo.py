@@ -2547,3 +2547,167 @@ async def test_filtra_decisoes_por_motivo(client, db, tenant, usuario, empresa):
 
     assert achou["total"] == 1
     assert nao_achou["total"] == 0
+
+
+# ── Cancelamento de lançamento (fase 01 do estorno auditado) ─────────────────
+
+
+async def _classificar_uma(client, db, empresa, csrf) -> tuple[str, str]:
+    """Deixa uma transação contabilizada e devolve (lancamento_id, transacao_id)."""
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+    await _criar_regra(client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDACAO", "D", csrf)
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    registro = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.empresa_id == empresa.id,
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().first()
+    assert registro is not None, "o motor não contabilizou nada"
+    return str(registro.lancamento_id), str(registro.transacao_id)
+
+
+def _cancelar_url(empresa_id, lancamento_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/lancamentos/{lancamento_id}/cancelar"
+
+
+@pytest.mark.asyncio
+async def test_cancelar_apaga_o_par_e_devolve_a_transacao_para_a_fila(
+    client, db, tenant, usuario, empresa
+):
+    """As duas partidas somem juntas e a transação volta a ser classificável."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+
+    r = await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["partidas_canceladas"] == 2
+
+    ativas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.lancamento_id == UUID(lancamento_id),
+                RegistroContabil.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert ativas == []
+
+    transacao = (
+        await db.execute(select(Transacao).where(Transacao.id == UUID(transacao_id)))
+    ).scalar_one()
+    await db.refresh(transacao)
+    assert transacao.status == "pendente"
+
+
+@pytest.mark.asyncio
+async def test_cancelar_duas_vezes_devolve_404_e_nao_500(
+    client, db, tenant, usuario, empresa
+):
+    """Clicar duas vezes é cenário real — precisa ser informação, não erro."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+    corpo = {"motivo": "conta errada"}
+
+    primeira = await client.post(
+        _cancelar_url(empresa.id, lancamento_id), json=corpo,
+        headers={"X-CSRF-Token": csrf},
+    )
+    segunda = await client.post(
+        _cancelar_url(empresa.id, lancamento_id), json=corpo,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert primeira.status_code == 200
+    assert segunda.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancelar_exige_motivo(client, db, tenant, usuario, empresa):
+    """Sem motivo a trilha de auditoria vira lista de carimbos."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+
+    r = await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "  "},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_transacao_cancelada_pode_ser_classificada_de_novo(
+    client, db, tenant, usuario, empresa
+):
+    """O ponto da fase 01: reclassificar deixa de ser um beco sem saída.
+
+    `associar_manual` recusa transação `processada`. Depois do cancelamento ela
+    volta a `pendente` e aceita a classificação nova.
+    """
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "reclassificar"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    outra_conta = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.8", descricao="Despesas Financeiras", tipo="despesa"
+    )
+    db.add(outra_conta)
+    await db.flush()
+    decisao_id = (
+        await db.execute(
+            select(NeoDecisao)
+            .where(NeoDecisao.transacao_id == UUID(transacao_id))
+            .order_by(NeoDecisao.processado_em.desc())
+        )
+    ).scalars().first().id
+
+    r = await client.post(
+        _decisoes_url(empresa.id) + f"/{decisao_id}/associar-manual",
+        json={"conta_id": str(outra_conta.id), "descricao": "Tarifa reclassificada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_cancelamento_fica_na_trilha_de_auditoria(
+    client, db, tenant, usuario, empresa
+):
+    """Quem desfez, o que havia antes e por quê."""
+    from src.db.models import AuditLog
+
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "lancado na conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    log = (
+        await db.execute(
+            select(AuditLog).where(AuditLog.acao == "lancamento.cancelado")
+        )
+    ).scalars().first()
+    assert log is not None
+    assert log.entidade_id == lancamento_id
+    assert log.usuario_id == usuario.id
+    assert "lancado na conta errada" in (log.dados_depois or "")
+    # O que havia antes precisa estar guardado — é o que permite reconstruir.
+    assert "partidas" in (log.dados_antes or "")

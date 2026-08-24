@@ -203,3 +203,22 @@ class NeoCriarRegraEAplicarRequest(RegraCreate):
 class NeoCriarRegraEAplicarResponse(BaseModel):
     regra: RegraResponse
     resultado: NeoResultado
+
+
+class NeoCancelarLancamentoRequest(BaseModel):
+    # Motivo é exigido pela API, não só pelo formulário: desfazer sem motivo
+    # registrado transforma a trilha de auditoria numa lista de carimbos, e
+    # qualquer chamada direta contornaria uma validação que morasse só na tela.
+    motivo: str = Field(..., min_length=3, max_length=300)
+
+    @field_validator("motivo", mode="before")
+    @classmethod
+    def limpar_motivo(cls, valor: str) -> str:
+        return valor.strip() if isinstance(valor, str) else valor
+
+
+class NeoCancelarLancamentoResponse(BaseModel):
+    transacao_id: UUID
+    partidas_canceladas: int
+    notas_desvinculadas: int
+    comprovantes_desvinculados: int
