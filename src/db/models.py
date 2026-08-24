@@ -424,6 +424,11 @@ class Transacao(Base, TimestampMixin):
     agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
     data: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
+    # Saldo da conta APÓS este lançamento, como impresso no extrato. NULL quando a
+    # origem não informa (OFX não traz saldo) — é estado permanente, não pendência.
+    saldo_apos: Mapped[Decimal | None] = mapped_column(
+        Numeric(15, 2, asdecimal=True), nullable=True
+    )
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_transacao_enum"), nullable=False)
     status: Mapped[str] = mapped_column(

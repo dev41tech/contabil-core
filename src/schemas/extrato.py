@@ -15,6 +15,9 @@ class TransacaoResponse(BaseModel):
     agencia_id: UUID
     data: datetime
     valor: Decimal
+    # Saldo da conta após o lançamento, como impresso no extrato. `null` quando a
+    # origem não informa (importação por OFX) — a tela deve exibir vazio, não zero.
+    saldo_apos: Decimal | None = None
     historico: str
     dc: str
     status: str
