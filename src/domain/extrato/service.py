@@ -104,6 +104,7 @@ class ExtratoService:
                     valor=abs(t.valor),
                     historico=t.historico or t.tipo_ofx,
                     dc=dc,
+                    saldo_apos=t.saldo_apos,   # OFX não informa: fica NULL
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )
@@ -206,6 +207,7 @@ class ExtratoService:
                     valor=abs(t.valor),
                     historico=t.historico or "EXTRATO PDF",
                     dc=dc,
+                    saldo_apos=t.saldo_apos,
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )

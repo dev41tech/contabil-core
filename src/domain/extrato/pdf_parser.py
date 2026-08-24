@@ -133,22 +133,41 @@ def _gerar_fitid(data: datetime, historico: str, valor: Decimal, idx: int) -> st
 # grupo 1 = prefixo (contém data/desc/doc)
 # grupo 2 = valor da transação (pode ser negativo)
 # grupo 3 = saldo corrente (descartado)
+#
+# O saldo aceita sinal negativo: conta no vermelho é normal e, enquanto o grupo 3
+# exigia dígito no início, TODA linha de um extrato com saldo devedor deixava de
+# casar. O parser devolvia zero transações, o arquivo caía na camada de IA e a IA
+# achatava a linha capturando a coluna de saldo no lugar do valor — foi assim que
+# 29 lançamentos da SINCOPEÇAS entraram com o saldo como valor (ver 4ac77cf).
 _TX_LINE = re.compile(
     r"^(.+?)\s+"
     r"([-]?\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s+"
-    r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$",
+    r"([-]?\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*$",
 )
 
 # Prefixo de data no início de uma linha
 # NOTA: \d{4} deve vir ANTES de \d{2} para evitar que "2026" case como "20" + sobra
 _DATE_PREFIX = re.compile(r"^(\d{2}[/\-]\d{2}[/\-](?:\d{4}|\d{2}))\s*")
 
-# Linhas a ignorar sempre
+# Linhas a ignorar sempre.
+#
+# Cabeçalho não é só ruído: uma linha de texto puro que não casa com _TX_LINE vira
+# `pending_desc` e é usada como histórico da PRÓXIMA transação (o formato Bradesco
+# depende disso). Sem suprimir o cabeçalho do Sicredi, "Dados referentes ao
+# período..." entrava como descrição do primeiro lançamento do extrato.
 _SKIP_RE = re.compile(
     r"^(Data\s|Ag[eê]ncia|Extrato|Total\s|Os dados|Pr[oó]ximo|"
-    r"^\s*Cr[eé]dito|^\s*D[eé]bito|Saldo \(|REM:\s)",
+    r"^\s*Cr[eé]dito|^\s*D[eé]bito|Saldo \(|REM:\s|"
+    r"Associado:|Cooperativa:|Conta Corrente:|Impresso em|Dados referentes)",
     re.IGNORECASE,
 )
+
+# Cabeçalho de coluna da tabela ("Data  Descrição  Documento  Valor  Saldo").
+# Marca a fronteira entre o cabeçalho do documento e os lançamentos: nada lido
+# antes dele pode virar descrição de transação. Sem isso, uma razão social que
+# quebrou em duas linhas ("...COM IMPORT DISTR DE AUTOP E" / "MOTOP ROL E AC NO E")
+# sobrevivia como `pending_desc` e virava o histórico do primeiro lançamento.
+_TABLE_HEADER_RE = re.compile(r"^Data\b.*\bSaldo\b", re.IGNORECASE)
 
 # Limite de texto enviado para a IA (gpt-4o-mini suporta 128k tokens ≈ ~500k chars)
 _AI_TEXT_MAX_CHARS = 80_000
@@ -203,6 +222,11 @@ def _parse_linhas_multipagina(
             continue
 
         # ── Linhas a ignorar completamente ────────────────────────────────────
+        # O cabeçalho da tabela encerra o preâmbulo do documento: qualquer
+        # descrição acumulada até aqui é cabeçalho, não lançamento.
+        if _TABLE_HEADER_RE.match(line):
+            pending_desc = None
+            continue
         if _SKIP_RE.search(line):
             continue
         # Saldo sem débito/crédito (ex: "SALDO ANTERIOR 232,94")
@@ -219,7 +243,7 @@ def _parse_linhas_multipagina(
                 pending_desc = clean
             continue
 
-        prefix_raw, val_str, _saldo = m.group(1), m.group(2), m.group(3)
+        prefix_raw, val_str, saldo_str = m.group(1), m.group(2), m.group(3)
 
         # ── Extrai data do prefixo (se houver) ────────────────────────────────
         dm = _DATE_PREFIX.match(prefix_raw)
@@ -252,6 +276,15 @@ def _parse_linhas_multipagina(
         if valor is None or abs(valor) < Decimal("0.001"):
             continue
 
+        # ── Saldo após o lançamento ───────────────────────────────────────────
+        # Diferente do valor, saldo ilegível não invalida a transação: é dado de
+        # conferência, não o lançamento em si. Zero é saldo legítimo, então só
+        # `None` significa ausência.
+        saldo_apos = _parse_valor(saldo_str)
+
+        # O fitid NÃO inclui o saldo de propósito: ele é a identidade da
+        # transação para deduplicação, e o mesmo lançamento reimportado precisa
+        # gerar o mesmo fitid mesmo que o saldo tenha sido lido de outro jeito.
         fitid = _gerar_fitid(last_date, historico, valor, idx)
         transacoes.append(
             TransacaoOFX(
@@ -260,6 +293,7 @@ def _parse_linhas_multipagina(
                 valor=valor,
                 historico=historico[:200],
                 tipo_ofx="CREDIT" if valor >= 0 else "DEBIT",
+                saldo_apos=saldo_apos,
             )
         )
         idx += 1
@@ -605,6 +639,53 @@ def _valor_declarado(linha: str) -> Decimal | None:
     return decimal
 
 
+def _validar_cadeia_de_saldos(
+    transacoes: list[TransacaoOFX], tolerancia: Decimal
+) -> bool:
+    """Confere que o saldo caminha de um lançamento para o outro.
+
+    Num extrato, `saldo[n] - saldo[n-1]` é exatamente `valor[n]`. Essa igualdade
+    é a verificação de completude mais forte que existe, e não depende de o banco
+    imprimir "SALDO ANTERIOR" ou "TOTAL DÉBITOS": lançamento faltando faz o saldo
+    pular mais que o valor, e valor trocado quebra o elo.
+
+    É o que faltava. A conferência por soma total aceita, sem perceber, uma
+    extração que perdeu lançamentos e trocou valores de modo que os erros se
+    cancelam — foi assim que a SINCOPEÇAS ficou com 34 valores errados e ~144
+    lançamentos ausentes em fev–mai/2026 sem que nada reclamasse. Também é a
+    única validação que funciona no Sicredi, cujo extrato não traz nenhuma das
+    linhas de resumo que as outras estratégias procuram.
+
+    Retorna True se a cadeia foi conferida (isto é, se havia saldo para tanto).
+    Só as origens que informam saldo por lançamento entram aqui: OFX e as
+    camadas de IA passam direto, sem alegar validação que não fizeram.
+    """
+    com_saldo = [t for t in transacoes if t.saldo_apos is not None]
+    if len(com_saldo) < 2 or len(com_saldo) != len(transacoes):
+        # Cadeia parcial não prova nada sobre os buracos — não alegamos validação.
+        return False
+
+    for anterior, atual in zip(transacoes, transacoes[1:]):
+        movimento = atual.saldo_apos - anterior.saldo_apos  # type: ignore[operator]
+        if abs(movimento - atual.valor) > tolerancia:
+            raise PDFParseError(
+                "Extração incompleta: o saldo do extrato não caminha com os "
+                f"lançamentos. Depois de {_fmt_reais(anterior.saldo_apos)} o saldo "  # type: ignore[arg-type]
+                f"vai para {_fmt_reais(atual.saldo_apos)}, uma variação de "  # type: ignore[arg-type]
+                f"{_fmt_reais(movimento)}, mas o lançamento "
+                f"'{atual.historico[:60]}' é de {_fmt_reais(atual.valor)} — "
+                "há lançamento faltando ou com valor errado entre os dois."
+            )
+    return True
+
+
+def _fmt_reais(valor: Decimal) -> str:
+    """Formata no padrão brasileiro — a mensagem é lida por contador."""
+    inteiro, _, centavos = f"{abs(valor):.2f}".partition(".")
+    milhar = f"{int(inteiro):,}".replace(",", ".")
+    return f"{'-' if valor < 0 else ''}R$ {milhar},{centavos}"
+
+
 def _validar_completude(linhas: list[str], transacoes: list[TransacaoOFX]) -> None:
     saldos_iniciais: list[Decimal] = []
     saldos_finais: list[Decimal] = []
@@ -626,7 +707,7 @@ def _validar_completude(linhas: list[str], transacoes: list[TransacaoOFX]) -> No
 
     valores = [t.valor for t in transacoes]
     tolerancia = Decimal("0.05")
-    validou = False
+    validou = _validar_cadeia_de_saldos(transacoes, tolerancia)
     if saldos_iniciais and saldos_finais:
         diferenca = saldos_finais[-1] - saldos_iniciais[0]
         if abs(sum(valores, Decimal("0")) - diferenca) > tolerancia:

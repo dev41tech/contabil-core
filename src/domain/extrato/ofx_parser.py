@@ -22,6 +22,10 @@ class TransacaoOFX:
     valor: Decimal       # positivo = crédito, negativo = débito
     historico: str
     tipo_ofx: str        # CREDIT, DEBIT, etc.
+    # Saldo da conta após o lançamento, quando a origem informa. O OFX não traz
+    # essa informação por lançamento; só o extrato em PDF a tem. Fica no fim,
+    # com default, para não quebrar as construções posicionais existentes.
+    saldo_apos: Decimal | None = None
 
 
 class OFXParseError(Exception):
