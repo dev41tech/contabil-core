@@ -353,9 +353,25 @@ class ExportacaoService:
             q = q.where(Transacao.data >= data.data_de.date())
         if data.data_ate:
             q = q.where(Transacao.data <= data.data_ate.date())
+        if data.dc:
+            q = q.where(Transacao.dc == data.dc)
+        if data.valor_min is not None:
+            q = q.where(Transacao.valor >= data.valor_min)
+        if data.valor_max is not None:
+            q = q.where(Transacao.valor <= data.valor_max)
+        if data.historico:
+            q = q.where(Transacao.historico.ilike(f"%{data.historico.strip()}%"))
 
         transacoes = (
-            await self._db.execute(q.order_by(Transacao.data, Transacao.id))
+            # Mesma ordenação da tela: o arquivo reproduz o extrato do banco, e
+            # `ordem` é o que põe os lançamentos do mesmo dia na sequência certa.
+            await self._db.execute(
+                q.order_by(
+                    Transacao.data,
+                    Transacao.ordem.asc().nullslast(),
+                    Transacao.id,
+                )
+            )
         ).scalars().all()
 
         # Resolve o nome da agência em lote: a alternativa é uma query por linha.
