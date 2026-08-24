@@ -298,6 +298,9 @@ def _parse_linhas_multipagina(
                 historico=historico[:200],
                 tipo_ofx="CREDIT" if valor >= 0 else "DEBIT",
                 saldo_apos=saldo_apos,
+                # Posição da linha no arquivo. Desempata lançamentos do mesmo
+                # dia: nem saldo nem valor reproduzem a ordem do extrato.
+                ordem=idx,
             )
         )
         idx += 1
@@ -531,6 +534,7 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
             valor=valor,
             historico=historico[:200],
             tipo_ofx="CREDIT" if valor >= 0 else "DEBIT",
+            ordem=idx,
         )
     except Exception as e:
         logger.warning("IA: item inválido descartado (%s)", type(e).__name__)

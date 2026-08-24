@@ -491,3 +491,51 @@ async def test_paginacao_nao_repete_nem_pula_no_mesmo_dia(
 
     vistos = [i["id"] for i in p1["items"] + p2["items"] + p3["items"]]
     assert len(vistos) == len(set(vistos)) == 10
+
+
+@pytest.mark.asyncio
+async def test_mesmo_dia_segue_a_ordem_do_extrato(client, db, tenant, usuario, empresa):
+    """Dentro do dia, a ordem é a do arquivo — não a do saldo nem a do valor.
+
+    Caso real (SINCOPEÇAS, 02/01/2026): a tarifa de R$ 0,20 vem PRIMEIRO, com o
+    maior saldo, e o pagamento de R$ 2.164,48 vem por último, com o menor. Num
+    dia com crédito a relação se inverte, então nenhuma ordenação por saldo
+    reproduz o extrato — só a posição da linha reproduz.
+    """
+    from datetime import date
+    from uuid import UUID
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    # Inseridos FORA de ordem de propósito: quem manda é `ordem`, não a inserção.
+    for ordem, hist, valor, saldo in [
+        (2, "PAGAMENTO PIX CASSIA", Decimal("2164.48"), Decimal("58443.17")),
+        (0, "TARIFA BAIXA DE TITULOS", Decimal("0.20"), Decimal("67201.27")),
+        (1, "TRANSF ENTRE CONTAS CEZAR", Decimal("6593.62"), Decimal("60607.65")),
+    ]:
+        db.add(
+            Transacao(
+                empresa_id=empresa.id,
+                agencia_id=UUID(agencia["id"]),
+                data=date(2026, 1, 2),
+                valor=valor,
+                saldo_apos=saldo,
+                historico=hist,
+                dc="D",
+                ordem=ordem,
+                hash_dedup=f"hash_ordem_{ordem}",
+            )
+        )
+    await db.flush()
+
+    body = await _listar(client, empresa)
+
+    assert [i["historico"] for i in body["items"]] == [
+        "TARIFA BAIXA DE TITULOS",
+        "TRANSF ENTRE CONTAS CEZAR",
+        "PAGAMENTO PIX CASSIA",
+    ]
+    # O saldo NÃO está em ordem decrescente por acaso — está na ordem do banco.
+    saldos = [Decimal(str(i["saldo_apos"])) for i in body["items"]]
+    assert saldos == [Decimal("67201.27"), Decimal("60607.65"), Decimal("58443.17")]

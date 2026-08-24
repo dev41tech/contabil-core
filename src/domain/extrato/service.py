@@ -105,6 +105,7 @@ class ExtratoService:
                     historico=t.historico or t.tipo_ofx,
                     dc=dc,
                     saldo_apos=t.saldo_apos,   # OFX não informa: fica NULL
+                    ordem=t.ordem,
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )
@@ -208,6 +209,7 @@ class ExtratoService:
                     historico=t.historico or "EXTRATO PDF",
                     dc=dc,
                     saldo_apos=t.saldo_apos,
+                    ordem=t.ordem,
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )
@@ -274,11 +276,19 @@ class ExtratoService:
                 # antigo para o mais recente, e é assim que o saldo faz sentido
                 # de uma linha para a outra.
                 #
-                # `id` é desempate, não enfeite: `data` é só um dia, e um extrato
-                # tem vários lançamentos no mesmo dia. Sem critério estável, o
-                # banco pode devolver ordens diferentes entre uma página e outra,
-                # e a paginação passa a repetir e pular linhas.
-                q.order_by(Transacao.data.asc(), Transacao.id.asc())
+                # `ordem` é a posição da linha no arquivo — reproduz o extrato
+                # dentro do dia. Nem saldo nem valor servem: em dia só de débitos
+                # o saldo cai, em dia com crédito ele sobe, então nenhuma direção
+                # fixa funciona; e o extrato não é ordenado por valor.
+                #
+                # `id` fecha a ordenação para linhas antigas sem `ordem`, que sem
+                # ele empatariam — e empate torna a paginação instável, repetindo
+                # e pulando registros entre uma página e outra.
+                q.order_by(
+                    Transacao.data.asc(),
+                    Transacao.ordem.asc().nullslast(),
+                    Transacao.id.asc(),
+                )
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )
