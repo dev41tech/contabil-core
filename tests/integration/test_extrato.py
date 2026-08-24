@@ -318,3 +318,122 @@ async def test_extrato_normal_nao_ganha_rejeicao(client, tenant, usuario, empres
     assert body["importadas"] == 2
     assert body["rejeitadas"] == 0
     assert body["motivos_rejeicao"] == []
+
+
+# ── Filtros da listagem ──────────────────────────────────────────────────────
+
+
+async def _semear(db, empresa, agencia_id) -> None:
+    """Três lançamentos com histórico, valor, D/C e data distintos."""
+    from datetime import date
+    from uuid import UUID
+
+    for i, (dia, hist, valor, dc) in enumerate(
+        [
+            (date(2026, 3, 1), "PAGAMENTO PIX FORNECEDOR ALFA", Decimal("100.00"), "D"),
+            (date(2026, 3, 15), "TARIFA COM R LIQUIDACAO", Decimal("1.19"), "D"),
+            (date(2026, 3, 31), "TED RECEBIDA CLIENTE BETA", Decimal("5000.00"), "C"),
+        ]
+    ):
+        db.add(
+            Transacao(
+                empresa_id=empresa.id,
+                agencia_id=UUID(agencia_id),
+                data=dia,
+                valor=valor,
+                historico=hist,
+                dc=dc,
+                hash_dedup=f"hash_filtro_{i}",
+            )
+        )
+    await db.flush()
+
+
+async def _listar(client, empresa, **params) -> dict:
+    r = await client.get(f"/api/v1/empresas/{empresa.id}/extrato", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_filtra_por_trecho_do_historico(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa, historico="tarifa")
+
+    assert body["total"] == 1
+    assert "TARIFA" in body["items"][0]["historico"]
+
+
+@pytest.mark.asyncio
+async def test_filtra_por_faixa_de_valor(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa, valor_min=50, valor_max=1000)
+
+    assert [Decimal(str(i["valor"])) for i in body["items"]] == [Decimal("100.00")]
+
+
+@pytest.mark.asyncio
+async def test_filtra_por_debito_ou_credito(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa, dc="C")
+
+    assert body["total"] == 1
+    assert body["items"][0]["dc"] == "C"
+
+
+@pytest.mark.asyncio
+async def test_periodo_inclui_o_ultimo_dia(client, db, tenant, usuario, empresa):
+    """31/03 tem de entrar quando `data_ate=2026-03-31`.
+
+    Enquanto o filtro era datetime, a data virava 00:00 e o último dia inteiro
+    ficava de fora — o lançamento do dia 31 sumia do extrato.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa, data_de="2026-03-01", data_ate="2026-03-31")
+
+    assert body["total"] == 3
+    assert "2026-03-31" in {i["data"] for i in body["items"]}
+
+
+@pytest.mark.asyncio
+async def test_data_sai_como_dia_sem_fuso(client, db, tenant, usuario, empresa):
+    """`2026-03-01`, não `2026-03-01T00:00:00Z` — que o front renderizava como 28/02."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+
+    body = await _listar(client, empresa, historico="ALFA")
+
+    assert body["items"][0]["data"] == "2026-03-01"
+
+
+@pytest.mark.asyncio
+async def test_transacao_apagada_some_da_listagem(client, db, tenant, usuario, empresa):
+    """Soft delete precisa esconder de fato — é o que a limpeza de extrato usa."""
+    from datetime import UTC, datetime
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    antes = await _listar(client, empresa)
+
+    alvo = (await db.execute(select(Transacao).limit(1))).scalars().first()
+    alvo.deleted_at = datetime.now(UTC)
+    await db.flush()
+
+    depois = await _listar(client, empresa)
+
+    assert depois["total"] == antes["total"] - 1
+    assert str(alvo.id) not in {i["id"] for i in depois["items"]}

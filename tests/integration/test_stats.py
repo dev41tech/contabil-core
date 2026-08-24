@@ -6,7 +6,7 @@ andando. Um percentual errado aqui não parece um bug — parece trabalho penden
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 import pytest_asyncio
@@ -59,7 +59,7 @@ async def tres_transacoes_uma_conciliada(
         t = Transacao(
             empresa_id=empresa.id,
             agencia_id=agencia.id,
-            data=datetime(2026, 3, 10 + i, tzinfo=UTC),
+            data=date(2026, 3, 10 + i),
             valor=100 * (i + 1),
             historico=f"MOVIMENTO {i}",
             dc="C",
@@ -201,7 +201,7 @@ async def test_stats_nao_conta_transacao_de_outra_empresa(
         Transacao(
             empresa_id=outra.id,
             agencia_id=ag_outra.id,
-            data=datetime(2026, 3, 20, tzinfo=UTC),
+            data=date(2026, 3, 20),
             valor=9_999,
             historico="MOVIMENTO DA OUTRA EMPRESA",
             dc="C",

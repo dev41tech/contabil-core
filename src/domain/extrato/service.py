@@ -238,7 +238,12 @@ class ExtratoService:
         page: int = 1,
         page_size: int = 50,
     ) -> ExtratoPendentesResponse:
-        q = select(Transacao).where(Transacao.empresa_id == self._empresa_id)
+        q = select(Transacao).where(
+            Transacao.empresa_id == self._empresa_id,
+            # Sem isto, transação apagada continuava listada — e a limpeza de
+            # extrato, que é soft delete, não escondia nada da tela.
+            Transacao.deleted_at.is_(None),
+        )
 
         if filtro.status:
             q = q.where(Transacao.status == filtro.status)
@@ -248,6 +253,17 @@ class ExtratoService:
             q = q.where(Transacao.data >= filtro.data_de)
         if filtro.data_ate:
             q = q.where(Transacao.data <= filtro.data_ate)
+        if filtro.dc:
+            q = q.where(Transacao.dc == filtro.dc)
+        if filtro.valor_min is not None:
+            q = q.where(Transacao.valor >= filtro.valor_min)
+        if filtro.valor_max is not None:
+            q = q.where(Transacao.valor <= filtro.valor_max)
+        if filtro.historico:
+            # `valor` é sempre positivo na tabela; o sinal mora em `dc`. Por isso
+            # a faixa de valor não precisa de abs() aqui.
+            termo = f"%{filtro.historico.strip()}%"
+            q = q.where(Transacao.historico.ilike(termo))
 
         count_q = select(func.count()).select_from(q.subquery())
         total = (await self._db.execute(count_q)).scalar_one()
@@ -272,6 +288,7 @@ class ExtratoService:
             select(Transacao).where(
                 Transacao.id == transacao_id,
                 Transacao.empresa_id == self._empresa_id,
+                Transacao.deleted_at.is_(None),
             )
         )
         t = result.scalar_one_or_none()

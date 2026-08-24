@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -51,7 +51,7 @@ async def transacao(db: AsyncSession, empresa: Empresa, agencia: AgenciaBancaria
     t = Transacao(
         empresa_id=empresa.id,
         agencia_id=agencia.id,
-        data=datetime(2026, 3, 10, tzinfo=UTC),
+        data=date(2026, 3, 10),
         valor=1_500,
         historico="PAGAMENTO FORNECEDOR ACME",
         dc="D",
@@ -263,7 +263,7 @@ async def test_associar_transacao_de_outra_empresa_rejeita(
     t_outra = Transacao(
         empresa_id=outra.id,
         agencia_id=ag.id,
-        data=datetime(2026, 3, 11, tzinfo=UTC),
+        data=date(2026, 3, 11),
         valor=800,
         historico="MOVIMENTO DA OUTRA",
         dc="D",

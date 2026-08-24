@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.periodos import limites_competencia
+from src.core.dates import bounds_do_mes_data
 from src.db.models import Empresa, Permissao, Transacao
 from src.schemas.carteira import CarteiraEmpresaResponse, CarteiraResponse
 
@@ -21,7 +21,7 @@ async def listar_carteira(
     role: str,
     mes: str,
 ) -> CarteiraResponse:
-    inicio, fim = limites_competencia(mes)
+    inicio, fim = bounds_do_mes_data(mes)
 
     total = func.count(Transacao.id).label("transacoes_importadas")
     pendentes = func.sum(
@@ -67,7 +67,7 @@ async def listar_carteira(
             and_(
                 Transacao.empresa_id == Empresa.id,
                 Transacao.data >= inicio,
-                Transacao.data < fim,
+                Transacao.data <= fim,   # `fim` é o último DIA do mês, inclusivo
                 Transacao.deleted_at.is_(None),
             ),
         )

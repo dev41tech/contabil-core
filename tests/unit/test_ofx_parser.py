@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import date
 from decimal import Decimal
 
 from src.domain.extrato.ofx_parser import parse_ofx, parse_ofx_detalhado
@@ -77,7 +77,8 @@ def test_parse_ofx1_credito():
     assert cred.valor == Decimal("1500.00")
     assert cred.historico == "TED RECEBIDA CLIENTE"
     assert cred.tipo_ofx == "CREDIT"
-    assert cred.data.tzinfo == timezone.utc
+    # Data de calendário, sem hora nem fuso: quem lê não reinterpreta o dia.
+    assert cred.data == date(2024, 1, 15)
 
 
 def test_parse_ofx1_debito():
@@ -172,9 +173,26 @@ def test_parse_ofx_registro_sem_fitid_reportado():
 
 
 def test_parse_ofx_data_com_fracao_e_timezone():
+    """Hora, fração e offset são aceitos, mas o que sobra é a data de calendário."""
     ofx = _OFX_COM_TIMEZONE.replace(
         "20240301120000[-3:BRT]", "20240301120000.125[-3:BRT]"
     )
+
     transacao = parse_ofx(ofx)[0]
-    assert transacao.data.microsecond == 125_000
-    assert transacao.data.utcoffset().total_seconds() == -3 * 3600
+
+    assert transacao.data == date(2024, 3, 1)
+
+
+def test_lancamento_noturno_fica_no_dia_do_banco():
+    """22h de 01/03 em Brasília é 01/03, embora seja 02/03 em UTC.
+
+    Enquanto a data era instante, converter para UTC empurrava o lançamento para
+    o dia seguinte. A data de negócio é a do fuso que o próprio OFX declara.
+    """
+    ofx = _OFX_COM_TIMEZONE.replace(
+        "20240301120000[-3:BRT]", "20240301220000[-3:BRT]"
+    )
+
+    transacao = parse_ofx(ofx)[0]
+
+    assert transacao.data == date(2024, 3, 1)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -49,8 +49,9 @@ async def balancete(
 
 @router.get("/livro-caixa", response_model=LivroCaixaResponse)
 async def livro_caixa(
-    data_de: datetime | None = Query(default=None),
-    data_ate: datetime | None = Query(default=None),
+    # Datas de calendário, inclusivas: o livro percorre `Transacao.data`.
+    data_de: date | None = Query(default=None, description="AAAA-MM-DD"),
+    data_ate: date | None = Query(default=None, description="AAAA-MM-DD"),
     svc: RelatoriosService = Depends(_svc),
 ) -> LivroCaixaResponse:
     """Livro Caixa com movimentação diária e saldo acumulado por agência."""

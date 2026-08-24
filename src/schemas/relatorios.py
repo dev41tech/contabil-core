@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -78,7 +78,8 @@ class BalanceteResponse(BaseModel):
 class LivroCaixaLancamento(BaseModel):
     """Um lançamento no livro caixa."""
 
-    data: datetime
+    # Data de calendário: vem de `Transacao.data`, que não guarda hora.
+    data: date
     historico: str
     dc: str
     valor: Decimal
@@ -99,8 +100,8 @@ class LivroCaixaAgencia(BaseModel):
 
 class LivroCaixaResponse(BaseModel):
     empresa_id: str
-    data_de: datetime | None
-    data_ate: datetime | None
+    data_de: date | None
+    data_ate: date | None
     agencias: list[LivroCaixaAgencia]
 
 

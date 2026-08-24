@@ -60,7 +60,7 @@ import structlog
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.dates import bounds_do_mes
+from src.core.dates import bounds_do_mes_data
 from src.core.texto import normalizar_historico_contabil, normalizar_para_match
 from src.db.models import (
     AgenciaBancaria,
@@ -1009,6 +1009,8 @@ class NeoEngine:
             .where(
                 Transacao.empresa_id == self._empresa_id,
                 Transacao.status == "pendente",
+                # Transação apagada não volta para a fila de classificação.
+                Transacao.deleted_at.is_(None),
             )
             .order_by(Transacao.data.asc(), Transacao.id.asc())
             .with_for_update(skip_locked=True)
@@ -1016,7 +1018,7 @@ class NeoEngine:
         if agencia_id:
             q = q.where(Transacao.agencia_id == agencia_id)
         if mes:
-            inicio, fim = bounds_do_mes(mes)
+            inicio, fim = bounds_do_mes_data(mes)
             q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
         return (await self._db.execute(q)).scalars().all()
 

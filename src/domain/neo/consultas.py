@@ -20,7 +20,7 @@ from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, contains_eager
 
-from src.core.dates import bounds_do_mes
+from src.core.dates import bounds_do_mes_data
 from src.core.errors import ValidationError
 from src.core.texto import (
     chave_agrupamento_historico,
@@ -160,7 +160,7 @@ async def listar_decisoes(
             )
         )
     if mes:
-        inicio, fim = bounds_do_mes(mes)
+        inicio, fim = bounds_do_mes_data(mes)
         q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
     if valor_min is not None and valor_max is not None and valor_min > valor_max:
         raise ValidationError(message="valor_min não pode ser maior que valor_max.")
@@ -242,7 +242,7 @@ async def consultar_divergencias(
     if agencia_id is not None:
         filtros.append(Transacao.agencia_id == agencia_id)
     if mes is not None:
-        inicio, fim = bounds_do_mes(mes)
+        inicio, fim = bounds_do_mes_data(mes)
         filtros.extend((Transacao.data >= inicio, Transacao.data <= fim))
 
     resumo = (
@@ -458,11 +458,12 @@ async def agrupar_pendencias(
         NeoDecisao.empresa_id == empresa_id,
         NeoDecisao.resultado == "sem_regra",
         Transacao.status == "pendente",
+        Transacao.deleted_at.is_(None),
     ]
     if agencia_id:
         filtros.append(Transacao.agencia_id == agencia_id)
     if mes:
-        inicio, fim = bounds_do_mes(mes)
+        inicio, fim = bounds_do_mes_data(mes)
         filtros.extend((Transacao.data >= inicio, Transacao.data <= fim))
 
     base = (

@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 
 @dataclass
 class TransacaoOFX:
     fitid: str           # ID único da transação no banco
-    data: datetime
+    # Data de calendário do lançamento, não instante. Guardar isto como datetime
+    # foi o que fez a tela mostrar sempre um dia a menos: meia-noite UTC vira
+    # 21h do dia anterior em Brasília, e cada consumidor decidia o fuso por conta
+    # própria — o export acertava, a tela errava.
+    data: date
     valor: Decimal       # positivo = crédito, negativo = débito
     historico: str
     tipo_ofx: str        # CREDIT, DEBIT, etc.
@@ -153,8 +157,15 @@ def _parse_bloco(bloco: str) -> TransacaoOFX:
     )
 
 
-def _parse_data(s: str) -> datetime | None:
-    """Parseia data OFX completa, inclusive fração e offset ``[-3:BRT]``."""
+def _parse_data(s: str) -> date | None:
+    """Data de calendário do DTPOSTED, no fuso que o próprio OFX declara.
+
+    O OFX pode trazer só a data (``20260701``) ou data e hora com offset
+    (``20260701220000[-3:BRT]``). No segundo caso a data de negócio é a do fuso
+    declarado: 22h do dia 01 em Brasília é dia 01, embora seja dia 02 em UTC.
+    Converter para UTC antes de tirar a data trocaria o dia dos lançamentos
+    noturnos — por isso a conversão acontece aqui, onde o offset ainda é conhecido.
+    """
     match = re.fullmatch(
         r"(?P<base>\d{8}(?:\d{4}(?:\d{2})?)?)"
         r"(?:\.(?P<fracao>\d+))?"
@@ -169,11 +180,8 @@ def _parse_data(s: str) -> datetime | None:
         return None
     try:
         data = datetime.strptime(base, formato)
-        fracao = match.group("fracao")
-        if fracao:
-            data = data.replace(microsecond=int((fracao + "000000")[:6]))
-        offset = match.group("offset")
-        tz = timezone(timedelta(hours=float(offset))) if offset is not None else UTC
-        return data.replace(tzinfo=tz)
+        # A hora e o offset só existem para situar a data no fuso do banco; a
+        # data resultante é o que interessa, e sai daqui já resolvida.
+        return data.date()
     except (ValueError, OverflowError):
         return None

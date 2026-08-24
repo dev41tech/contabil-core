@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, Request, UploadFile
@@ -80,18 +81,26 @@ async def listar_transacoes(
     page_size: int = Query(default=50, ge=1, le=200),
     status: str | None = Query(default=None),
     agencia_id: UUID | None = Query(default=None),
-    data_de: str | None = Query(default=None, description="ISO 8601 — ex: 2024-01-01"),
-    data_ate: str | None = Query(default=None, description="ISO 8601 — ex: 2024-12-31"),
+    # `date` e não `str`: o FastAPI valida e converte, e o intervalo é inclusivo
+    # nos dois extremos — informar 2026-01-31 traz os lançamentos daquele dia.
+    data_de: date | None = Query(default=None, description="AAAA-MM-DD — ex: 2026-01-01"),
+    data_ate: date | None = Query(default=None, description="AAAA-MM-DD — ex: 2026-12-31"),
+    historico: str | None = Query(default=None, description="Busca parcial no histórico"),
+    dc: str | None = Query(default=None, pattern="^[DC]$", description="D ou C"),
+    valor_min: Decimal | None = Query(default=None, ge=0, description="Valor mínimo"),
+    valor_max: Decimal | None = Query(default=None, ge=0, description="Valor máximo"),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> ExtratoPendentesResponse:
-    from datetime import datetime
-
     filtro = TransacaoFiltro(
         status=status,
         agencia_id=agencia_id,
-        data_de=datetime.fromisoformat(data_de) if data_de else None,
-        data_ate=datetime.fromisoformat(data_ate) if data_ate else None,
+        data_de=data_de,
+        data_ate=data_ate,
+        historico=historico,
+        dc=dc,
+        valor_min=valor_min,
+        valor_max=valor_max,
     )
     return await _svc(empresa_id, db).listar(filtro, page=page, page_size=page_size)
 

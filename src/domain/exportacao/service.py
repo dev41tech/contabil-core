@@ -346,10 +346,13 @@ class ExportacaoService:
             q = q.where(Transacao.agencia_id == data.agencia_id)
         if data.status:
             q = q.where(Transacao.status == data.status)
+        # `Transacao.data` é `Date`; o filtro chega como datetime porque o mesmo
+        # schema serve ao razão, cujo `data_lancamento` é instante. Converter aqui
+        # evita que o Postgres resolva a comparação pelo fuso da sessão.
         if data.data_de:
-            q = q.where(Transacao.data >= data.data_de)
+            q = q.where(Transacao.data >= data.data_de.date())
         if data.data_ate:
-            q = q.where(Transacao.data <= data.data_ate)
+            q = q.where(Transacao.data <= data.data_ate.date())
 
         transacoes = (
             await self._db.execute(q.order_by(Transacao.data, Transacao.id))
@@ -473,7 +476,7 @@ class ExportacaoService:
                 "valor": _as_decimal(n.valor),
                 "chave_acesso": n.chave_acesso or "",
                 "status": n.status or "",
-                "data_transacao": t.data.date().isoformat() if t else "",
+                "data_transacao": t.data.isoformat() if t else "",
                 "valor_transacao": _as_decimal(t.valor) if t else "",
             })
 
@@ -499,10 +502,13 @@ class ExportacaoService:
             Transacao.empresa_id == self._empresa_id,
             Transacao.deleted_at.is_(None),
         )
+        # `Transacao.data` é `Date`; o filtro chega como datetime porque o mesmo
+        # schema serve ao razão, cujo `data_lancamento` é instante. Converter aqui
+        # evita que o Postgres resolva a comparação pelo fuso da sessão.
         if data.data_de:
-            q = q.where(Transacao.data >= data.data_de)
+            q = q.where(Transacao.data >= data.data_de.date())
         if data.data_ate:
-            q = q.where(Transacao.data <= data.data_ate)
+            q = q.where(Transacao.data <= data.data_ate.date())
 
         transacoes = (
             await self._db.execute(q.order_by(Transacao.data))
@@ -568,7 +574,7 @@ class ExportacaoService:
 
             for idx, (n, c) in enumerate(zip(notas_padded, comps_padded)):
                 row: dict = {
-                    "data_transacao": t.data.date().isoformat() if idx == 0 else "",
+                    "data_transacao": t.data.isoformat() if idx == 0 else "",
                     "historico_extrato": t.historico if idx == 0 else "",
                     "dc": t.dc if idx == 0 else "",
                     "valor_transacao": _as_decimal(t.valor) if idx == 0 else "",
