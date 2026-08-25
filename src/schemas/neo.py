@@ -46,6 +46,10 @@ class NeoDecisaoResponse(BaseModel):
     # "Data | Histórico | Valor": sem ela a tela teria de buscar transação por
     # transação, um N+1 para exibir uma coluna.
     transacao_data: date | None = None
+    # Lançamento contábil vigente da transação, quando ela está classificada.
+    # É o que a tela precisa para oferecer "Desfazer" — o índice único parcial
+    # garante no máximo um par ativo por transação, então não há ambiguidade.
+    lancamento_id: UUID | None = None
     agencia_id: UUID | None = None
     regra_id: UUID | None
     regra_descricao: str | None = None
