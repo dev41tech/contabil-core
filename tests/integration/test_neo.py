@@ -2924,3 +2924,70 @@ async def test_desfeita_individual_nao_marca_lote_cancelado(
 
     assert item["importacao_arquivo"] is not None   # veio de um upload
     assert item["lote_cancelado"] is False          # mas o lote segue de pé
+
+
+@pytest.mark.asyncio
+async def test_desfeita_traz_a_decisao_para_reclassificar(
+    client, db, tenant, usuario, empresa
+):
+    """A aba oferece "Associar" direto, e precisa da decisão pendente para isso.
+
+    Tem de ser a mais recente `sem_regra` — a antiga `associada` continua no log
+    e associar contra ela seria mirar a classificação que acabou de ser desfeita.
+    """
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    item = (await client.get(_desfeitas_url(empresa.id))).json()["items"][0]
+
+    assert item["transacao_status"] == "pendente"
+    assert item["decisao_atual_id"] is not None
+
+    # E a decisão oferecida tem de funcionar de verdade.
+    outra = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.5", descricao="Outras Despesas", tipo="despesa"
+    )
+    db.add(outra)
+    await db.flush()
+    r = await client.post(
+        _decisoes_url(empresa.id) + f"/{item['decisao_atual_id']}/associar-manual",
+        json={"conta_id": str(outra.id), "descricao": "Reclassificada da aba Desfeitas"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_desfeita_ja_reclassificada_nao_oferece_associar(
+    client, db, tenant, usuario, empresa
+):
+    """Oferecer o botão depois de reclassificada levaria a um 409."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    item = (await client.get(_desfeitas_url(empresa.id))).json()["items"][0]
+    outra = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.4", descricao="Despesas Gerais", tipo="despesa"
+    )
+    db.add(outra)
+    await db.flush()
+    await client.post(
+        _decisoes_url(empresa.id) + f"/{item['decisao_atual_id']}/associar-manual",
+        json={"conta_id": str(outra.id), "descricao": "Ja resolvida"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    depois = (await client.get(_desfeitas_url(empresa.id))).json()["items"][0]
+
+    assert depois["transacao_status"] == "processada"
+    assert depois["decisao_atual_id"] is None

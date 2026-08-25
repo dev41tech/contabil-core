@@ -729,6 +729,31 @@ async def listar_desfeitas(
         )
     ).all()
 
+    # A tela oferece "Associar" direto daqui, e para isso precisa da decisão
+    # PENDENTE da transação — `associar_manual` recebe `decisao_id`, não
+    # `transacao_id`. Buscada em lote: uma query para a página, não uma por
+    # linha.
+    #
+    # A decisão certa é a MAIS RECENTE `sem_regra`: o cancelamento cria uma
+    # nova linha de log, então a antiga (`associada`) continua lá e associar
+    # contra ela seria associar contra a classificação que acabou de ser
+    # desfeita.
+    decisao_pendente: dict[UUID, UUID] = {}
+    transacao_ids = [linha[1].id for linha in linhas]
+    if transacao_ids:
+        recentes = (
+            await db.execute(
+                select(NeoDecisao.transacao_id, NeoDecisao.id)
+                .where(
+                    NeoDecisao.transacao_id.in_(transacao_ids),
+                    NeoDecisao.resultado == "sem_regra",
+                )
+                .order_by(NeoDecisao.processado_em.asc())
+            )
+        ).all()
+        # A ordem crescente faz a última escrita vencer — sobra a mais recente.
+        decisao_pendente = {t_id: d_id for t_id, d_id in recentes}
+
     itens: list[dict] = []
     for registro, transacao, importacao, usuario in linhas:
         itens.append(
@@ -749,6 +774,15 @@ async def listar_desfeitas(
                 # de um lote, mas foi desfeito sozinho" — a tela agrupa só o
                 # primeiro caso.
                 "lote_cancelado": bool(importacao and importacao.cancelada_em),
+                # A tela só oferece "Associar" enquanto a transação estiver de
+                # volta na fila. Se ela já foi reclassificada, o botão levaria a
+                # um 409 e o certo é mostrar que o caso já foi resolvido.
+                "transacao_status": transacao.status,
+                "decisao_atual_id": (
+                    decisao_pendente.get(transacao.id)
+                    if transacao.status == "pendente"
+                    else None
+                ),
             }
         )
     return itens, total
