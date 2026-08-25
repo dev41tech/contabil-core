@@ -2827,3 +2827,100 @@ async def test_nome_ambiguo_deixa_pendente_em_vez_de_adivinhar(
     await db.refresh(transacao)
 
     assert transacao.status == "pendente"
+
+
+# ── Aba Desfeitas ───────────────────────────────────────────────────────────
+
+
+def _desfeitas_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/desfeitas"
+
+
+@pytest.mark.asyncio
+async def test_lancamento_cancelado_aparece_em_desfeitas(
+    client, db, tenant, usuario, empresa
+):
+    """Uma linha por LANÇAMENTO, não por partida — o par é a unidade."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    body = (await client.get(_desfeitas_url(empresa.id))).json()
+
+    assert body["total"] == 1
+    item = body["items"][0]
+    assert item["lancamento_id"] == lancamento_id
+    assert item["motivo_cancelamento"] == "conta errada"
+    assert item["cancelado_por_nome"] == usuario.nome
+    # A partida exibida é a da conta classificada, não a contrapartida bancária.
+    assert not item["conta_descricao"].startswith("Contrapartida bancária")
+
+
+@pytest.mark.asyncio
+async def test_desfeitas_vazio_quando_nada_foi_cancelado(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    await _classificar_uma(client, db, empresa, csrf)
+
+    body = (await client.get(_desfeitas_url(empresa.id))).json()
+
+    assert body["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_desfeita_por_lote_traz_o_arquivo_de_origem(
+    client, db, tenant, usuario, empresa
+):
+    """Cancelar o upload inteiro precisa deixar visível de qual arquivo veio.
+
+    É isso que permite a tela agrupar os itens sob o arquivo em vez de
+    espalhá-los numa lista plana.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_tarifas(client, db, empresa, csrf)
+    await _criar_regra(
+        client, empresa, agencia_id, conta_id, "TARIFA COM LIQUIDACAO", "D", csrf
+    )
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    lote_id = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/extrato/importacoes")
+    ).json()["items"][0]["id"]
+    await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importacoes/{lote_id}/cancelar",
+        json={"motivo": "arquivo do mes errado"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    body = (await client.get(_desfeitas_url(empresa.id))).json()
+
+    assert body["total"] >= 1
+    item = body["items"][0]
+    assert item["importacao_id"] == lote_id
+    assert item["importacao_arquivo"].endswith(".ofx")
+    assert item["lote_cancelado"] is True
+    assert "arquivo do mes errado" in item["motivo_cancelamento"]
+
+
+@pytest.mark.asyncio
+async def test_desfeita_individual_nao_marca_lote_cancelado(
+    client, db, tenant, usuario, empresa
+):
+    """Veio de um lote, mas foi desfeita sozinha — a tela não deve agrupar."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, _ = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "so esta"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    item = (await client.get(_desfeitas_url(empresa.id))).json()["items"][0]
+
+    assert item["importacao_arquivo"] is not None   # veio de um upload
+    assert item["lote_cancelado"] is False          # mas o lote segue de pé

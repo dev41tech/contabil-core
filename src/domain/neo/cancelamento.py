@@ -137,6 +137,9 @@ async def cancelar_lancamento(
 
     for partida in partidas:
         partida.deleted_at = agora
+        partida.cancelado_em = agora
+        partida.cancelado_por = usuario_id
+        partida.motivo_cancelamento = motivo[:300]
 
     transacao.status = "pendente"
 

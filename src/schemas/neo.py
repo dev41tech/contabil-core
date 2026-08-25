@@ -226,3 +226,29 @@ class NeoCancelarLancamentoResponse(BaseModel):
     partidas_canceladas: int
     notas_desvinculadas: int
     comprovantes_desvinculados: int
+
+
+class NeoDesfeitaResponse(BaseModel):
+    lancamento_id: UUID
+    transacao_id: UUID
+    transacao_data: date | None = None
+    transacao_descricao: str | None = None
+    valor: Decimal
+    dc: str
+    conta_descricao: str
+    cancelado_em: datetime
+    cancelado_por_nome: str | None = None
+    motivo_cancelamento: str | None = None
+    # Preenchidos quando o lançamento veio de um upload. `lote_cancelado` diz se
+    # o upload INTEIRO foi desfeito — é o que a tela usa para agrupar os itens
+    # sob o arquivo em vez de espalhá-los numa lista plana.
+    importacao_id: UUID | None = None
+    importacao_arquivo: str | None = None
+    lote_cancelado: bool = False
+
+
+class NeoDesfeitaListResponse(BaseModel):
+    items: list[NeoDesfeitaResponse]
+    total: int
+    page: int
+    page_size: int

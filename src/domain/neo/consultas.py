@@ -30,11 +30,13 @@ from src.core.texto import (
 from src.db.functions import sem_acento
 from src.db.models import (
     AgenciaBancaria,
+    ExtratoImportacao,
     NeoDecisao,
     PlanoConta,
     Regra,
     RegistroContabil,
     Transacao,
+    Usuario,
 )
 from src.domain.neo.engine import estrategia_de_match
 from src.schemas.neo import (
@@ -658,3 +660,88 @@ async def simular_regra(
             quantidade=conflitos, amostras=amostras_conflitos
         ),
     )
+
+
+async def listar_desfeitas(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[dict], int]:
+    """Lançamentos cancelados, do mais recente para o mais antigo.
+
+    Uma linha por LANÇAMENTO, não por partida: o par é a unidade, e listar as
+    duas linhas mostraria o mesmo cancelamento duas vezes. A partida escolhida
+    para exibição é a da conta classificada, não a contrapartida bancária — é a
+    conta que o contador reconhece.
+
+    Quando o cancelamento veio de um lote, `importacao_id` e `importacao_arquivo`
+    vêm preenchidos, e é isso que permite a tela agrupar os itens sob o arquivo
+    que os trouxe em vez de espalhá-los numa lista plana.
+    """
+    conta_bancaria = aliased(PlanoConta)
+
+    # Das duas partidas do par, a exibida é a da CLASSIFICAÇÃO, não a
+    # contrapartida bancária. O discriminador é estrutural, não textual: o par
+    # sempre tem D/C opostos, e a partida de classificação carrega o mesmo D/C
+    # da transação — regra só é candidata quando `regra.dc == transacao.dc`
+    # (engine.py:310), e os caminhos manual e por contraparte passam
+    # `transacao.dc` diretamente.
+    #
+    # Filtrar pela descrição ("Contrapartida bancária: ...") pareceria mais
+    # óbvio e estaria errado: `normalizar_historico_contabil` põe tudo em
+    # maiúsculas antes de gravar, então o prefixo no banco não é o do código.
+    base = (
+        select(RegistroContabil, Transacao, ExtratoImportacao, Usuario)
+        .join(Transacao, Transacao.id == RegistroContabil.transacao_id)
+        .outerjoin(
+            ExtratoImportacao, ExtratoImportacao.id == Transacao.importacao_id
+        )
+        .outerjoin(Usuario, Usuario.id == RegistroContabil.cancelado_por)
+        .where(
+            RegistroContabil.empresa_id == empresa_id,
+            RegistroContabil.cancelado_em.is_not(None),
+            RegistroContabil.dc == Transacao.dc,
+        )
+    )
+
+    total = (
+        await db.execute(
+            select(func.count()).select_from(
+                base.with_only_columns(RegistroContabil.id).subquery()
+            )
+        )
+    ).scalar_one()
+
+    linhas = (
+        await db.execute(
+            base.order_by(RegistroContabil.cancelado_em.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    itens: list[dict] = []
+    for registro, transacao, importacao, usuario in linhas:
+        itens.append(
+            {
+                "lancamento_id": registro.lancamento_id,
+                "transacao_id": transacao.id,
+                "transacao_data": transacao.data,
+                "transacao_descricao": transacao.historico,
+                "valor": registro.valor,
+                "dc": registro.dc,
+                "conta_descricao": registro.descricao,
+                "cancelado_em": registro.cancelado_em,
+                "cancelado_por_nome": usuario.nome if usuario else None,
+                "motivo_cancelamento": registro.motivo_cancelamento,
+                "importacao_id": importacao.id if importacao else None,
+                "importacao_arquivo": importacao.nome_arquivo if importacao else None,
+                # Distingue "veio de um lote que foi cancelado inteiro" de "veio
+                # de um lote, mas foi desfeito sozinho" — a tela agrupa só o
+                # primeiro caso.
+                "lote_cancelado": bool(importacao and importacao.cancelada_em),
+            }
+        )
+    return itens, total
