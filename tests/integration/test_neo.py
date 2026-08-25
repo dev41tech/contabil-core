@@ -311,6 +311,8 @@ async def test_classificar_lote_processa_pendentes_e_ignora_retrato_velho(
         "classificadas": 1,
         "ignoradas": 1,
         "ids_ignorados": [str(velha.id)],
+        "bloqueadas": 0,
+        "bloqueios": [],
     }
     await db.refresh(atual)
     assert atual.status == "processada"
@@ -3104,3 +3106,214 @@ async def test_liberar_duas_vezes_devolve_409(client, db, tenant, usuario, empre
 
     assert primeira.status_code == 204
     assert segunda.status_code == 409
+
+
+# ── Quarentena: transação cujo valor não é confiável
+
+
+_LINHA_CRUA = "18/02/2026 TARIFA COM R LIQUIDACAO COB000001 -1,19 -54.881,83"
+
+
+async def _pendencia(
+    db,
+    empresa,
+    agencia_id,
+    *,
+    historico: str = _LINHA_CRUA,
+    valor: str = "54881.83",
+    dc: str = "C",
+) -> Transacao:
+    """Pendência montada direto no banco.
+
+    O caminho de importação recusaria a linha crua — é justamente essa a
+    barreira que existe desde 21/08/2026. O estrago que estes testes cobrem já
+    está no banco de quem importou antes disso, então a pendência precisa
+    nascer sem passar pela importação.
+    """
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia_id),
+        data=date(2026, 2, 18),
+        valor=Decimal(valor),
+        historico=historico,
+        dc=dc,
+        status="pendente",
+        hash_dedup=f"valor-suspeito-{uuid4().hex}",
+    )
+    db.add(transacao)
+    await db.flush()
+    return transacao
+
+
+@pytest.mark.asyncio
+async def test_motor_nao_contabiliza_transacao_com_o_saldo_no_lugar_do_valor(
+    client, db, tenant, usuario, empresa
+):
+    """A regra casa, e mesmo assim a transação não pode virar lançamento.
+
+    A regra é criada de propósito para reconhecer a linha: se a quarentena
+    fosse checada depois do match, o teste passaria por acidente. O valor
+    gravado (R$ 54.881,83) é o saldo da conta; contabilizá-lo levaria o erro
+    para o razão em silêncio, e é assim que ele some.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _criar_regra(
+        client, empresa, agencia_id, conta_id, "TARIFA COM R LIQUIDACAO", "C", csrf
+    )
+    transacao = await _pendencia(db, empresa, agencia_id)
+
+    resultado = await _resultado_do_job(
+        client,
+        empresa.id,
+        await client.post(
+            _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+        ),
+    )
+
+    assert resultado["bloqueadas_valor_suspeito"] == 1
+    await db.refresh(transacao)
+    assert transacao.status == "pendente"
+    assert (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().all() == []
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+    assert (decisao.resultado, decisao.estrategia) == ("sem_regra", "valor_suspeito")
+    assert "saldo" in decisao.motivo
+
+
+@pytest.mark.asyncio
+async def test_bloqueio_por_valor_sobrescreve_o_motivo_generico_na_fila(
+    client, db, tenant, usuario, empresa
+):
+    """Pendência que já estava na fila precisa ganhar o aviso.
+
+    A decisão `sem_regra` antiga dizia só "Nenhuma regra encontrada". Se o
+    motor a deixasse intacta, a transação continuaria parecendo pendência
+    comum — e a tela ofereceria classificá-la em lote com as outras.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    transacao = await _pendencia(db, empresa, agencia_id)
+    db.add(
+        NeoDecisao(
+            empresa_id=empresa.id,
+            transacao_id=transacao.id,
+            resultado="sem_regra",
+            motivo="Nenhuma regra encontrada para 'TARIFA' (dc=C)",
+        )
+    )
+    await db.flush()
+
+    await _resultado_do_job(
+        client,
+        empresa.id,
+        await client.post(
+            _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+        ),
+    )
+
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+    assert decisao.estrategia == "valor_suspeito"
+    assert "Nenhuma regra encontrada" not in decisao.motivo
+
+
+@pytest.mark.asyncio
+async def test_classificar_lote_recusa_a_suspeita_e_contabiliza_as_boas(
+    client, db, tenant, usuario, empresa
+):
+    """Uma linha podre não pode anular o lote inteiro, nem passar junto.
+
+    Este é o cenário que motivou a barreira: dezesseis pendências
+    selecionadas de uma vez na tela, uma delas com o saldo no lugar do valor.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    boa = await _pendencia(
+        db, empresa, agencia_id, historico="DEPOSITO IDENTIFICADO", valor="100.00"
+    )
+    suspeita = await _pendencia(db, empresa, agencia_id)
+
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(boa.id), str(suspeita.id)],
+            "conta_id": conta_id,
+            "descricao": "Tarifas do mes",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 200
+    corpo = resposta.json()
+    assert (corpo["classificadas"], corpo["ignoradas"], corpo["bloqueadas"]) == (1, 0, 1)
+    assert corpo["bloqueios"][0]["transacao_id"] == str(suspeita.id)
+    assert "saldo" in corpo["bloqueios"][0]["motivo"]
+
+    await db.refresh(boa)
+    await db.refresh(suspeita)
+    assert (boa.status, suspeita.status) == ("processada", "pendente")
+    assert (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == suspeita.id
+            )
+        )
+    ).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_associar_manual_recusa_transacao_com_valor_suspeito(
+    client, db, tenant, usuario, empresa
+):
+    """A associação individual recusa com o motivo, não em silêncio.
+
+    O contador precisa saber que o conserto é na importação do extrato — sem
+    isso, a recusa vira "o sistema não deixa" e alguém contorna criando uma
+    regra.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    transacao = await _pendencia(db, empresa, agencia_id)
+    await _resultado_do_job(
+        client,
+        empresa.id,
+        await client.post(
+            _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+        ),
+    )
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+
+    resposta = await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/decisoes/{decisao.id}/associar-manual",
+        json={"conta_id": conta_id, "descricao": "Tarifa bancaria"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 422
+    assert "saldo" in resposta.json()["message"]
+    await db.refresh(transacao)
+    assert transacao.status == "pendente"
+    assert (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().all() == []

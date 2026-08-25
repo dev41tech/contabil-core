@@ -29,6 +29,7 @@ from src.domain.neo.cancelamento import cancelar_lancamento, liberar_para_automa
 from src.schemas.neo import (
     NeoAssociarManualRequest,
     NeoClassificarLoteRequest,
+    NeoClassificarLoteBloqueio,
     NeoClassificarLoteResponse,
     NeoCriarRegraEAplicarRequest,
     NeoCriarRegraEAplicarResponse,
@@ -260,11 +261,13 @@ async def classificar_lote(
     ids_ignorados = [id_ for id_ in body.transacao_ids if id_ not in por_id]
 
     engine = NeoEngine(db=db, empresa_id=empresa_id)
-    decisoes = await engine.classificar_manualmente_lote(
+    classificacao = await engine.classificar_manualmente_lote(
         ordenadas, conta.id, body.descricao
     )
     await db.flush()
-    for transacao, decisao in zip(ordenadas, decisoes, strict=True):
+    for transacao, decisao in zip(
+        classificacao.classificadas, classificacao.decisoes, strict=True
+    ):
         await registrar_auditoria(
             db,
             tenant_id=ctx.tenant_id,
@@ -288,9 +291,16 @@ async def classificar_lote(
         )
 
     return NeoClassificarLoteResponse(
-        classificadas=len(ordenadas),
+        classificadas=len(classificacao.classificadas),
         ignoradas=len(ids_ignorados),
         ids_ignorados=ids_ignorados,
+        bloqueadas=len(classificacao.bloqueadas),
+        bloqueios=[
+            NeoClassificarLoteBloqueio(
+                transacao_id=bloqueio.transacao_id, motivo=bloqueio.motivo
+            )
+            for bloqueio in classificacao.bloqueadas
+        ],
     )
 
 
@@ -441,11 +451,15 @@ async def associar_manual(
     engine = NeoEngine(db=db, empresa_id=empresa_id)
     # O mesmo fluxo usado pelo lote encerra a decisão `sem_regra`; manter essa
     # transição no motor evita que as duas rotas voltem a divergir.
-    decisao = (
-        await engine.classificar_manualmente_lote(
-            [transacao], conta.id, body.descricao
-        )
-    )[0]
+    classificacao = await engine.classificar_manualmente_lote(
+        [transacao], conta.id, body.descricao
+    )
+    if classificacao.bloqueadas:
+        # Uma transação só: não há o que aproveitar do lote, então a recusa é a
+        # resposta inteira — e sai no mesmo envelope `{"message": ...}` que a
+        # tela já lê nas outras recusas desta rota.
+        raise ValidationError(message=classificacao.bloqueadas[0].motivo)
+    decisao = classificacao.decisoes[0]
 
     await registrar_auditoria(
         db,

@@ -38,7 +38,7 @@ from src.db.models import (
     Transacao,
     Usuario,
 )
-from src.domain.neo.engine import estrategia_de_match
+from src.domain.neo.engine import ESTRATEGIA_VALOR_SUSPEITO, estrategia_de_match
 from src.schemas.neo import (
     NeoConflitoAmostra,
     NeoDecisaoListResponse,
@@ -66,6 +66,12 @@ ESTRATEGIAS_VALIDAS = (
     "todas_palavras",
     "manual",
     "contraparte",
+    # Não é uma forma de casar histórico: marca a pendência que o motor
+    # recusou contabilizar por valor não confiável. Fica aqui porque a fila
+    # filtra por este mesmo campo e a tela precisa isolar essas linhas. Vem do
+    # motor, e não repetida como texto, para o filtro não passar a mentir se a
+    # marca mudar de nome.
+    ESTRATEGIA_VALOR_SUSPEITO,
 )
 
 # Aceita a letra e a palavra por extenso, com ou sem acento.
