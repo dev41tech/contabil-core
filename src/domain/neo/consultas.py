@@ -16,7 +16,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, contains_eager
 
@@ -692,6 +692,13 @@ async def listar_desfeitas(
     # Filtrar pela descrição ("Contrapartida bancária: ...") pareceria mais
     # óbvio e estaria errado: `normalizar_historico_contabil` põe tudo em
     # maiúsculas antes de gravar, então o prefixo no banco não é o do código.
+    #
+    # O `cast` para texto NÃO é enfeite. `RegistroContabil.dc` e `Transacao.dc`
+    # são enums DIFERENTES no PostgreSQL (`dc_registro_enum` e
+    # `dc_transacao_enum`), e comparar dois enums distintos é erro de tipo:
+    # "operator does not exist: dc_registro_enum = dc_transacao_enum". Em SQLite
+    # enum é texto e a comparação passa — foi assim que a suíte deu verde com o
+    # endpoint quebrado em produção.
     base = (
         select(RegistroContabil, Transacao, ExtratoImportacao, Usuario)
         .join(Transacao, Transacao.id == RegistroContabil.transacao_id)
@@ -702,7 +709,7 @@ async def listar_desfeitas(
         .where(
             RegistroContabil.empresa_id == empresa_id,
             RegistroContabil.cancelado_em.is_not(None),
-            RegistroContabil.dc == Transacao.dc,
+            cast(RegistroContabil.dc, String) == cast(Transacao.dc, String),
         )
     )
 
