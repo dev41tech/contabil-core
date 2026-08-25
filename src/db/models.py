@@ -493,6 +493,16 @@ class Transacao(Base, TimestampMixin):
         nullable=False,
     )
     hash_dedup: Mapped[str] = mapped_column(String(64), nullable=False)  # SHA-256 para dedup
+    # Um humano recusou a classificação automática desta transação. Enquanto
+    # preenchido, o motor não a classifica sozinho — ela espera decisão humana.
+    # É o que dá prioridade real ao manual: sem isso, a mesma regra reclassifica
+    # na execução seguinte e desfazer não significa nada.
+    auto_recusado_em: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    auto_recusado_por: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True
+    )
 
     __table_args__ = (
         UniqueConstraint("empresa_id", "hash_dedup", name="uq_transacao_empresa_hash"),
