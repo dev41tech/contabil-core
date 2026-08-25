@@ -51,6 +51,7 @@ from src.domain.exportacao.formatos import (
     _new_workbook,
     _save_workbook,
 )
+from src.domain.extrato.ordenacao import ordenar_como_o_extrato
 from src.schemas.contabil import ExportJobCreate, ExportJobResponse
 
 logger = structlog.get_logger(__name__)
@@ -363,15 +364,9 @@ class ExportacaoService:
             q = q.where(Transacao.historico.ilike(f"%{data.historico.strip()}%"))
 
         transacoes = (
-            # Mesma ordenação da tela: o arquivo reproduz o extrato do banco, e
-            # `ordem` é o que põe os lançamentos do mesmo dia na sequência certa.
-            await self._db.execute(
-                q.order_by(
-                    Transacao.data,
-                    Transacao.ordem.asc().nullslast(),
-                    Transacao.id,
-                )
-            )
+            # Mesma ordenação da tela, pela mesma função: o arquivo tem de bater
+            # linha a linha com o que o contador está vendo.
+            await self._db.execute(ordenar_como_o_extrato(q))
         ).scalars().all()
 
         # Resolve o nome da agência em lote: a alternativa é uma query por linha.
