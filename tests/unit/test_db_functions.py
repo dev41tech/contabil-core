@@ -40,39 +40,45 @@ def test_expressao_pode_ser_agrupada():
     assert "GROUP BY" in sql
 
 
-def test_desfeitas_compara_dc_com_cast_explicito():
-    """`RegistroContabil.dc` e `Transacao.dc` são enums DIFERENTES no Postgres.
+def test_dc_e_um_tipo_so_em_todas_as_tabelas():
+    """Um enum D/C por tabela foi o que quebrou a aba Desfeitas em produção.
 
-    Comparar os dois sem cast é erro de tipo lá — "operator does not exist:
-    dc_registro_enum = dc_transacao_enum" — mas passa em SQLite, onde enum é
-    texto. Foi assim que a aba Desfeitas foi para produção quebrada com a suíte
-    verde.
+    Eram três tipos com os mesmos dois valores. No PostgreSQL enum é tipo
+    nominal, então comparar `dc_registro_enum` com `dc_transacao_enum` é
+    "operator does not exist" e a query nem roda; em SQLite enum é texto e a
+    mesma comparação passa — a suíte ficava verde com o endpoint quebrado.
 
-    O teste compila a consulta no dialeto PostgreSQL e exige o CAST, porque é a
-    única forma de pegar isso sem um Postgres de verdade na suíte.
+    Este teste é a única barreira que a suíte consegue oferecer contra isso
+    voltar: ele olha o TIPO declarado nos models, não o banco. Que o banco de
+    produção esteja de fato com um tipo só depende da migration 0031, e SQLite
+    não tem como verificar.
     """
+    from src.db.models import Regra, RegistroContabil, Transacao
+
+    nomes = {
+        modelo.__table__.c.dc.type.name
+        for modelo in (Regra, RegistroContabil, Transacao)
+    }
+    assert nomes == {"dc_enum"}, (
+        f"D/C voltou a ter mais de um tipo: {sorted(nomes)}. Reusar `DC_ENUM` "
+        f"de src.db.models é o que impede a comparação entre tabelas de "
+        f"quebrar no Postgres."
+    )
+
+
+def test_comparar_dc_entre_tabelas_nao_precisa_mais_de_cast():
+    """Com um tipo só, a comparação volta a ser direta.
+
+    O `cast` para texto que a aba Desfeitas carregava era remendo do sintoma —
+    saiu junto com a causa. Se ele reaparecer, é sinal de que alguém criou um
+    enum novo por tabela outra vez.
+    """
+    from sqlalchemy import select
     from sqlalchemy.dialects import postgresql
-    from sqlalchemy import String, cast, select
 
     from src.db.models import RegistroContabil, Transacao
 
-    q = select(RegistroContabil.id).where(
-        cast(RegistroContabil.dc, String) == cast(Transacao.dc, String)
-    )
+    q = select(RegistroContabil.id).where(RegistroContabil.dc == Transacao.dc)
     sql = str(q.compile(dialect=postgresql.dialect()))
 
-    assert "CAST" in sql.upper(), (
-        "a comparação entre os dois enums precisa de cast explícito no Postgres"
-    )
-
-
-def test_comparar_os_dois_enums_sem_cast_seria_invalido_no_postgres():
-    """Guarda o motivo: os tipos SÃO diferentes, não é preciosismo."""
-    from src.db.models import RegistroContabil, Transacao
-
-    assert RegistroContabil.__table__.c.dc.type.name == "dc_registro_enum"
-    assert Transacao.__table__.c.dc.type.name == "dc_transacao_enum"
-    assert (
-        RegistroContabil.__table__.c.dc.type.name
-        != Transacao.__table__.c.dc.type.name
-    )
+    assert "CAST" not in sql.upper()
