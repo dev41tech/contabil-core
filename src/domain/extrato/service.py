@@ -38,7 +38,12 @@ class ExtratoService:
         self._db = db
         self._empresa_id = empresa_id
 
-    async def importar_ofx(self, conteudo: str, agencia_id: UUID) -> ImportacaoResult:
+    async def importar_ofx(
+        self,
+        conteudo: str,
+        agencia_id: UUID,
+        importacao_id: UUID | None = None,
+    ) -> ImportacaoResult:
         """Parseia OFX, deduplica e persiste as transações novas."""
         await self._get_agencia_or_400(agencia_id)
 
@@ -106,6 +111,7 @@ class ExtratoService:
                     dc=dc,
                     saldo_apos=t.saldo_apos,   # OFX não informa: fica NULL
                     ordem=t.ordem,
+                    importacao_id=importacao_id,
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )
@@ -145,6 +151,7 @@ class ExtratoService:
         self,
         transacoes_raw: list,
         agencia_id: UUID,
+        importacao_id: UUID | None = None,
     ) -> ImportacaoResult:
         """Persiste transações já parseadas (ex.: vindas do PDF parser)."""
         await self._get_agencia_or_400(agencia_id)
@@ -210,6 +217,7 @@ class ExtratoService:
                     dc=dc,
                     saldo_apos=t.saldo_apos,
                     ordem=t.ordem,
+                    importacao_id=importacao_id,
                     hash_dedup=hash_dedup,
                     status="pendente",
                 )

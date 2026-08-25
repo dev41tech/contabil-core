@@ -156,7 +156,8 @@ async def executar_neo(job_id: UUID, empresa_id: UUID, agencia_id: UUID | None,
 
 async def executar_importacao_extrato(job_id: UUID, empresa_id: UUID, agencia_id: UUID,
                                       nome_arquivo: str, conteudo_bytes: bytes,
-                                      runtime: JobRuntime) -> None:
+                                      runtime: JobRuntime,
+                                      criado_por: UUID | None = None) -> None:
     """Importa OFX/PDF no background, preservando o resultado síncrono no job."""
     heartbeat: asyncio.Task | None = None
     try:
@@ -164,7 +165,8 @@ async def executar_importacao_extrato(job_id: UUID, empresa_id: UUID, agencia_id
         heartbeat = asyncio.create_task(_heartbeat(runtime, job_id))
         async with runtime.session_scope() as db:
             resultado = await _importar_extrato(db, empresa_id, agencia_id,
-                                                nome_arquivo, conteudo_bytes)
+                                                nome_arquivo, conteudo_bytes,
+                                                criado_por)
             await _persistir(db, runtime)
         await _concluir(runtime, job_id, resultado,
                         com_alertas=resultado.rejeitadas > 0,
@@ -180,9 +182,23 @@ async def executar_importacao_extrato(job_id: UUID, empresa_id: UUID, agencia_id
 
 
 async def _importar_extrato(db: AsyncSession, empresa_id: UUID, agencia_id: UUID,
-                            nome_arquivo: str, conteudo_bytes: bytes):
+                            nome_arquivo: str, conteudo_bytes: bytes,
+                            criado_por: UUID | None = None):
     """Executa o fluxo legado de importação dentro da sessão do job."""
+    from src.domain.extrato.importacoes import abrir_importacao, registrar_resultado
+
     svc = ExtratoService(db=db, empresa_id=empresa_id)
+    # O lote nasce ANTES do parse: saber que alguém tentou subir um arquivo que
+    # o sistema recusou é informação de suporte, e some se o registro depender
+    # da leitura ter dado certo.
+    importacao = await abrir_importacao(
+        db,
+        empresa_id=empresa_id,
+        agencia_id=agencia_id,
+        nome_arquivo=nome_arquivo,
+        conteudo=conteudo_bytes,
+        criado_por=criado_por,
+    )
     if nome_arquivo.endswith(".pdf"):
         from starlette.concurrency import run_in_threadpool
         from src.core.config import get_settings
@@ -196,13 +212,19 @@ async def _importar_extrato(db: AsyncSession, empresa_id: UUID, agencia_id: UUID
             raise ValidationError(message="Processamento do PDF excedeu o tempo limite.") from None
         except PDFParseError as exc:
             raise ValidationError(message=f"Arquivo PDF inválido: {exc}") from exc
-        return await svc.importar_transacoes_raw(transacoes, agencia_id)
+        resultado = await svc.importar_transacoes_raw(
+            transacoes, agencia_id, importacao_id=importacao.id
+        )
+        await registrar_resultado(db, importacao, resultado)
+        return resultado
 
     try:
         conteudo = conteudo_bytes.decode("utf-8")
     except UnicodeDecodeError:
         conteudo = conteudo_bytes.decode("latin-1")
-    return await svc.importar_ofx(conteudo, agencia_id)
+    resultado = await svc.importar_ofx(conteudo, agencia_id, importacao_id=importacao.id)
+    await registrar_resultado(db, importacao, resultado)
+    return resultado
 
 
 async def recuperar_jobs_sem_heartbeat(runtime: JobRuntime | None = None) -> int:
