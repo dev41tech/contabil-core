@@ -2991,3 +2991,116 @@ async def test_desfeita_ja_reclassificada_nao_oferece_associar(
 
     assert depois["transacao_status"] == "processada"
     assert depois["decisao_atual_id"] is None
+
+
+# ── Prioridade do manual sobre o automático (item 4.3) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rodar_o_neo_nao_desfaz_o_desfazer(
+    client, db, tenant, usuario, empresa
+):
+    """O ponto do item 4.3.
+
+    Antes disto: a regra que classificou continuava ativa, o desfazer devolvia a
+    transação para `pendente`, e a execução seguinte do motor reclassificava do
+    mesmo jeito. O contador desfazia, rodava o NEO, e voltava ao ponto de
+    partida.
+    """
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    # A regra segue ativa — de propósito: ela pode estar certa para outros.
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    transacao = (
+        await db.execute(select(Transacao).where(Transacao.id == UUID(transacao_id)))
+    ).scalar_one()
+    await db.refresh(transacao)
+    assert transacao.status == "pendente", "o motor reclassificou o que um humano recusou"
+    assert transacao.auto_recusado_em is not None
+
+
+@pytest.mark.asyncio
+async def test_classificar_manualmente_resolve_a_recusa(
+    client, db, tenant, usuario, empresa
+):
+    """Decidido por humano: a marca de recusa não faz mais sentido."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    item = (await client.get(_desfeitas_url(empresa.id))).json()["items"][0]
+    assert item["aguardando_decisao_manual"] is True
+
+    outra = PlanoConta(
+        empresa_id=empresa.id, codigo="4.1.3", descricao="Despesas Diversas", tipo="despesa"
+    )
+    db.add(outra)
+    await db.flush()
+    await client.post(
+        _decisoes_url(empresa.id) + f"/{item['decisao_atual_id']}/associar-manual",
+        json={"conta_id": str(outra.id), "descricao": "Decidido a mao"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    transacao = (
+        await db.execute(select(Transacao).where(Transacao.id == UUID(transacao_id)))
+    ).scalar_one()
+    await db.refresh(transacao)
+    assert transacao.status == "processada"
+    assert transacao.auto_recusado_em is None
+
+
+@pytest.mark.asyncio
+async def test_liberar_devolve_a_transacao_ao_motor(
+    client, db, tenant, usuario, empresa
+):
+    """Desfazer por engano não pode condenar a transação a espera eterna."""
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "foi sem querer"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/transacoes/{transacao_id}/liberar-automatico",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 204
+
+    await client.post(_processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf})
+
+    transacao = (
+        await db.execute(select(Transacao).where(Transacao.id == UUID(transacao_id)))
+    ).scalar_one()
+    await db.refresh(transacao)
+    assert transacao.status == "processada", "liberada, a regra deveria voltar a valer"
+
+
+@pytest.mark.asyncio
+async def test_liberar_duas_vezes_devolve_409(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    lancamento_id, transacao_id = await _classificar_uma(client, db, empresa, csrf)
+    await client.post(
+        _cancelar_url(empresa.id, lancamento_id),
+        json={"motivo": "engano"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    url = f"/api/v1/empresas/{empresa.id}/neo/transacoes/{transacao_id}/liberar-automatico"
+
+    primeira = await client.post(url, headers={"X-CSRF-Token": csrf})
+    segunda = await client.post(url, headers={"X-CSRF-Token": csrf})
+
+    assert primeira.status_code == 204
+    assert segunda.status_code == 409

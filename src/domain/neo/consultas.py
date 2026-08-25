@@ -778,6 +778,10 @@ async def listar_desfeitas(
                 # volta na fila. Se ela já foi reclassificada, o botão levaria a
                 # um 409 e o certo é mostrar que o caso já foi resolvido.
                 "transacao_status": transacao.status,
+                # Enquanto marcada, o motor não toca nesta transação. A tela usa
+                # isto para explicar por que ela não volta sozinha e oferecer a
+                # liberação a quem desfez por engano.
+                "aguardando_decisao_manual": transacao.auto_recusado_em is not None,
                 "decisao_atual_id": (
                     decisao_pendente.get(transacao.id)
                     if transacao.status == "pendente"

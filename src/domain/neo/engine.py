@@ -689,6 +689,10 @@ class NeoEngine:
         for transacao in transacoes:
             await self.registrar_partidas_manuais(transacao, conta_id, descricao)
             transacao.status = "processada"
+            # A recusa foi resolvida: um humano decidiu. Manter a marca deixaria
+            # o campo significando "há recusa pendente" quando não há mais.
+            transacao.auto_recusado_em = None
+            transacao.auto_recusado_por = None
             decisoes.append(
                 self._registrar_decisao(
                     transacao,
@@ -1077,6 +1081,11 @@ class NeoEngine:
                 Transacao.status == "pendente",
                 # Transação apagada não volta para a fila de classificação.
                 Transacao.deleted_at.is_(None),
+                # Prioridade do manual: quem teve a classificação automática
+                # recusada por um humano espera decisão humana. Sem isto, a
+                # mesma regra reclassifica na execução seguinte e desfazer vira
+                # gesto vazio.
+                Transacao.auto_recusado_em.is_(None),
             )
             .order_by(Transacao.data.asc(), Transacao.id.asc())
             .with_for_update(skip_locked=True)

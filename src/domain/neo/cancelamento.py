@@ -142,6 +142,11 @@ async def cancelar_lancamento(
         partida.motivo_cancelamento = motivo[:300]
 
     transacao.status = "pendente"
+    # Marca a recusa: a transação volta para a fila, mas para decisão HUMANA.
+    # Sem isto, a mesma regra que classificou reclassificaria na proxima
+    # execução do motor, e desfazer não teria efeito nenhum.
+    transacao.auto_recusado_em = agora
+    transacao.auto_recusado_por = usuario_id
 
     # Documentos são DESVINCULADOS, nunca apagados: o documento não tem nada de
     # errado e precisa ficar livre para a próxima classificação reencontrá-lo.
@@ -218,4 +223,56 @@ async def cancelar_lancamento(
         partidas_canceladas=len(partidas),
         notas_desvinculadas=len(notas),
         comprovantes_desvinculados=len(comprovantes),
+    )
+
+
+async def liberar_para_automatico(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    transacao_id: UUID,
+    usuario_id: UUID | None = None,
+) -> None:
+    """Devolve a transação ao motor, desfazendo a recusa da classificação automática.
+
+    Existe porque desfazer por engano, ou para testar, não pode condenar a
+    transação a esperar decisão manual para sempre. Sem esta porta, a única
+    saída seria classificar à mão algo que a regra já classificava bem.
+
+    Não mexe em regra nenhuma: só remove o bloqueio desta transação.
+    """
+    transacao = (
+        await db.execute(
+            select(Transacao)
+            .where(
+                Transacao.id == transacao_id,
+                Transacao.empresa_id == empresa_id,
+                Transacao.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if transacao is None:
+        raise NotFoundError(message="Transação não encontrada.")
+    if transacao.auto_recusado_em is None:
+        raise ConflictError(
+            message="Esta transação já está liberada para classificação automática."
+        )
+
+    antes = transacao.auto_recusado_em
+    transacao.auto_recusado_em = None
+    transacao.auto_recusado_por = None
+
+    await registrar_auditoria(
+        db,
+        acao="transacao.liberada_para_automatico",
+        entidade="transacao",
+        entidade_id=transacao_id,
+        dados_antes={"auto_recusado_em": str(antes)},
+        dados_depois={"auto_recusado_em": None},
+        empresa_id=empresa_id,
+        usuario_id=usuario_id,
+    )
+    logger.info(
+        "neo.transacao_liberada_para_automatico", transacao_id=str(transacao_id)
     )

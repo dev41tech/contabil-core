@@ -250,6 +250,9 @@ class NeoDesfeitaResponse(BaseModel):
     # porque já foi, ou porque o motor ainda não registrou pendência.
     transacao_status: str | None = None
     decisao_atual_id: UUID | None = None
+    # O motor não reclassifica esta transação enquanto isto for True — é a
+    # prioridade do manual sobre o automático. A tela explica e oferece liberar.
+    aguardando_decisao_manual: bool = False
 
 
 class NeoDesfeitaListResponse(BaseModel):

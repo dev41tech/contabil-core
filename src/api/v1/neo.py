@@ -25,7 +25,7 @@ from src.domain.neo.consultas import (
 from src.domain.neo.engine import NeoEngine
 from src.domain.jobs import JobRuntime, executar_neo
 from src.domain.regras.service import RegraService
-from src.domain.neo.cancelamento import cancelar_lancamento
+from src.domain.neo.cancelamento import cancelar_lancamento, liberar_para_automatico
 from src.schemas.neo import (
     NeoAssociarManualRequest,
     NeoClassificarLoteRequest,
@@ -529,4 +529,28 @@ async def listar_desfeitas_endpoint(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.post(
+    "/transacoes/{transacao_id}/liberar-automatico",
+    status_code=204,
+    dependencies=[Depends(require_csrf)],
+)
+async def liberar_para_automatico_endpoint(
+    empresa_id: UUID,
+    transacao_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Devolve ao motor uma transação cuja classificação automática foi recusada.
+
+    Para quem desfez por engano ou para testar: sem esta porta, a transação
+    esperaria decisão manual para sempre.
+    """
+    await liberar_para_automatico(
+        db,
+        empresa_id=empresa_id,
+        transacao_id=transacao_id,
+        usuario_id=ctx.user_id,
     )
