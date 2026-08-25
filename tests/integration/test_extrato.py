@@ -539,3 +539,107 @@ async def test_mesmo_dia_segue_a_ordem_do_extrato(client, db, tenant, usuario, e
     # O saldo NÃO está em ordem decrescente por acaso — está na ordem do banco.
     saldos = [Decimal(str(i["saldo_apos"])) for i in body["items"]]
     assert saldos == [Decimal("67201.27"), Decimal("60607.65"), Decimal("58443.17")]
+
+
+# ── Lotes de importação ──────────────────────────────────────────────────────
+
+
+def _imp_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/extrato/importacoes"
+
+
+@pytest.mark.asyncio
+async def test_importar_registra_o_lote(client, db, tenant, usuario, empresa):
+    """Cada upload vira um lote com nome do arquivo e o que ele produziu."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+
+    body = (await client.get(_imp_url(empresa.id))).json()
+
+    assert body["total"] == 1
+    lote = body["items"][0]
+    assert lote["nome_arquivo"].endswith(".ofx")
+    assert lote["importadas"] == 2
+    assert lote["transacoes_ativas"] == 2
+    assert lote["cancelada_em"] is None
+
+
+@pytest.mark.asyncio
+async def test_rota_de_importacoes_nao_e_engolida_pela_rota_de_transacao(
+    client, db, tenant, usuario, empresa
+):
+    """`/extrato/{transacao_id}` casaria com "importacoes" e devolveria 422.
+
+    O FastAPI resolve na ordem de registro, então a rota literal precisa vir
+    antes da curinga — este teste trava essa ordem.
+    """
+    await _login(client, tenant, usuario)
+
+    r = await client.get(_imp_url(empresa.id))
+
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelar_lote_remove_as_transacoes_dele(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+    antes = (await _listar(client, empresa))["total"]
+
+    r = await client.post(
+        f"{_imp_url(empresa.id)}/{lote_id}/cancelar",
+        json={"motivo": "arquivo do mes errado"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["transacoes_removidas"] == antes
+    assert (await _listar(client, empresa))["total"] == 0
+
+    lote = (await client.get(_imp_url(empresa.id))).json()["items"][0]
+    assert lote["cancelada_em"] is not None
+    assert lote["transacoes_ativas"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelar_lote_duas_vezes_devolve_409(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+    corpo = {"motivo": "arquivo errado"}
+
+    primeira = await client.post(
+        f"{_imp_url(empresa.id)}/{lote_id}/cancelar", json=corpo,
+        headers={"X-CSRF-Token": csrf},
+    )
+    segunda = await client.post(
+        f"{_imp_url(empresa.id)}/{lote_id}/cancelar", json=corpo,
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert primeira.status_code == 200
+    assert segunda.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_cancelar_lote_exige_motivo(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+
+    r = await client.post(
+        f"{_imp_url(empresa.id)}/{lote_id}/cancelar",
+        json={"motivo": " "},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422

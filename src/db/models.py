@@ -417,6 +417,47 @@ class Contraparte(Base, TimestampMixin):
 # ─────────────────────────────────────────────────────────────── Extrato / Transação
 
 
+class ExtratoImportacao(Base, TimestampMixin):
+    """Um upload de extrato — o lote a que as transações pertencem.
+
+    Sem isto, a transação não sabe de qual arquivo veio, e três coisas ficam
+    impossíveis: remover um extrato específico, desfazer um upload errado, e
+    ordenar com estabilidade lançamentos do mesmo dia vindos de arquivos
+    diferentes (`Transacao.ordem` é posição DENTRO de um arquivo, então duas
+    importações começam do zero e colidem).
+    """
+
+    __tablename__ = "extrato_importacoes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
+    agencia_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agencias_bancarias.id"), nullable=False
+    )
+    nome_arquivo: Mapped[str] = mapped_column(String(255), nullable=False)
+    # SHA-256 do conteúdo. Não impede reimportar — a deduplicação por transação
+    # já cuida disso —, mas responde "este arquivo já subiu?" sem abrir o lote.
+    hash_arquivo: Mapped[str] = mapped_column(String(64), nullable=False)
+    total_no_arquivo: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    importadas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    duplicadas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rejeitadas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    criado_por: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True
+    )
+    cancelada_em: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelada_por: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True
+    )
+    motivo_cancelamento: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+    __table_args__ = (
+        Index("ix_importacao_empresa_criada", "empresa_id", "created_at"),
+    )
+
+
 class Transacao(Base, TimestampMixin):
     __tablename__ = "transacoes"
 
@@ -440,6 +481,11 @@ class Transacao(Base, TimestampMixin):
     # Só a ordem relativa dentro do dia importa. NULL em linhas anteriores a 0027
     # que o backfill não alcançou.
     ordem: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # De qual upload esta transação veio. NULL nas anteriores à migration 0028 —
+    # não há como descobrir depois, então o backfill seria invenção.
+    importacao_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("extrato_importacoes.id"), nullable=True
+    )
     dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_transacao_enum"), nullable=False)
     status: Mapped[str] = mapped_column(
         Enum("pendente", "processada", "erro", name="status_transacao_enum"),

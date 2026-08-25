@@ -96,7 +96,7 @@ async def test_importacao_com_rejeicao_conclui_com_alertas(
         )
     ).json()
 
-    async def importar_com_rejeicao(self, conteudo, agencia_id):
+    async def importar_com_rejeicao(self, conteudo, agencia_id, importacao_id=None):
         return ImportacaoResult(
             agencia_id=agencia_id,
             total_no_arquivo=2,

@@ -15,7 +15,12 @@ from src.db.models import Job
 from src.db.session import get_db
 from src.domain.jobs import JobRuntime, executar_importacao_extrato
 from src.domain.extrato.service import ExtratoService
+from src.domain.extrato.importacoes import cancelar_importacao, listar_importacoes
 from src.schemas.extrato import (
+    CancelarImportacaoRequest,
+    CancelarImportacaoResponse,
+    ImportacaoListResponse,
+    ImportacaoResponse,
     ExtratoPendentesResponse,
     TransacaoFiltro,
     TransacaoResponse,
@@ -70,6 +75,7 @@ async def importar_extrato(
         nome,
         conteudo_bytes,
         runtime,
+        ctx.user_id,
     )
     return job
 
@@ -103,6 +109,63 @@ async def listar_transacoes(
         valor_max=valor_max,
     )
     return await _svc(empresa_id, db).listar(filtro, page=page, page_size=page_size)
+
+
+# NOTA: as rotas de /importacoes precisam vir ANTES de /{transacao_id}. O
+# FastAPI casa na ordem de registro, e depois da rota curinga um GET em
+# /extrato/importacoes tentaria ler "importacoes" como UUID e responderia 422.
+@router.get("/importacoes", response_model=ImportacaoListResponse)
+async def listar_importacoes_endpoint(
+    empresa_id: UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    agencia_id: UUID | None = Query(default=None),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> ImportacaoListResponse:
+    """Uploads de extrato da empresa, do mais recente para o mais antigo."""
+    itens, ativas, total = await listar_importacoes(
+        db, empresa_id=empresa_id, agencia_id=agencia_id, page=page, page_size=page_size
+    )
+    resposta = []
+    for importacao, quantidade in zip(itens, ativas):
+        item = ImportacaoResponse.model_validate(importacao)
+        item.transacoes_ativas = quantidade
+        resposta.append(item)
+    return ImportacaoListResponse(
+        items=resposta, total=total, page=page, page_size=page_size
+    )
+
+
+@router.post(
+    "/importacoes/{importacao_id}/cancelar",
+    response_model=CancelarImportacaoResponse,
+    dependencies=[Depends(require_csrf)],
+)
+async def cancelar_importacao_endpoint(
+    empresa_id: UUID,
+    importacao_id: UUID,
+    body: CancelarImportacaoRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> CancelarImportacaoResponse:
+    """Desfaz um upload inteiro — transações e lançamentos que vieram dele.
+
+    Transação já contabilizada tem o lançamento cancelado ANTES de ser removida:
+    o inverso deixaria partidas órfãs no razão, sem transação para explicá-las.
+    """
+    resultado = await cancelar_importacao(
+        db,
+        empresa_id=empresa_id,
+        importacao_id=importacao_id,
+        motivo=body.motivo,
+        usuario_id=ctx.user_id,
+    )
+    return CancelarImportacaoResponse(
+        importacao_id=resultado.importacao_id,
+        transacoes_removidas=resultado.transacoes_removidas,
+        lancamentos_cancelados=resultado.lancamentos_cancelados,
+    )
 
 
 @router.get("/{transacao_id}", response_model=TransacaoResponse)
