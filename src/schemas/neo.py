@@ -245,6 +245,11 @@ class NeoDesfeitaResponse(BaseModel):
     importacao_id: UUID | None = None
     importacao_arquivo: str | None = None
     lote_cancelado: bool = False
+    # Estado atual da transação e a decisão contra a qual associar. `None` em
+    # `decisao_atual_id` significa que não há o que reclassificar agora — ou
+    # porque já foi, ou porque o motor ainda não registrou pendência.
+    transacao_status: str | None = None
+    decisao_atual_id: UUID | None = None
 
 
 class NeoDesfeitaListResponse(BaseModel):
