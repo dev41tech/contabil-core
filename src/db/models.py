@@ -523,6 +523,17 @@ class RegistroContabil(Base, TimestampMixin):
     tipo_regra: Mapped[str] = mapped_column(String(50), nullable=False)
     valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     data_lancamento: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Marca de cancelamento deliberado. `deleted_at` é o soft delete genérico e
+    # diz que a linha saiu; `cancelado_em` diz que ela saiu porque alguém
+    # desfez o lançamento. Hoje coincidem, mas a fase 03 (estorno aditivo) vai
+    # precisar da distinção: lá a partida original permanece ATIVA e estornada.
+    cancelado_em: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelado_por: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("usuarios.id"), nullable=True
+    )
+    motivo_cancelamento: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
     transacao: Mapped[Transacao | None] = relationship("Transacao")
     conta: Mapped[PlanoConta] = relationship("PlanoConta")

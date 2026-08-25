@@ -16,6 +16,7 @@ from src.db.models import Job, NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.consultas import (
+    listar_desfeitas as _listar_desfeitas,
     agrupar_pendencias as _agrupar_pendencias,
     consultar_divergencias as _consultar_divergencias,
     listar_decisoes as _listar_decisoes,
@@ -34,6 +35,8 @@ from src.schemas.neo import (
     NeoCancelarLancamentoRequest,
     NeoCancelarLancamentoResponse,
     NeoDecisaoListResponse,
+    NeoDesfeitaListResponse,
+    NeoDesfeitaResponse,
     NeoDecisaoResponse,
     NeoDivergenciasResponse,
     NeoPendenciasAgrupadasResponse,
@@ -502,4 +505,28 @@ async def cancelar_lancamento_endpoint(
         partidas_canceladas=resultado.partidas_canceladas,
         notas_desvinculadas=resultado.notas_desvinculadas,
         comprovantes_desvinculados=resultado.comprovantes_desvinculados,
+    )
+
+
+@router.get("/desfeitas", response_model=NeoDesfeitaListResponse)
+async def listar_desfeitas_endpoint(
+    empresa_id: UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoDesfeitaListResponse:
+    """Classificações desfeitas, da mais recente para a mais antiga.
+
+    Uma linha por lançamento, não por partida — o par é a unidade, e listar as
+    duas mostraria o mesmo cancelamento duas vezes.
+    """
+    itens, total = await _listar_desfeitas(
+        db, empresa_id, page=page, page_size=page_size
+    )
+    return NeoDesfeitaListResponse(
+        items=[NeoDesfeitaResponse(**item) for item in itens],
+        total=total,
+        page=page,
+        page_size=page_size,
     )
