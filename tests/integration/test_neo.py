@@ -1700,7 +1700,7 @@ async def test_neo_classifica_sem_regra_via_contraparte(
     lancamento = next(p for p in partidas if p.conta_id == conta_contraparte.id)
     assert lancamento.dc == "C"
     assert lancamento.descricao == "AXEL TECNOLOGIA LTDA"
-    assert lancamento.historico == "RECEBIMENTO REF NF NF-321 - AXEL TECNOLOGIA LTDA"
+    assert lancamento.historico == "REC REF NF NF-321 - AXEL TECNOLOGIA LTDA"
     assert lancamento.historico_extrato == "DEPOSITO AVULSO DESCONHECIDO"  # extrato bruto preservado
 
     decisao = (
@@ -3835,3 +3835,62 @@ async def test_decisao_antiga_nao_aponta_para_o_lancamento_novo(
     assert len(com_lancamento) == 1
     assert com_lancamento[0]["lancamento_historico"] == "ALUGUEL JANEIRO - CONTA CERTA"
     assert com_lancamento[0]["conta_id"] == str(outra_conta.id)
+
+
+@pytest.mark.asyncio
+async def test_decisoes_saem_na_ordem_de_leitura_do_extrato(
+    client, db, tenant, usuario, empresa
+):
+    """A aba de classificadas le como o papel do banco, igual a fila.
+
+    Ordenar por `processado_em` punha em cima o que o motor decidiu por ultimo
+    — e uma execucao inteira compartilha o mesmo instante, entao a data saia
+    embaralhada. Aqui as tres transacoes sao classificadas na ordem INVERSA da
+    data de propriosito: so a ordem por data produz o resultado esperado.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+
+    transacoes = {}
+    for rotulo, dia in (("TERCEIRA", 20), ("PRIMEIRA", 5), ("SEGUNDA", 12)):
+        transacao = Transacao(
+            empresa_id=empresa.id,
+            agencia_id=UUID(agencia_id),
+            data=date(2026, 3, dia),
+            valor=Decimal("10.00"),
+            historico=f"LANCAMENTO {rotulo}",
+            dc="D",
+            hash_dedup=f"hash_ordem_decisao_{rotulo}",
+        )
+        db.add(transacao)
+        await db.flush()
+        transacoes[rotulo] = transacao
+        # Uma chamada por transacao, na ordem inversa da data.
+        await client.post(
+            _pendencias_url(empresa.id, "classificar-lote"),
+            json={
+                "transacao_ids": [str(transacao.id)],
+                "conta_id": conta_id,
+                "descricao": f"CLASSIFICACAO {rotulo}",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+    corpo = (
+        await client.get(
+            f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=associada&page_size=200"
+        )
+    ).json()
+    nossas = [
+        i["transacao_descricao"]
+        for i in corpo["items"]
+        if i["transacao_descricao"] in {
+            "LANCAMENTO PRIMEIRA", "LANCAMENTO SEGUNDA", "LANCAMENTO TERCEIRA"
+        }
+    ]
+
+    assert nossas == [
+        "LANCAMENTO PRIMEIRA",
+        "LANCAMENTO SEGUNDA",
+        "LANCAMENTO TERCEIRA",
+    ]

@@ -11,9 +11,9 @@ from src.domain.neo.engine import gerar_historico_sugerido
     ("dc", "razao_social", "numero_nf", "esperado"),
     [
         ("D", "Axel Tecnologia Ltda", None, "PGTO REF AXEL TECNOLOGIA LTDA"),
-        ("C", "Axel Tecnologia Ltda", None, "RECEBIMENTO REF AXEL TECNOLOGIA LTDA"),
+        ("C", "Axel Tecnologia Ltda", None, "REC REF AXEL TECNOLOGIA LTDA"),
         ("D", "Axel Tecnologia Ltda", "123", "PGTO REF NF 123 - AXEL TECNOLOGIA LTDA"),
-        ("C", "Axel Tecnologia Ltda", "456", "RECEBIMENTO REF NF 456 - AXEL TECNOLOGIA LTDA"),
+        ("C", "Axel Tecnologia Ltda", "456", "REC REF NF 456 - AXEL TECNOLOGIA LTDA"),
     ],
 )
 def test_gerar_historico_sugerido_templates(dc, razao_social, numero_nf, esperado):

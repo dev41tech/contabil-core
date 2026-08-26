@@ -344,13 +344,22 @@ async def listar_decisoes(
     )
     total = (await db.execute(count_q)).scalar_one()
 
+    # Mesma ordem de leitura da tela de Extrato e da fila: data > lote > ordem
+    # no arquivo. Ordenar por `processado_em` punha em cima o que o motor
+    # decidiu por último — e como uma execução inteira compartilha o mesmo
+    # instante, a data saía embaralhada, sem critério visível para quem lê.
+    #
+    # `processado_em` desc fica como último desempate, e só importa entre as
+    # decisões da MESMA transação: a vigente vem antes da histórica.
     rows = (
         (
             await db.execute(
-                q.options(
-                    contains_eager(NeoDecisao.transacao),
-                    contains_eager(NeoDecisao.regra),
-                    contains_eager(NeoDecisao.conta),
+                ordenar_como_o_extrato(
+                    q.options(
+                        contains_eager(NeoDecisao.transacao),
+                        contains_eager(NeoDecisao.regra),
+                        contains_eager(NeoDecisao.conta),
+                    )
                 )
                 .order_by(NeoDecisao.processado_em.desc())
                 .offset((page - 1) * page_size)
