@@ -827,12 +827,24 @@ class NeoEngine:
     async def registrar_partidas_manuais(
         self, transacao: Transacao, conta_id: UUID, descricao: str
     ) -> None:
-        """Cria, atomicamente, a classificação manual e sua contrapartida bancária."""
+        """Cria, atomicamente, a classificação manual e sua contrapartida bancária.
+
+        O texto digitado pelo contador vira o HISTÓRICO do lançamento, não só a
+        descrição. Antes o histórico recebia a linha crua do banco: quem
+        classificava à mão escrevia "PGTO ALUGUEL JANEIRO", via o razão
+        continuar mostrando "PAGAMENTO PIX 09033833000123 PERFORMANCE ENGENHA
+        PIX_DEB", e concluía que o campo não servia para nada. É o mesmo que a
+        regra faz quando `manter_historico` é falso.
+
+        A linha do banco não se perde: `_registrar_partidas` sempre grava
+        `historico_extrato` com o texto original, que é a evidência para
+        auditoria e conciliação.
+        """
         await self._registrar_partidas(
             transacao=transacao,
             conta_id=conta_id,
             descricao=descricao,
-            historico=transacao.historico,
+            historico=descricao,
             dc=transacao.dc,
             tipo_regra="manual",
         )

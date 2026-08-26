@@ -1001,7 +1001,12 @@ async def test_neo_normaliza_historico_e_descricao_preservando_extrato(
     client, db, tenant, usuario, empresa
 ):
     """RegistroContabil.historico/descricao saem em maiúsculas e sem espaços
-    duplicados, mas historico_extrato preserva o texto bruto do banco."""
+    duplicados, mas historico_extrato preserva o texto bruto do banco.
+
+    Na classificação manual os dois campos nascem do MESMO texto — o que o
+    contador digitou —, e é ele que vai para o razão. A linha do banco fica só
+    em `historico_extrato`, que é a evidência.
+    """
     from src.domain.neo.engine import NeoEngine
 
     csrf = await _login(client, tenant, usuario)
@@ -1033,8 +1038,9 @@ async def test_neo_normaliza_historico_e_descricao_preservando_extrato(
     assert len(partidas) == 2
     lancamento = next(p for p in partidas if p.conta_id == UUID(conta_id))
     assert lancamento.descricao == "PGTO REF FORNECEDOR ALFA"
-    assert lancamento.historico == "BOLETO ENERGIA ELETRICA"
-    # A evidência bruta do extrato não é tocada pela normalização.
+    assert lancamento.historico == "PGTO REF FORNECEDOR ALFA"
+    # A evidência bruta do extrato não é tocada pela normalização — nem pelo
+    # texto que o contador escreveu.
     assert lancamento.historico_extrato == "BOLETO ENERGIA ELETRICA"
 
 
@@ -3674,3 +3680,158 @@ async def test_fila_filtra_por_termo_e_valor(client, db, tenant, usuario, empres
         await client.get(f"{_fila_url(empresa.id)}?termo=tarifa&valor_min=100")
     ).json()
     assert [i["historico"] for i in por_valor["items"]] == ["TARIFA ANUAL"]
+
+
+@pytest.mark.asyncio
+async def test_classificacao_manual_usa_o_texto_digitado_como_historico(
+    client, db, tenant, usuario, empresa
+):
+    """O que o contador escreve e o que vai para o razao tem de ser a mesma coisa.
+
+    Antes o historico do lancamento recebia a linha crua do banco: quem
+    classificava a mao escrevia "PGTO ALUGUEL JANEIRO", via o razao continuar
+    mostrando "PAGAMENTO PIX 09033833000123 ...", e concluia que o campo nao
+    servia para nada.
+
+    A linha do banco nao se perde — fica em `historico_extrato`, que e a
+    evidencia para auditoria e conciliacao.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    transacao = await _pendencia(
+        db,
+        empresa,
+        agencia_id,
+        historico="PAGAMENTO PIX 09033833000123 PERFORMANCE ENGENHA PIX_DEB",
+        valor="7714.53",
+        dc="D",
+    )
+
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(transacao.id)],
+            "conta_id": conta_id,
+            "descricao": "PGTO ALUGUEL JANEIRO",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert resposta.status_code == 200
+
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().all()
+    assert len(partidas) == 2
+    assert {p.historico for p in partidas} == {"PGTO ALUGUEL JANEIRO"}
+    assert {p.historico_extrato for p in partidas} == {
+        "PAGAMENTO PIX 09033833000123 PERFORMANCE ENGENHA PIX_DEB"
+    }
+    # E a transacao continua com a linha do banco intacta: ela e evidencia.
+    await db.refresh(transacao)
+    assert transacao.historico == "PAGAMENTO PIX 09033833000123 PERFORMANCE ENGENHA PIX_DEB"
+
+
+@pytest.mark.asyncio
+async def test_decisao_devolve_o_historico_do_lancamento_vigente(
+    client, db, tenant, usuario, empresa
+):
+    """A tela mostra o historico contabil na linha classificada.
+
+    Sem este campo ela so teria a linha crua do banco, e alterar a descricao
+    nao mudaria nada visivel — o contador conclui que o campo nao faz nada.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    transacao = await _pendencia(
+        db, empresa, agencia_id, historico="TED RECEBIDA CLIENTE", valor="900.00", dc="C"
+    )
+    await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(transacao.id)],
+            "conta_id": conta_id,
+            "descricao": "RECEBIMENTO CLIENTE ALFA",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    corpo = (
+        await client.get(
+            f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=associada&page_size=200"
+        )
+    ).json()
+
+    linha = next(
+        item for item in corpo["items"] if item["transacao_id"] == str(transacao.id)
+    )
+    assert linha["lancamento_historico"] == "RECEBIMENTO CLIENTE ALFA"
+    # A linha crua continua disponivel ao lado, sem se confundir com o contabil.
+    assert linha["transacao_descricao"] == "TED RECEBIDA CLIENTE"
+
+
+@pytest.mark.asyncio
+async def test_decisao_antiga_nao_aponta_para_o_lancamento_novo(
+    client, db, tenant, usuario, empresa
+):
+    """Reclassificar deixa a decisao antiga no log — sem lancamento.
+
+    `NeoDecisao` e log: a linha velha continua la, e o lancamento dela foi
+    cancelado. Se ela apontasse para o lancamento vigente, a tela ofereceria
+    "Alterar" numa linha historica e a acao mexeria num lancamento que nao e
+    dela.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    outra_conta = await _criar_conta_generica(db, empresa, codigo="4.9.9")
+    transacao = await _pendencia(
+        db, empresa, agencia_id, historico="PAGAMENTO ALUGUEL", valor="1200.00", dc="D"
+    )
+    await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(transacao.id)],
+            "conta_id": conta_id,
+            "descricao": "ALUGUEL JANEIRO",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    lancamento = (
+        await db.execute(
+            select(RegistroContabil.lancamento_id).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().first()
+
+    # Reclassifica: desfaz e classifica de novo, que e o que o botao Alterar faz.
+    await client.post(
+        _cancelar_url(empresa.id, lancamento),
+        json={"motivo": "conta errada"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(transacao.id)],
+            "conta_id": str(outra_conta.id),
+            "descricao": "ALUGUEL JANEIRO - CONTA CERTA",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    corpo = (
+        await client.get(
+            f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=associada&page_size=200"
+        )
+    ).json()
+    linhas = [i for i in corpo["items"] if i["transacao_id"] == str(transacao.id)]
+
+    assert len(linhas) == 2, "as duas decisoes continuam no log"
+    com_lancamento = [i for i in linhas if i["lancamento_id"]]
+    assert len(com_lancamento) == 1
+    assert com_lancamento[0]["lancamento_historico"] == "ALUGUEL JANEIRO - CONTA CERTA"
+    assert com_lancamento[0]["conta_id"] == str(outra_conta.id)

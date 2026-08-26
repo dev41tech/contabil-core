@@ -55,6 +55,11 @@ class NeoDecisaoResponse(BaseModel):
     # É o que a tela precisa para oferecer "Desfazer" — o índice único parcial
     # garante no máximo um par ativo por transação, então não há ambiguidade.
     lancamento_id: UUID | None = None
+    # Histórico CONTÁBIL do lançamento vigente — o texto que foi para o razão,
+    # que é o que o contador escreveu ao classificar (ou o que a regra
+    # produziu). Diferente de `transacao_descricao`, que é a linha crua do
+    # banco e nunca muda.
+    lancamento_historico: str | None = None
     agencia_id: UUID | None = None
     regra_id: UUID | None
     regra_descricao: str | None = None

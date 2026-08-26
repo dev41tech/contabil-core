@@ -366,23 +366,51 @@ async def listar_decisoes(
     # Só as decisões que viraram partida têm lançamento; as pendentes ficam com
     # None, e a tela usa isso para saber quando oferecer "Desfazer".
     lancamento_por_transacao: dict[UUID, UUID] = {}
+    historico_por_transacao: dict[UUID, str] = {}
+    decisao_atual: dict[UUID, datetime] = {}
     transacao_ids = [r.transacao_id for r in rows]
     if transacao_ids:
         vinculos = (
             await db.execute(
-                select(RegistroContabil.transacao_id, RegistroContabil.lancamento_id)
+                select(
+                    RegistroContabil.transacao_id,
+                    RegistroContabil.lancamento_id,
+                    RegistroContabil.historico,
+                )
                 .where(
                     RegistroContabil.transacao_id.in_(transacao_ids),
                     RegistroContabil.deleted_at.is_(None),
                 )
             )
         ).all()
-        lancamento_por_transacao = {t_id: l_id for t_id, l_id in vinculos}
+        lancamento_por_transacao = {t_id: l_id for t_id, l_id, _ in vinculos}
+        # As duas partidas do par têm o mesmo histórico, então qualquer uma
+        # responde — não é preciso distinguir classificação de contrapartida.
+        historico_por_transacao = {t_id: hist for t_id, _, hist in vinculos}
+
+        # `NeoDecisao` é log: reclassificar deixa a decisão antiga para trás, e
+        # o lançamento dela foi cancelado. Amarrar o lançamento VIGENTE só à
+        # decisão mais recente da transação evita que a linha velha ofereça
+        # "Alterar" — a acão mexeria num lançamento que não é o dela.
+        decisao_atual = dict(
+            (
+                await db.execute(
+                    select(
+                        NeoDecisao.transacao_id,
+                        func.max(NeoDecisao.processado_em),
+                    )
+                    .where(NeoDecisao.transacao_id.in_(transacao_ids))
+                    .group_by(NeoDecisao.transacao_id)
+                )
+            ).all()
+        )
 
     items = []
     for r in rows:
         item = NeoDecisaoResponse.model_validate(r)
-        item.lancamento_id = lancamento_por_transacao.get(r.transacao_id)
+        if decisao_atual.get(r.transacao_id) == r.processado_em:
+            item.lancamento_id = lancamento_por_transacao.get(r.transacao_id)
+            item.lancamento_historico = historico_por_transacao.get(r.transacao_id)
         item.transacao_descricao = r.transacao.historico
         item.transacao_valor = r.transacao.valor
         item.transacao_dc = r.transacao.dc
