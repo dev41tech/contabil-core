@@ -541,6 +541,80 @@ async def test_mesmo_dia_segue_a_ordem_do_extrato(client, db, tenant, usuario, e
     assert saldos == [Decimal("67201.27"), Decimal("60607.65"), Decimal("58443.17")]
 
 
+@pytest.mark.asyncio
+async def test_mesmo_dia_de_dois_arquivos_segue_a_ordem_dos_lotes(
+    client, db, tenant, usuario, empresa
+):
+    """Com dois arquivos no mesmo dia, `ordem` sozinha não resolve.
+
+    `ordem` é a posição da linha DENTRO de um arquivo, então dois uploads que
+    cobrem o mesmo dia começam ambos do zero. Sem o lote no critério, as linhas
+    do segundo arquivo se intercalam com as do primeiro na posição 0, 1, 2… e o
+    desempate cai no `id`, que é UUID aleatório — o extrato aparece embaralhado
+    exatamente quando alguém reimporta o arquivo depois de uma correção.
+
+    A transação sem lote vem primeiro: é anterior à migration 0028, importada
+    antes de existir qualquer lote rastreado.
+    """
+    from datetime import UTC, date, datetime
+    from uuid import UUID
+
+    from src.db.models import ExtratoImportacao
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    lotes = {}
+    for nome, criado_em in (
+        ("primeiro.ofx", datetime(2026, 1, 10, tzinfo=UTC)),
+        ("segundo.ofx", datetime(2026, 1, 20, tzinfo=UTC)),
+    ):
+        lote = ExtratoImportacao(
+            empresa_id=empresa.id,
+            agencia_id=UUID(agencia["id"]),
+            nome_arquivo=nome,
+            hash_arquivo=nome.ljust(64, "0"),
+            created_at=criado_em,
+        )
+        db.add(lote)
+        lotes[nome] = lote
+    await db.flush()
+
+    # Inseridos fora de ordem de propósito, e o legado com `ordem` alta para
+    # que só a regra do lote possa produzir o resultado esperado.
+    for rotulo, lote_id, ordem in (
+        ("SEGUNDO 0", lotes["segundo.ofx"].id, 0),
+        ("LEGADO", None, 9),
+        ("PRIMEIRO 1", lotes["primeiro.ofx"].id, 1),
+        ("SEGUNDO 1", lotes["segundo.ofx"].id, 1),
+        ("PRIMEIRO 0", lotes["primeiro.ofx"].id, 0),
+    ):
+        db.add(
+            Transacao(
+                empresa_id=empresa.id,
+                agencia_id=UUID(agencia["id"]),
+                data=date(2026, 1, 2),
+                valor=Decimal("10.00"),
+                historico=rotulo,
+                dc="D",
+                ordem=ordem,
+                importacao_id=lote_id,
+                hash_dedup=f"hash_lote_{rotulo.replace(' ', '_')}",
+            )
+        )
+    await db.flush()
+
+    body = await _listar(client, empresa)
+
+    assert [i["historico"] for i in body["items"]] == [
+        "LEGADO",
+        "PRIMEIRO 0",
+        "PRIMEIRO 1",
+        "SEGUNDO 0",
+        "SEGUNDO 1",
+    ]
+
+
 # ── Lotes de importação ──────────────────────────────────────────────────────
 
 

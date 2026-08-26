@@ -33,6 +33,21 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from src.db.session import Base
 
 
+# ─────────────────────────────────────────────────────────── Tipos compartilhados
+
+# UM tipo D/C para toda a base, reusando o MESMO objeto — é o que faz o
+# SQLAlchemy emitir um único tipo no PostgreSQL.
+#
+# Antes eram três com os mesmos dois valores (`dc_enum`, `dc_transacao_enum`,
+# `dc_registro_enum`), um por tabela. No PostgreSQL enum é tipo nominal:
+# comparar dois deles é `operator does not exist: dc_registro_enum =
+# dc_transacao_enum`, e a query nem chega a rodar. Em SQLite enum é texto e a
+# mesma comparação passa — foi assim que a suíte deu verde com a aba Desfeitas
+# quebrada em produção. A migration 0031 unificou os três; criar um enum novo
+# por tabela recria a armadilha.
+DC_ENUM = Enum("D", "C", name="dc_enum")
+
+
 # ─────────────────────────────────────────────────────────────── Mixin
 
 
@@ -331,7 +346,7 @@ class Regra(Base, TimestampMixin):
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
     historico_normalizado: Mapped[str] = mapped_column(String(500), nullable=False)
-    dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_enum"), nullable=False)
+    dc: Mapped[str] = mapped_column(DC_ENUM, nullable=False)
     tipo: Mapped[str] = mapped_column(
         Enum("automatica", "manual", name="tipo_regra_enum"), nullable=False
     )
@@ -486,7 +501,7 @@ class Transacao(Base, TimestampMixin):
     importacao_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("extrato_importacoes.id"), nullable=True
     )
-    dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_transacao_enum"), nullable=False)
+    dc: Mapped[str] = mapped_column(DC_ENUM, nullable=False)
     status: Mapped[str] = mapped_column(
         Enum("pendente", "processada", "erro", name="status_transacao_enum"),
         default="pendente",
@@ -529,7 +544,7 @@ class RegistroContabil(Base, TimestampMixin):
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
     historico_extrato: Mapped[str] = mapped_column(String(500), nullable=False)
-    dc: Mapped[str] = mapped_column(Enum("D", "C", name="dc_registro_enum"), nullable=False)
+    dc: Mapped[str] = mapped_column(DC_ENUM, nullable=False)
     tipo_regra: Mapped[str] = mapped_column(String(50), nullable=False)
     valor: Mapped[Decimal] = mapped_column(Numeric(15, 2, asdecimal=True), nullable=False)
     data_lancamento: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

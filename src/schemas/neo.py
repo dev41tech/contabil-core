@@ -32,6 +32,11 @@ class NeoResultado(BaseModel):
     # Classificadas sem regra, só pelo cadastro de contrapartes (itens 1+2 do
     # PDF de feedback dos contadores) — subconjunto de `associadas`.
     classificadas_por_contraparte: int = 0
+    # Barradas antes de qualquer classificação porque o valor gravado não é
+    # confiável — subconjunto de `sem_regra`, não uma quarta categoria: elas
+    # continuam pendentes e voltam a ser tentadas quando o extrato for
+    # corrigido.
+    bloqueadas_valor_suspeito: int = 0
     processado_em: datetime
 
 
@@ -148,10 +153,21 @@ class NeoClassificarLoteRequest(BaseModel):
         return list(dict.fromkeys(ids))
 
 
+class NeoClassificarLoteBloqueio(BaseModel):
+    transacao_id: UUID
+    motivo: str
+
+
 class NeoClassificarLoteResponse(BaseModel):
     classificadas: int
     ignoradas: int
     ids_ignorados: list[UUID]
+    # `ignoradas` é fotografia velha (id sumiu, mudou de empresa, já foi
+    # processado) e não pede ação. `bloqueadas` é o contrário: a linha existe,
+    # está pendente, e foi recusada por um motivo que o contador precisa ler —
+    # por isso vem com texto, e não só com o id.
+    bloqueadas: int = 0
+    bloqueios: list[NeoClassificarLoteBloqueio] = Field(default_factory=list)
 
 
 class NeoSimularRegraRequest(BaseModel):

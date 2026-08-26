@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Transacao
 from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx_detalhado
+from src.domain.extrato.ordenacao import ordenar_como_o_extrato
 from src.domain.extrato.validacao import (
     historico_parece_linha_crua,
     motivo_valor_nao_confiavel,
@@ -280,23 +281,10 @@ class ExtratoService:
 
         rows = (
             await self._db.execute(
-                # Ordem crescente: o extrato é lido como o papel do banco, do mais
-                # antigo para o mais recente, e é assim que o saldo faz sentido
-                # de uma linha para a outra.
-                #
-                # `ordem` é a posição da linha no arquivo — reproduz o extrato
-                # dentro do dia. Nem saldo nem valor servem: em dia só de débitos
-                # o saldo cai, em dia com crédito ele sobe, então nenhuma direção
-                # fixa funciona; e o extrato não é ordenado por valor.
-                #
-                # `id` fecha a ordenação para linhas antigas sem `ordem`, que sem
-                # ele empatariam — e empate torna a paginação instável, repetindo
-                # e pulando registros entre uma página e outra.
-                q.order_by(
-                    Transacao.data.asc(),
-                    Transacao.ordem.asc().nullslast(),
-                    Transacao.id.asc(),
-                )
+                # Ordem de leitura do extrato — a mesma da exportação, definida
+                # em `ordenacao.py`. A contagem acima roda sobre `q` sem o join
+                # do lote de propósito: total não depende de ordem.
+                ordenar_como_o_extrato(q)
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )

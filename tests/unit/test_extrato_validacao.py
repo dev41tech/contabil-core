@@ -13,11 +13,13 @@ from decimal import Decimal
 
 import pytest
 
+from src.db.models import Transacao
 from src.domain.extrato.validacao import (
     historico_parece_linha_crua,
     motivo_valor_nao_confiavel,
     valores_na_linha,
 )
+from src.domain.neo.engine import motivo_para_nao_contabilizar
 
 # Linhas exatamente como estavam no banco de produção.
 _TARIFA = "18/02/2026 TARIFA COM R LIQUIDACAO COB000001 -1,19 -54.881,83"
@@ -87,3 +89,27 @@ def test_linha_crua_e_sinalizada_mesmo_quando_o_valor_confere():
     caminho heurístico e merece conferência."""
     assert historico_parece_linha_crua(_TARIFA) is True
     assert historico_parece_linha_crua(_LIMPA) is False
+
+
+@pytest.mark.parametrize("historico", [_TARIFA, _CONVENIO])
+def test_motor_usa_a_mesma_regua_da_importacao(historico: str):
+    """O NEO não pode ter uma segunda definição de "valor confiável".
+
+    Se as duas divergirem, a fila barra um conjunto e a importação recusa
+    outro — e a transação que escapar das duas entra no razão com valor
+    errado. A mensagem do motor acrescenta o que fazer, porque quem a lê está
+    na tela de classificação, não na de importação.
+    """
+    valor = valores_na_linha(historico)[-1]
+    transacao = Transacao(historico=historico, valor=valor, dc="C")
+
+    assert motivo_valor_nao_confiavel(historico, valor) is not None
+    motivo = motivo_para_nao_contabilizar(transacao)
+    assert motivo is not None
+    assert "saldo" in motivo
+    assert "Corrija a importação" in motivo
+
+
+def test_transacao_com_valor_confiavel_passa_pelo_motor():
+    transacao = Transacao(historico=_LIMPA, valor=Decimal("1.19"), dc="D")
+    assert motivo_para_nao_contabilizar(transacao) is None

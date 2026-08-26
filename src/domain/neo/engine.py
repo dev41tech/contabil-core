@@ -38,6 +38,16 @@ Ao não encontrar match nem contraparte:
   - Salva NeoDecisao com resultado "sem_regra".
   - Transação permanece "pendente".
 
+Valor não confiável (quarentena):
+  Antes de qualquer classificação, o motor aplica em cada transação a MESMA
+  régua da importação (`src.domain.extrato.validacao`). Transação cujo valor
+  gravado é o saldo da linha — ou não é nenhum número dela — não vira partida
+  por regra, por contraparte nem à mão: fica `sem_regra` com
+  `estrategia="valor_suspeito"` e o motivo em texto de contador. A barreira da
+  importação só protege o que entra a partir de 21/08/2026; as transações que
+  entraram antes já estão no banco, e classificá-las levaria o valor errado
+  para o razão em silêncio.
+
 Idempotência:
   - Transações com status != "pendente" são ignoradas.
   - Re-executar o NEO na mesma empresa é seguro.
@@ -65,6 +75,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.dates import bounds_do_mes_data
 from src.core.texto import normalizar_historico_contabil, normalizar_para_match
+from src.domain.extrato.validacao import motivo_valor_nao_confiavel
 from src.domain.neo.contraparte_por_nome import (
     CandidataPorNome,
     casar_por_nome,
@@ -92,6 +103,13 @@ _DATA_TOLERANCIA_COMP = 3             # dias de tolerância para comprovantes
 _DATA_TOLERANCIA_NF = 7              # dias de tolerância para notas fiscais
 
 _ESTRATEGIAS_MATCH = ("exato", "substring", "todas_palavras")
+
+# Marca da decisão de quarentena. É `estrategia`, e não um `resultado` novo,
+# de propósito: `resultado` é enum no Postgres e ganhar um valor exigiria
+# `ALTER TYPE` numa migration — a transação bloqueada é, de fato, uma
+# pendência que o motor não classificou, que é exatamente o que `sem_regra`
+# significa. O discriminador fino fica no campo de texto, que a fila já filtra.
+ESTRATEGIA_VALOR_SUSPEITO = "valor_suspeito"
 _ERROS_DE_PROGRAMACAO = (AttributeError, TypeError, NameError, ImportError, KeyError)
 
 
@@ -159,6 +177,45 @@ def gerar_historico_sugerido(dc: str, razao_social: str, numero_nf: str | None) 
     return normalizar_historico_contabil(texto)
 
 
+@dataclass(frozen=True)
+class BloqueioManual:
+    """Transação que a classificação manual recusou, com o motivo em texto de
+    contador — a tela mostra isso ao lado da linha."""
+
+    transacao_id: UUID
+    motivo: str
+
+
+@dataclass(frozen=True)
+class ClassificacaoManual:
+    """O que o lote manual contabilizou e o que ele recusou.
+
+    `decisoes` e `classificadas` andam em paralelo (mesma ordem, mesmo
+    tamanho) porque quem chama precisa dos dois lados para a auditoria.
+    """
+
+    decisoes: list[NeoDecisao]
+    classificadas: list[Transacao]
+    bloqueadas: list[BloqueioManual]
+
+
+def motivo_para_nao_contabilizar(transacao: Transacao) -> str | None:
+    """Por que esta transação não pode virar lançamento — ou `None` se pode.
+
+    Reusa a régua da importação em vez de reimplementá-la: duas definições de
+    "valor confiável" fariam a fila barrar um conjunto e a importação recusar
+    outro. Vale para o motor e para a classificação manual, porque o valor
+    errado contamina o razão do mesmo jeito nos dois caminhos.
+    """
+    motivo = motivo_valor_nao_confiavel(transacao.historico or "", transacao.valor)
+    if motivo is None:
+        return None
+    return (
+        f"Valor não confiável: {motivo}. Corrija a importação deste extrato "
+        f"antes de classificar."
+    )
+
+
 class NeoEngine:
     def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
         self._db = db
@@ -199,28 +256,33 @@ class NeoEngine:
         associadas = sem_regra = erros = 0
         comprovantes_associados = notas_associadas = 0
         classificadas_por_contraparte = 0
+        bloqueadas_valor_suspeito = 0
 
         for indice, transacao in enumerate(pendentes, start=1):
             try:
                 teve_match = associou_comprovante = associou_nota = False
                 associou_por_contraparte = False
+                bloqueio_valor = motivo_para_nao_contabilizar(transacao)
                 async with self._db.begin_nested():
-                    regra, estrategia = self._encontrar_regra(transacao, regras)
-                    if regra:
-                        associou_comprovante, associou_nota = await self._registrar_match(
-                            transacao, regra, estrategia
-                        )
-                        teve_match = True
+                    if bloqueio_valor is not None:
+                        self._registrar_valor_suspeito(transacao, bloqueio_valor)
                     else:
-                        resultado_contraparte = await self._tentar_classificar_por_contraparte(
-                            transacao
-                        )
-                        if resultado_contraparte is not None:
-                            associou_comprovante, associou_nota = resultado_contraparte
+                        regra, estrategia = self._encontrar_regra(transacao, regras)
+                        if regra:
+                            associou_comprovante, associou_nota = await self._registrar_match(
+                                transacao, regra, estrategia
+                            )
                             teve_match = True
-                            associou_por_contraparte = True
-                        elif transacao.id not in self._decisoes_sem_regra:
-                            await self._registrar_sem_regra(transacao)
+                        else:
+                            resultado_contraparte = await self._tentar_classificar_por_contraparte(
+                                transacao
+                            )
+                            if resultado_contraparte is not None:
+                                associou_comprovante, associou_nota = resultado_contraparte
+                                teve_match = True
+                                associou_por_contraparte = True
+                            elif transacao.id not in self._decisoes_sem_regra:
+                                await self._registrar_sem_regra(transacao)
                     await self._db.flush()
                 if teve_match:
                     associadas += 1
@@ -229,7 +291,12 @@ class NeoEngine:
                     if associou_por_contraparte:
                         classificadas_por_contraparte += 1
                 else:
+                    # Bloqueada continua contando como `sem_regra` para o total
+                    # bater com `total_pendentes`; `bloqueadas_valor_suspeito` é
+                    # o subconjunto que o contador precisa ver separado.
                     sem_regra += 1
+                    if bloqueio_valor is not None:
+                        bloqueadas_valor_suspeito += 1
             except Exception as exc:
                 # Estes tipos apontam para contrato quebrado no próprio código, não
                 # para uma transação ruim. Convertê-los em decisão `erro` esconderia
@@ -261,6 +328,7 @@ class NeoEngine:
             comprovantes_associados=comprovantes_associados,
             notas_associadas=notas_associadas,
             classificadas_por_contraparte=classificadas_por_contraparte,
+            bloqueadas_valor_suspeito=bloqueadas_valor_suspeito,
         )
 
         return NeoResultado(
@@ -272,6 +340,7 @@ class NeoEngine:
             comprovantes_associados=comprovantes_associados,
             notas_associadas=notas_associadas,
             classificadas_por_contraparte=classificadas_por_contraparte,
+            bloqueadas_valor_suspeito=bloqueadas_valor_suspeito,
             processado_em=datetime.now(UTC),
         )
 
@@ -677,22 +746,38 @@ class NeoEngine:
 
     async def classificar_manualmente_lote(
         self, transacoes: list[Transacao], conta_id: UUID, descricao: str
-    ) -> list[NeoDecisao]:
+    ) -> ClassificacaoManual:
         """Classifica transações já travadas e encerra suas decisões abertas.
 
         O chamador seleciona e trava apenas pendências da empresa. Concentrar
         aqui partidas, status e decisão garante que os endpoints individual e
         em lote não possam deixar uma decisão `sem_regra` órfã.
+
+        Transação com valor não confiável é recusada uma a uma, e não derruba
+        o lote inteiro: quem selecionou dezesseis linhas na tela contabiliza as
+        quinze boas e recebe, nomeada, a que precisa de conserto na
+        importação. Recusar tudo por causa de uma faria o contador desistir da
+        barreira, que é o oposto do que ela existe para conseguir.
         """
         self._decisoes_sem_regra = await self._carregar_decisoes_sem_regra(transacoes)
         decisoes: list[NeoDecisao] = []
+        classificadas: list[Transacao] = []
+        bloqueadas: list[BloqueioManual] = []
         for transacao in transacoes:
+            motivo_bloqueio = motivo_para_nao_contabilizar(transacao)
+            if motivo_bloqueio is not None:
+                self._registrar_valor_suspeito(transacao, motivo_bloqueio)
+                bloqueadas.append(
+                    BloqueioManual(transacao_id=transacao.id, motivo=motivo_bloqueio)
+                )
+                continue
             await self.registrar_partidas_manuais(transacao, conta_id, descricao)
             transacao.status = "processada"
             # A recusa foi resolvida: um humano decidiu. Manter a marca deixaria
             # o campo significando "há recusa pendente" quando não há mais.
             transacao.auto_recusado_em = None
             transacao.auto_recusado_por = None
+            classificadas.append(transacao)
             decisoes.append(
                 self._registrar_decisao(
                     transacao,
@@ -703,7 +788,9 @@ class NeoEngine:
                     motivo=f"Associação manual: {descricao}",
                 )
             )
-        return decisoes
+        return ClassificacaoManual(
+            decisoes=decisoes, classificadas=classificadas, bloqueadas=bloqueadas
+        )
 
     async def _registrar_partidas(
         self,
@@ -872,6 +959,31 @@ class NeoEngine:
         # (no `_registrar_erro`) escreveria num objeto que o rollback já
         # descartou — o registro de erro simplesmente sumiria.
         return decisao
+
+    def _registrar_valor_suspeito(self, transacao: Transacao, motivo: str) -> None:
+        """Deixa a transação pendente e explica na fila por que ela não foi
+        classificada.
+
+        Chama `_registrar_decisao` direto (e não passa pela guarda de
+        `_decisoes_sem_regra` que o laço usa) porque uma decisão `sem_regra`
+        antiga trazia o motivo genérico "Nenhuma regra encontrada": mantê-lo
+        esconderia justamente o aviso, e a transação pareceria só mais uma
+        pendência comum na tela.
+        """
+        self._registrar_decisao(
+            transacao,
+            resultado="sem_regra",
+            regra_id=None,
+            conta_id=None,
+            estrategia=ESTRATEGIA_VALOR_SUSPEITO,
+            motivo=motivo[:500],
+        )
+        logger.warning(
+            "neo.bloqueada_valor_suspeito",
+            transacao_id=str(transacao.id),
+            valor=str(transacao.valor),
+            historico=(transacao.historico or "")[:200],
+        )
 
     async def _registrar_sem_regra(self, transacao: Transacao) -> None:
         self._registrar_decisao(
