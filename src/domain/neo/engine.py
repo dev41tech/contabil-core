@@ -23,10 +23,12 @@ Ao encontrar match:
 
 Classificação por contraparte (itens 1+2 do PDF de feedback dos contadores):
   Quando NENHUMA regra casa, antes de desistir o motor tenta achar a
-  contraparte (fornecedor/cliente cadastrado) por duas vias, nesta ordem:
-  primeiro o CNPJ/CPF do comprovante ou nota fiscal candidato; depois, se isso
-  não resolver, o NOME da contraparte dentro do histórico do extrato. Nome é
-  evidência mais fraca que documento e recusa em qualquer ambiguidade — ver
+  contraparte (fornecedor/cliente cadastrado) por três vias, nesta ordem:
+  primeiro o CNPJ/CPF do comprovante ou nota fiscal candidato; depois o
+  CNPJ/CPF que o próprio banco imprimiu no histórico
+  (`documento_no_historico.py`); e por último o NOME da contraparte dentro do
+  histórico. Nome é evidência mais fraca que documento — banco trunca nome, não
+  trunca CNPJ — e recusa em qualquer ambiguidade, ver
   `contraparte_por_nome.py`. Se achar, classifica exatamente como um
   match de regra faria — conta da contraparte, histórico no formato "PGTO/
   RECEBIMENTO REF [NF ...] RAZÃO SOCIAL" — com `estrategia="contraparte"` e
@@ -76,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.dates import bounds_do_mes_data
 from src.core.texto import normalizar_historico_contabil, normalizar_para_match
 from src.domain.extrato.validacao import motivo_valor_nao_confiavel
+from src.domain.neo.documento_no_historico import documentos_no_historico
 from src.domain.neo.contraparte_por_nome import (
     CandidataPorNome,
     casar_por_nome,
@@ -157,7 +160,7 @@ class ResolucaoSombra:
 
     contraparte_id: UUID
     documento: str
-    origem_evidencia: str  # "nota_fiscal" | "comprovante" | "nome"
+    origem_evidencia: str  # "nota_fiscal" | "comprovante" | "historico" | "nome"
     conta_contraparte_id: UUID
     conta_divergente: bool
     historico_sugerido: str
@@ -226,6 +229,10 @@ class NeoEngine:
         self._regras_normalizadas: dict[UUID, str] = {}
         self._decisoes_sem_regra: dict[UUID, NeoDecisao] = {}
         self._empresa_cnpj: str | None = None
+        # Quase-acerto recusado por ambiguidade, por transação. Vira texto na
+        # decisão `sem_regra`: sem isso a transação parece ignorada pelo motor,
+        # e o contador não tem como saber que faltou desempatar um cadastro.
+        self._recusas_por_ambiguidade: dict[UUID, str] = {}
 
     async def processar(
         self,
@@ -247,6 +254,7 @@ class NeoEngine:
         self._decisoes_sem_regra = await self._carregar_decisoes_sem_regra(pendentes)
         self._comprovantes_consumidos.clear()
         self._notas_consumidas.clear()
+        self._recusas_por_ambiguidade.clear()
         self._empresa_cnpj = (
             await self._db.execute(
                 select(Empresa.cnpj).where(Empresa.id == self._empresa_id)
@@ -281,8 +289,21 @@ class NeoEngine:
                                 associou_comprovante, associou_nota = resultado_contraparte
                                 teve_match = True
                                 associou_por_contraparte = True
-                            elif transacao.id not in self._decisoes_sem_regra:
-                                await self._registrar_sem_regra(transacao)
+                            else:
+                                motivo_recusa = self._recusas_por_ambiguidade.get(
+                                    transacao.id
+                                )
+                                # Sem motivo novo, reescrever a decisão aberta a
+                                # cada execução seria churn puro. Com motivo, a
+                                # linha PRECISA ser atualizada: é o único lugar
+                                # onde o contador vê o que faltou.
+                                if (
+                                    motivo_recusa is not None
+                                    or transacao.id not in self._decisoes_sem_regra
+                                ):
+                                    await self._registrar_sem_regra(
+                                        transacao, motivo_recusa
+                                    )
                     await self._db.flush()
                 if teve_match:
                     associadas += 1
@@ -656,6 +677,17 @@ class NeoEngine:
                     origem_evidencia=origem_evidencia,
                 )
 
+        # Nada de anexo: o CNPJ/CPF que o banco imprimiu na linha.
+        #
+        # `numero_nf` NÃO viaja junto daqui. Se uma nota candidata existisse e
+        # fosse desta contraparte, o bloco acima já teria retornado por ela; ter
+        # chegado até aqui com `numero_nf` preenchido significa que a nota é de
+        # OUTRO CNPJ, e carimbar o número dela no histórico gerado apontaria o
+        # lançamento para uma nota que não é dele.
+        por_documento_na_linha = await self._buscar_contraparte_no_historico(transacao)
+        if por_documento_na_linha is not None:
+            return por_documento_na_linha, "historico", None
+
         # Sem evidência documental, tenta o nome no histórico do extrato.
         #
         # Nome é evidência MAIS FRACA que documento: o CNPJ bate ou não bate,
@@ -667,6 +699,65 @@ class NeoEngine:
         if por_nome is not None:
             return por_nome, "nome", numero_nf
         return None
+
+    async def _buscar_contraparte_no_historico(
+        self, transacao: Transacao
+    ) -> Contraparte | None:
+        """Casa CPF/CNPJ escrito na linha do extrato com o cadastro.
+
+        Documento é identidade, então isto vem antes do nome. As guardas:
+
+        - só sequência de 11 ou 14 dígitos em corrida máxima
+          (`documento_no_historico.py`) — o resto do lixo numérico da linha não
+          é candidato;
+        - o CNPJ da própria empresa é descartado: ele aparece em transferência
+          entre contas próprias e classificaria a empresa como fornecedora dela
+          mesma;
+        - só casa contra contraparte JÁ cadastrada, ativa e com conta;
+        - dois documentos na mesma linha apontando para contrapartes
+          diferentes recusa e explica. Acontece de verdade — "LIQUIDACAO BOLETO
+          SICREDI <cnpj do banco> ... <cnpj do cedente>" — e escolher um dos
+          dois seria adivinhar qual.
+        """
+        documentos = documentos_no_historico(transacao.historico)
+        if not documentos:
+            return None
+
+        proprio = self._somente_digitos(self._empresa_cnpj)
+        achadas: dict[UUID, Contraparte] = {}
+        for documento in documentos:
+            if proprio and documento == proprio:
+                continue
+            contraparte = await self._buscar_contraparte_por_documento(documento)
+            if contraparte is not None:
+                achadas[contraparte.id] = contraparte
+
+        if not achadas:
+            return None
+
+        if len(achadas) > 1:
+            nomes = ", ".join(sorted(c.razao_social for c in achadas.values())[:3])
+            motivo = (
+                f"O histórico traz documentos de mais de uma contraparte "
+                f"cadastrada ({nomes}). Classifique manualmente."
+            )
+            self._recusas_por_ambiguidade[transacao.id] = motivo
+            logger.info(
+                "neo.contraparte_por_documento_ambigua",
+                transacao_id=str(transacao.id),
+                documentos=documentos,
+                motivo=motivo,
+            )
+            return None
+
+        contraparte = next(iter(achadas.values()))
+        logger.info(
+            "neo.contraparte_por_documento_no_historico",
+            transacao_id=str(transacao.id),
+            contraparte_id=str(contraparte.id),
+            documento=contraparte.documento,
+        )
+        return contraparte
 
     async def _buscar_contraparte_por_nome(
         self, transacao: Transacao
@@ -704,7 +795,9 @@ class NeoEngine:
         if achada is None:
             if motivo_conflito:
                 # Quase-acerto recusado precisa virar texto na fila, senão a
-                # transação parece simplesmente ignorada pelo motor.
+                # transação parece simplesmente ignorada pelo motor. Só logar
+                # deixava o aviso onde o contador não olha.
+                self._recusas_por_ambiguidade[transacao.id] = motivo_conflito
                 logger.info(
                     "neo.contraparte_por_nome_ambigua",
                     transacao_id=str(transacao.id),
@@ -985,14 +1078,21 @@ class NeoEngine:
             historico=(transacao.historico or "")[:200],
         )
 
-    async def _registrar_sem_regra(self, transacao: Transacao) -> None:
+    async def _registrar_sem_regra(
+        self, transacao: Transacao, motivo_recusa: str | None = None
+    ) -> None:
+        motivo = (
+            f"Nenhuma regra encontrada para '{transacao.historico}' (dc={transacao.dc})"
+        )
+        if motivo_recusa:
+            motivo = f"{motivo}. {motivo_recusa}"
         self._registrar_decisao(
             transacao,
             resultado="sem_regra",
             regra_id=None,
             conta_id=None,
             estrategia=None,
-            motivo=f"Nenhuma regra encontrada para '{transacao.historico}' (dc={transacao.dc})",
+            motivo=motivo[:500],
         )
 
     async def _registrar_erro(self, transacao: Transacao, erro: str) -> None:

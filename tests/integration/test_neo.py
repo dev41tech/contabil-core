@@ -3317,3 +3317,197 @@ async def test_associar_manual_recusa_transacao_com_valor_suspeito(
             )
         )
     ).scalars().all() == []
+
+
+# ── Contraparte pelo CNPJ que o banco imprimiu na linha
+
+
+@pytest.mark.asyncio
+async def test_classifica_pelo_cnpj_no_historico_quando_o_nome_vem_truncado(
+    client, db, tenant, usuario, empresa
+):
+    """O teste do contador em 26/08: cadastro certo, CNPJ na linha, e pendente.
+
+    O nome não casava porque o banco escreve "PERFORMANCE ENGENHA" e o cadastro
+    diz "PERFORMANCE ENGENHARIA LTDA." — truncar nome é o normal do extrato.
+    O CNPJ na mesma linha não trunca, e é ele que resolve.
+    """
+    from src.db.models import Contraparte
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "SICREDI", "agencia": "0021", "numero": "21111"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = PlanoConta(
+        empresa_id=empresa.id, codigo="2.1.3.01.0040", descricao="PERFORMANCE ENGENHARIA", tipo="passivo"
+    )
+    db.add(conta)
+    await db.flush()
+    db.add(
+        Contraparte(
+            empresa_id=empresa.id,
+            tipo="fornecedor",
+            documento="09033833000123",
+            razao_social="PERFORMANCE ENGENHARIA LTDA.",
+            nome_fantasia="PERFORMANCE ENGENHARIA",
+            conta_contabil_id=conta.id,
+            ativa=True,
+        )
+    )
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia["id"]),
+        data=date(2026, 1, 16),
+        valor=Decimal("7714.53"),
+        historico="PAGAMENTO PIX 09033833000123 PERFORMANCE ENGENHA PIX_DEB",
+        dc="D",
+        hash_dedup="hash_cnpj_historico_performance",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    await db.refresh(transacao)
+
+    assert transacao.status == "processada"
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalars().first()
+    assert (decisao.estrategia, decisao.conta_id) == ("contraparte", conta.id)
+    partidas = (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().all()
+    assert len(partidas) == 2
+    classificacao = next(p for p in partidas if p.conta_id == conta.id)
+    assert classificacao.historico == "PGTO REF PERFORMANCE ENGENHARIA LTDA."
+
+
+@pytest.mark.asyncio
+async def test_dois_cnpjs_cadastrados_na_mesma_linha_deixam_pendente_com_motivo(
+    client, db, tenant, usuario, empresa
+):
+    """Boleto Sicredi traz o CNPJ do banco E o do cedente na mesma linha.
+
+    Se os dois estiverem cadastrados, escolher um é adivinhar. Fica pendente —
+    e o motivo tem de aparecer na fila, senão a transação parece só ignorada.
+    """
+    from src.db.models import Contraparte
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "SICREDI", "agencia": "0022", "numero": "22222"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = await _criar_conta_generica(db, empresa, codigo="4.9.7")
+    for documento, razao in (
+        ("07070495000174", "SICREDI"),
+        ("31052957000105", "041 CONTABILIDADE LTDA"),
+    ):
+        db.add(
+            Contraparte(
+                empresa_id=empresa.id,
+                tipo="fornecedor",
+                documento=documento,
+                razao_social=razao,
+                conta_contabil_id=conta.id,
+                ativa=True,
+            )
+        )
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia["id"]),
+        data=date(2026, 1, 12),
+        valor=Decimal("14891.18"),
+        historico="LIQUIDACAO BOLETO SICREDI 07070495000174 CED 31052957000105",
+        dc="D",
+        hash_dedup="hash_cnpj_historico_ambiguo",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    await db.refresh(transacao)
+
+    assert transacao.status == "pendente"
+    assert (
+        await db.execute(
+            select(RegistroContabil).where(
+                RegistroContabil.transacao_id == transacao.id
+            )
+        )
+    ).scalars().all() == []
+    decisao = (
+        await db.execute(
+            select(NeoDecisao).where(NeoDecisao.transacao_id == transacao.id)
+        )
+    ).scalar_one()
+    assert decisao.resultado == "sem_regra"
+    assert "mais de uma contraparte" in decisao.motivo.lower()
+    assert "041 CONTABILIDADE LTDA" in decisao.motivo
+
+
+@pytest.mark.asyncio
+async def test_cnpj_da_propria_empresa_no_historico_e_ignorado(
+    client, db, tenant, usuario, empresa
+):
+    """Transferência entre contas próprias traz o CNPJ da empresa na linha.
+
+    Sem esta guarda, bastaria alguém cadastrar a própria empresa como
+    contraparte para ela virar fornecedora de si mesma.
+    """
+    from src.db.models import Contraparte
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = (
+        await client.post(
+            f"/api/v1/empresas/{empresa.id}/agencias",
+            json={"banco_sigla": "SICREDI", "agencia": "0023", "numero": "23333"},
+            headers={"X-CSRF-Token": csrf},
+        )
+    ).json()
+    conta = await _criar_conta_generica(db, empresa, codigo="4.9.8")
+    db.add(
+        Contraparte(
+            empresa_id=empresa.id,
+            tipo="ambos",
+            documento="".join(c for c in empresa.cnpj if c.isdigit()),
+            razao_social="A PROPRIA EMPRESA",
+            conta_contabil_id=conta.id,
+            ativa=True,
+        )
+    )
+    transacao = Transacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia["id"]),
+        data=date(2026, 1, 20),
+        valor=Decimal("500.00"),
+        historico=f"TRANSF ENTRE CONTAS {''.join(c for c in empresa.cnpj if c.isdigit())}",
+        dc="D",
+        hash_dedup="hash_cnpj_proprio",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    await client.post(
+        _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+    )
+    await db.refresh(transacao)
+
+    assert transacao.status == "pendente"
