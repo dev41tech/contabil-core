@@ -31,7 +31,7 @@ Classificação por contraparte (itens 1+2 do PDF de feedback dos contadores):
   trunca CNPJ — e recusa em qualquer ambiguidade, ver
   `contraparte_por_nome.py`. Se achar, classifica exatamente como um
   match de regra faria — conta da contraparte, histórico no formato "PGTO/
-  RECEBIMENTO REF [NF ...] RAZÃO SOCIAL" — com `estrategia="contraparte"` e
+  REC REF [NF ...] RAZÃO SOCIAL" — com `estrategia="contraparte"` e
   `regra_id=None`. Isso NUNCA disputa com uma regra já existente: só entra em
   jogo quando a regra não classificou nada, então não pode regredir nenhuma
   classificação que já funcionava.
@@ -168,9 +168,14 @@ class ResolucaoSombra:
 
 def gerar_historico_sugerido(dc: str, razao_social: str, numero_nf: str | None) -> str:
     """Histórico no formato pedido pelos contadores (item 2 do PDF de
-    feedback): 'PGTO/RECEBIMENTO REF [NF XXX –] RAZÃO SOCIAL'.
+    feedback): 'PGTO/REC REF [NF XXX –] RAZÃO SOCIAL'.
+
+    Débito é pagamento, crédito é recebimento. Os dois prefixos são curtos de
+    propósito: o histórico contábil aparece em coluna de tela e de relatório, e
+    "RECEBIMENTO" sozinho comia o espaço da razão social, que é a informação
+    que identifica o lançamento.
     """
-    prefixo = "PGTO" if dc == "D" else "RECEBIMENTO"
+    prefixo = "PGTO" if dc == "D" else "REC"
     numero_nf = (numero_nf or "").strip()
     texto = (
         f"{prefixo} REF NF {numero_nf} - {razao_social}"
