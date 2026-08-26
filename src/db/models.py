@@ -108,6 +108,7 @@ class Usuario(Base, TimestampMixin):
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "email", name="uq_usuario_tenant_email"),
+        Index("ix_usuario_email", "email"),
     )
 
 
@@ -131,9 +132,18 @@ class RefreshToken(Base):
         nullable=False,
     )
 
+    # Existe na tabela desde 0001 e nunca foi usada: o token é descartável,
+    # revogação é o campo `revogado`. Declarada para o model dizer a verdade
+    # sobre o schema — sem isso, autogenerate propõe DROP COLUMN.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     usuario: Mapped[Usuario] = relationship("Usuario", back_populates="refresh_tokens")
 
-    __table_args__ = (Index("ix_refresh_tokens_jti", "jti"),)
+    # Nome no singular porque é o que 0001 criou. Divergir do banco aqui fazia
+    # autogenerate propor dropar o índice real e criar um igual com outro nome.
+    __table_args__ = (Index("ix_refresh_token_jti", "jti"),)
 
 
 # ─────────────────────────────────────────────────────────────── Empresa (Parceiro)
@@ -198,6 +208,15 @@ class PlanoConta(Base, TimestampMixin):
     descricao: Mapped[str] = mapped_column(String(300), nullable=False)
     tipo: Mapped[str] = mapped_column(String(50), nullable=False)
     tipo_sa: Mapped[str] = mapped_column(String(1), nullable=False, default="A")
+    # Herança de 0001, hoje sem nenhum leitor no código: quem responde "aceita
+    # lançamento?" é `tipo_sa` ('A' analítica aceita, 'S' sintética não).
+    # Continua NOT NULL no banco com default true, então segue sendo preenchida
+    # sozinha. Declarada aqui para o model não mentir sobre o schema — derrubar
+    # a coluna é decisão separada, e exige olhar se alguém já gravou `false`
+    # por SQL antes de perder essa informação.
+    aceita_lancamentos: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
     pai_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("plano_contas.id"), nullable=True)
 
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="contas")
@@ -324,6 +343,8 @@ class AplicacaoFinanceira(Base, TimestampMixin):
 
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="aplicacoes_financeiras")
     agencia: Mapped[AgenciaBancaria | None] = relationship("AgenciaBancaria")
+
+    __table_args__ = (Index("ix_aplicacao_financeira_empresa", "empresa_id"),)
 
     @property
     def rendimento(self) -> Decimal | None:
@@ -522,6 +543,17 @@ class Transacao(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("empresa_id", "hash_dedup", name="uq_transacao_empresa_hash"),
         Index("ix_transacao_empresa_status", "empresa_id", "status"),
+        # Ordem de leitura do extrato (`extrato/ordenacao.py`).
+        Index("ix_transacao_empresa_data_ordem", "empresa_id", "data", "ordem"),
+        # Lote: listar e cancelar uma importação inteira.
+        Index("ix_transacao_importacao", "importacao_id"),
+        # Fila do motor: (empresa, status) + a marca de recusa manual.
+        Index(
+            "ix_transacao_empresa_status_auto",
+            "empresa_id",
+            "status",
+            "auto_recusado_em",
+        ),
     )
 
 
@@ -567,6 +599,8 @@ class RegistroContabil(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_registro_empresa_data", "empresa_id", "data_lancamento"),
         Index("ix_registro_lancamento", "lancamento_id"),
+        # Aba Desfeitas: cancelados de uma empresa, do mais recente ao mais antigo.
+        Index("ix_registro_empresa_cancelado", "empresa_id", "cancelado_em"),
         Index(
             "uq_registro_transacao_dc_ativo",
             "transacao_id",
@@ -986,7 +1020,7 @@ class CpArquivo(Base):
     """CONCILPRO — arquivo PDF importado (Razão de Fornecedores)."""
     __tablename__ = "cp_arquivo"
 
-    id              = _Col(_Int, primary_key=True, index=True)
+    id              = _Col(_Int, primary_key=True)
     empresa_id      = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     nome_arquivo    = _Col(_Str(255), nullable=False)
     hash_arquivo    = _Col(_Str(64), nullable=False)
@@ -1012,7 +1046,7 @@ class CpFornecedor(Base):
     """CONCILPRO — conta de fornecedor extraída do Razão."""
     __tablename__ = "cp_fornecedor"
 
-    id                  = _Col(_Int, primary_key=True, index=True)
+    id                  = _Col(_Int, primary_key=True)
     empresa_id          = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     arquivo_origem_id   = _Col(_Int, _FK("cp_arquivo.id"))
     codigo_conta        = _Col(_Str(10), nullable=False)
@@ -1049,7 +1083,7 @@ class CpLancamento(Base):
     """CONCILPRO — lançamento individual no Razão do fornecedor."""
     __tablename__ = "cp_lancamento"
 
-    id                    = _Col(_Int, primary_key=True, index=True)
+    id                    = _Col(_Int, primary_key=True)
     empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     data_lancamento       = _Col(_Date, nullable=False)
@@ -1088,7 +1122,7 @@ class CpConciliacao(Base):
     """CONCILPRO — vínculo FIFO entre compra (crédito) e pagamento (débito)."""
     __tablename__ = "cp_conciliacao"
 
-    id                    = _Col(_Int, primary_key=True, index=True)
+    id                    = _Col(_Int, primary_key=True)
     empresa_id            = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id         = _Col(_Int, _FK("cp_fornecedor.id"), nullable=False)
     lancamento_credito_id = _Col(_Int, _FK("cp_lancamento.id"))
@@ -1115,7 +1149,7 @@ class CpDivergencia(Base):
     """CONCILPRO — divergência contábil detectada na conciliação."""
     __tablename__ = "cp_divergencia"
 
-    id               = _Col(_Int, primary_key=True, index=True)
+    id               = _Col(_Int, primary_key=True)
     empresa_id       = _Col(UUID(as_uuid=True), _FK("empresas.id"), nullable=False)
     fornecedor_id    = _Col(_Int, _FK("cp_fornecedor.id"))
     lancamento_id    = _Col(_Int, _FK("cp_lancamento.id"))
