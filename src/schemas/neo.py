@@ -124,6 +124,39 @@ class NeoPendenciaGrupoResponse(BaseModel):
     transacao_ids: list[UUID]
 
 
+class NeoPendenciaResponse(BaseModel):
+    """Uma linha da fila de classificação.
+
+    Nasce da TRANSAÇÃO, não da decisão: transação recém-importada que o motor
+    ainda não olhou não tem decisão nenhuma, e uma fila que só mostrasse
+    decisões esconderia justamente o que falta processar.
+    """
+
+    transacao_id: UUID
+    # Nulo enquanto o NEO nunca rodou sobre esta transação.
+    decisao_id: UUID | None = None
+    data: date
+    historico: str
+    valor: Decimal
+    dc: str
+    agencia_id: UUID
+    # O que o motor achou e por que não classificou — inclui o aviso de valor
+    # não confiável e a recusa por contraparte ambígua.
+    motivo: str | None = None
+    # "valor_suspeito" marca a transação que o motor se recusa a contabilizar.
+    estrategia: str | None = None
+    # Preenchido quando um humano desfez a classificação automática: enquanto
+    # estiver aqui, o motor não tenta de novo sozinho.
+    auto_recusado_em: datetime | None = None
+
+
+class NeoPendenciaListResponse(BaseModel):
+    items: list[NeoPendenciaResponse]
+    total: int
+    page: int
+    page_size: int
+
+
 class NeoPendenciasAgrupadasResponse(BaseModel):
     grupos: list[NeoPendenciaGrupoResponse]
     total_pendentes: int

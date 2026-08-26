@@ -3511,3 +3511,166 @@ async def test_cnpj_da_propria_empresa_no_historico_e_ignorado(
     await db.refresh(transacao)
 
     assert transacao.status == "pendente"
+
+
+# ── Fila plana de pendências (uma linha por transação)
+
+
+def _fila_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/pendencias"
+
+
+@pytest.mark.asyncio
+async def test_fila_mostra_transacao_que_o_motor_nunca_processou(
+    client, db, tenant, usuario, empresa
+):
+    """É a diferença entre a fila e o log de decisões.
+
+    Transação recém-importada não tem decisão nenhuma. Uma fila montada sobre
+    `decisoes?resultado=sem_regra` a esconderia — justo a que mais precisa
+    aparecer depois de uma importação.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    nova = await _pendencia(
+        db, empresa, agencia_id, historico="DEPOSITO RECEM IMPORTADO", valor="10.00"
+    )
+
+    corpo = (await client.get(_fila_url(empresa.id))).json()
+
+    linha = next(i for i in corpo["items"] if i["transacao_id"] == str(nova.id))
+    assert linha["decisao_id"] is None
+    assert linha["motivo"] is None
+    assert (linha["historico"], linha["dc"]) == ("DEPOSITO RECEM IMPORTADO", "C")
+
+    # E o log de decisões, de propósito, NÃO a traz — é o que justifica a rota.
+    decisoes = (
+        await client.get(
+            f"/api/v1/empresas/{empresa.id}/neo/decisoes?resultado=sem_regra&page_size=200"
+        )
+    ).json()
+    assert all(d["transacao_id"] != str(nova.id) for d in decisoes["items"])
+
+
+@pytest.mark.asyncio
+async def test_fila_traz_o_aviso_da_decisao_aberta(
+    client, db, tenant, usuario, empresa
+):
+    """O motivo é o que explica por que aquela linha continua parada.
+
+    Sem ele, a transação bloqueada por valor não confiável fica na fila
+    parecendo pendência comum, e alguém tenta classificá-la.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    suspeita = await _pendencia(db, empresa, agencia_id)
+    await _resultado_do_job(
+        client,
+        empresa.id,
+        await client.post(
+            _processar_url(empresa.id), json={}, headers={"X-CSRF-Token": csrf}
+        ),
+    )
+
+    corpo = (await client.get(_fila_url(empresa.id))).json()
+
+    linha = next(i for i in corpo["items"] if i["transacao_id"] == str(suspeita.id))
+    assert linha["estrategia"] == "valor_suspeito"
+    assert "saldo" in linha["motivo"]
+    assert linha["decisao_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fila_nao_lista_transacao_ja_classificada(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    transacao = await _pendencia(
+        db, empresa, agencia_id, historico="PAGAMENTO FORNECEDOR X", valor="250.00"
+    )
+
+    antes = (await client.get(_fila_url(empresa.id))).json()["total"]
+    await client.post(
+        _pendencias_url(empresa.id, "classificar-lote"),
+        json={
+            "transacao_ids": [str(transacao.id)],
+            "conta_id": conta_id,
+            "descricao": "Fornecedor X",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    depois = (await client.get(_fila_url(empresa.id))).json()
+
+    assert depois["total"] == antes - 1
+    assert all(i["transacao_id"] != str(transacao.id) for i in depois["items"])
+
+
+@pytest.mark.asyncio
+async def test_fila_segue_a_ordem_de_leitura_do_extrato(
+    client, db, tenant, usuario, empresa
+):
+    """Mesma ordem da tela de Extrato.
+
+    Duas telas sobre as mesmas transações em ordens diferentes obrigam o
+    contador a se reorientar a cada troca de aba.
+    """
+    from src.db.models import ExtratoImportacao
+
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+
+    lote = ExtratoImportacao(
+        empresa_id=empresa.id,
+        agencia_id=UUID(agencia_id),
+        nome_arquivo="fila.ofx",
+        hash_arquivo="fila".ljust(64, "0"),
+        created_at=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+    db.add(lote)
+    await db.flush()
+
+    for rotulo, dia, ordem in (("SEGUNDA DO DIA", 5, 1), ("PRIMEIRA DO DIA", 5, 0)):
+        transacao = Transacao(
+            empresa_id=empresa.id,
+            agencia_id=UUID(agencia_id),
+            data=date(2026, 2, dia),
+            valor=Decimal("10.00"),
+            historico=rotulo,
+            dc="D",
+            ordem=ordem,
+            importacao_id=lote.id,
+            hash_dedup=f"hash_fila_{ordem}",
+        )
+        db.add(transacao)
+    await db.flush()
+
+    corpo = (await client.get(f"{_fila_url(empresa.id)}?termo=DO DIA")).json()
+
+    assert [i["historico"] for i in corpo["items"]] == [
+        "PRIMEIRA DO DIA",
+        "SEGUNDA DO DIA",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fila_filtra_por_termo_e_valor(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    await _pendencia(
+        db, empresa, agencia_id, historico="TARIFA MENSAL", valor="30.00", dc="D"
+    )
+    await _pendencia(
+        db, empresa, agencia_id, historico="TARIFA ANUAL", valor="900.00", dc="D"
+    )
+
+    por_termo = (await client.get(f"{_fila_url(empresa.id)}?termo=tarifa")).json()
+    assert {i["historico"] for i in por_termo["items"]} == {
+        "TARIFA MENSAL",
+        "TARIFA ANUAL",
+    }
+
+    por_valor = (
+        await client.get(f"{_fila_url(empresa.id)}?termo=tarifa&valor_min=100")
+    ).json()
+    assert [i["historico"] for i in por_valor["items"]] == ["TARIFA ANUAL"]
