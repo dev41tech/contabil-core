@@ -38,6 +38,7 @@ from src.db.models import (
     Transacao,
     Usuario,
 )
+from src.domain.extrato.ordenacao import ordenar_como_o_extrato
 from src.domain.neo.engine import ESTRATEGIA_VALOR_SUSPEITO, estrategia_de_match
 from src.schemas.neo import (
     NeoConflitoAmostra,
@@ -47,6 +48,8 @@ from src.schemas.neo import (
     NeoDivergenciaPorContaResponse,
     NeoDivergenciasResponse,
     NeoPendenciaGrupoResponse,
+    NeoPendenciaListResponse,
+    NeoPendenciaResponse,
     NeoPendenciasAgrupadasResponse,
     NeoSimulacaoConflitos,
     NeoSimulacaoQuantidade,
@@ -116,6 +119,147 @@ def _validar_opcao(valor: str, aceitos: tuple[str, ...], campo: str) -> str:
     return normalizado
 
 
+def _filtrar_por_transacao(
+    q,
+    *,
+    dc: str | None,
+    agencia_id: UUID | None,
+    mes: str | None,
+    data_de: date | None,
+    data_ate: date | None,
+    valor_min: Decimal | None,
+    valor_max: Decimal | None,
+):
+    """Recortes que valem sobre a TRANSAÇÃO, não sobre a decisão.
+
+    A fila e o log de decisões oferecem os mesmos filtros de data, valor,
+    agência e D/C. Duas cópias divergiriam no primeiro ajuste, e a tela
+    passaria a mostrar conjuntos diferentes para o mesmo filtro.
+    """
+    if dc:
+        q = q.where(Transacao.dc == normalizar_dc(dc))
+    if agencia_id:
+        q = q.where(Transacao.agencia_id == agencia_id)
+    # `mes` e o intervalo se ACUMULAM, não competem. A competência é global na
+    # aplicação — o contador a escolhe uma vez e ela vale em todas as telas —,
+    # então um intervalo informado aqui é um recorte DENTRO dela, mais
+    # específico. Dar precedência ao mês descartaria justamente a escolha mais
+    # explícita; pedir mês e intervalo incompatíveis devolve vazio, que é a
+    # resposta honesta.
+    if mes:
+        inicio, fim = bounds_do_mes_data(mes)
+        q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
+    if data_de is not None and data_ate is not None and data_de > data_ate:
+        raise ValidationError(message="data_de não pode ser maior que data_ate.")
+    if data_de is not None:
+        q = q.where(Transacao.data >= data_de)
+    if data_ate is not None:
+        q = q.where(Transacao.data <= data_ate)
+    if valor_min is not None and valor_max is not None and valor_min > valor_max:
+        raise ValidationError(message="valor_min não pode ser maior que valor_max.")
+    # `Transacao.valor` é gravado em módulo pelo importador de extrato (o sinal
+    # do lançamento está em `dc`), então a faixa é sempre em números positivos —
+    # o contador digita "150", não "-150", para achar um débito de R$ 150,00.
+    if valor_min is not None:
+        q = q.where(Transacao.valor >= valor_min)
+    if valor_max is not None:
+        q = q.where(Transacao.valor <= valor_max)
+    return q
+
+
+async def listar_pendencias(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    termo: str | None = None,
+    dc: str | None = None,
+    agencia_id: UUID | None = None,
+    mes: str | None = None,
+    data_de: date | None = None,
+    data_ate: date | None = None,
+    valor_min: Decimal | None = None,
+    valor_max: Decimal | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> NeoPendenciaListResponse:
+    """A fila de classificação, uma linha por transação pendente.
+
+    Parte da TRANSAÇÃO e traz a decisão aberta junto, quando existe. O caminho
+    inverso — listar decisões `sem_regra` — esconderia toda transação que o
+    motor ainda não processou, que é exatamente a que mais precisa aparecer
+    depois de uma importação.
+
+    A ordem é a mesma da tela de Extrato (`ordenar_como_o_extrato`): a fila é
+    lida como o papel do banco, e duas telas sobre as mesmas transações em
+    ordens diferentes obrigam o contador a se reorientar a cada troca de aba.
+    """
+    decisao_aberta = aliased(NeoDecisao)
+    q = (
+        select(Transacao, decisao_aberta)
+        .outerjoin(
+            decisao_aberta,
+            and_(
+                decisao_aberta.transacao_id == Transacao.id,
+                decisao_aberta.resultado == "sem_regra",
+            ),
+        )
+        .where(
+            Transacao.empresa_id == empresa_id,
+            Transacao.status == "pendente",
+            Transacao.deleted_at.is_(None),
+        )
+    )
+    q = _filtrar_por_transacao(
+        q,
+        dc=dc,
+        agencia_id=agencia_id,
+        mes=mes,
+        data_de=data_de,
+        data_ate=data_ate,
+        valor_min=valor_min,
+        valor_max=valor_max,
+    )
+    if termo:
+        # Só o histórico do extrato: aqui não há regra aplicada para procurar.
+        termo_like = f"%{_escapar_ilike(remover_acentos(termo.strip()).lower())}%"
+        q = q.where(sem_acento(Transacao.historico).like(termo_like, escape="\\"))
+
+    # Contagem antes da ordenação: o join do lote não muda o total, e contar
+    # sem ele é mais barato.
+    total = (
+        await db.execute(
+            select(func.count()).select_from(q.with_only_columns(Transacao.id).subquery())
+        )
+    ).scalar_one()
+
+    linhas = (
+        await db.execute(
+            ordenar_como_o_extrato(q).offset((page - 1) * page_size).limit(page_size)
+        )
+    ).unique().all()
+
+    return NeoPendenciaListResponse(
+        items=[
+            NeoPendenciaResponse(
+                transacao_id=transacao.id,
+                decisao_id=decisao.id if decisao else None,
+                data=transacao.data,
+                historico=transacao.historico,
+                valor=transacao.valor,
+                dc=transacao.dc,
+                agencia_id=transacao.agencia_id,
+                motivo=decisao.motivo if decisao else None,
+                estrategia=decisao.estrategia if decisao else None,
+                auto_recusado_em=transacao.auto_recusado_em,
+            )
+            for transacao, decisao in linhas
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
 async def listar_decisoes(
     db: AsyncSession,
     empresa_id: UUID,
@@ -159,10 +303,6 @@ async def listar_decisoes(
             NeoDecisao.estrategia
             == _validar_opcao(estrategia, ESTRATEGIAS_VALIDAS, "estrategia")
         )
-    if dc:
-        q = q.where(Transacao.dc == normalizar_dc(dc))
-    if agencia_id:
-        q = q.where(Transacao.agencia_id == agencia_id)
     if conta_id:
         q = q.where(
             or_(
@@ -170,36 +310,22 @@ async def listar_decisoes(
                 and_(NeoDecisao.conta_id.is_(None), Regra.conta_id == conta_id),
             )
         )
-    # `mes` e o intervalo se ACUMULAM, não competem. A competência é global na
-    # aplicação — o contador a escolhe uma vez e ela vale em todas as telas —,
-    # então um intervalo informado aqui é um recorte DENTRO dela, mais
-    # específico. Dar precedência ao mês descartaria justamente a escolha mais
-    # explícita; pedir mês e intervalo incompatíveis devolve vazio, que é a
-    # resposta honesta.
-    if mes:
-        inicio, fim = bounds_do_mes_data(mes)
-        q = q.where(Transacao.data >= inicio, Transacao.data <= fim)
-    if data_de is not None and data_ate is not None and data_de > data_ate:
-        raise ValidationError(message="data_de não pode ser maior que data_ate.")
-    if data_de is not None:
-        q = q.where(Transacao.data >= data_de)
-    if data_ate is not None:
-        q = q.where(Transacao.data <= data_ate)
+    q = _filtrar_por_transacao(
+        q,
+        dc=dc,
+        agencia_id=agencia_id,
+        mes=mes,
+        data_de=data_de,
+        data_ate=data_ate,
+        valor_min=valor_min,
+        valor_max=valor_max,
+    )
     if motivo:
         # O motivo é escrito pelo motor, sem acento inconsistente, mas passa
         # pela mesma normalização do `termo` para o contador não precisar saber
         # disso.
         motivo_like = f"%{_escapar_ilike(remover_acentos(motivo.strip()).lower())}%"
         q = q.where(sem_acento(NeoDecisao.motivo).like(motivo_like, escape="\\"))
-    if valor_min is not None and valor_max is not None and valor_min > valor_max:
-        raise ValidationError(message="valor_min não pode ser maior que valor_max.")
-    # `Transacao.valor` é gravado em módulo pelo importador de extrato (o sinal
-    # do lançamento está em `dc`), então a faixa é sempre em números positivos —
-    # o contador digita "150", não "-150", para achar um débito de R$ 150,00.
-    if valor_min is not None:
-        q = q.where(Transacao.valor >= valor_min)
-    if valor_max is not None:
-        q = q.where(Transacao.valor <= valor_max)
     if termo:
         # Busca com acento dobrado dos dois lados: quem digita "liquidacao"
         # precisa achar "LIQUIDAÇÃO" no extrato, e vice-versa. Pontuação é

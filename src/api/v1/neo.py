@@ -17,6 +17,7 @@ from src.db.session import get_db
 from src.domain.auditoria import registrar_auditoria
 from src.domain.neo.consultas import (
     listar_desfeitas as _listar_desfeitas,
+    listar_pendencias as _listar_pendencias,
     agrupar_pendencias as _agrupar_pendencias,
     consultar_divergencias as _consultar_divergencias,
     listar_decisoes as _listar_decisoes,
@@ -40,6 +41,7 @@ from src.schemas.neo import (
     NeoDesfeitaResponse,
     NeoDecisaoResponse,
     NeoDivergenciasResponse,
+    NeoPendenciaListResponse,
     NeoPendenciasAgrupadasResponse,
     NeoProcessarRequest,
     NeoResultado,
@@ -186,6 +188,53 @@ async def consultar_divergencias(
         empresa_id,
         mes=mes,
         agencia_id=agencia_id,
+    )
+
+
+@router.get("/pendencias", response_model=NeoPendenciaListResponse)
+async def listar_pendencias_endpoint(
+    empresa_id: UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    termo: str | None = Query(default=None, description="Busca no histórico do extrato"),
+    dc: str | None = Query(
+        default=None,
+        description="D/débito ou C/crédito (aceita a letra ou a palavra por extenso)",
+    ),
+    agencia_id: UUID | None = Query(default=None),
+    mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
+    data_de: date | None = Query(
+        default=None,
+        description="AAAA-MM-DD, inclusivo. Acumula com `mes`.",
+    ),
+    data_ate: date | None = Query(
+        default=None,
+        description="AAAA-MM-DD, inclusivo. Acumula com `mes`.",
+    ),
+    valor_min: Decimal | None = Query(default=None, ge=0),
+    valor_max: Decimal | None = Query(default=None, ge=0),
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoPendenciaListResponse:
+    """A fila de classificação, uma linha por transação pendente.
+
+    Diferente de `GET /neo/decisoes?resultado=sem_regra`, que lista DECISÕES:
+    transação recém-importada que o motor ainda não olhou não tem decisão, e
+    some daquela consulta. Aqui ela aparece, com `decisao_id` nulo.
+    """
+    return await _listar_pendencias(
+        db,
+        empresa_id,
+        termo=termo,
+        dc=dc,
+        agencia_id=agencia_id,
+        mes=mes,
+        data_de=data_de,
+        data_ate=data_ate,
+        valor_min=valor_min,
+        valor_max=valor_max,
+        page=page,
+        page_size=page_size,
     )
 
 
