@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.api.autorizacao import requer
 from src.db.models import Job
 from src.db.session import get_db
 from src.domain.jobs import JobRuntime, executar_importacao_extrato
@@ -41,7 +42,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> ExtratoService:
     "/importar",
     response_model=JobResponse,
     status_code=202,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("extrato.execute"), Depends(require_csrf)],
 )
 async def importar_extrato(
     empresa_id: UUID,
@@ -80,7 +81,7 @@ async def importar_extrato(
     return job
 
 
-@router.get("", response_model=ExtratoPendentesResponse)
+@router.get("", response_model=ExtratoPendentesResponse, dependencies=[requer("extrato.read")])
 async def listar_transacoes(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -114,7 +115,7 @@ async def listar_transacoes(
 # NOTA: as rotas de /importacoes precisam vir ANTES de /{transacao_id}. O
 # FastAPI casa na ordem de registro, e depois da rota curinga um GET em
 # /extrato/importacoes tentaria ler "importacoes" como UUID e responderia 422.
-@router.get("/importacoes", response_model=ImportacaoListResponse)
+@router.get("/importacoes", response_model=ImportacaoListResponse, dependencies=[requer("extrato.read")])
 async def listar_importacoes_endpoint(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -140,7 +141,7 @@ async def listar_importacoes_endpoint(
 @router.post(
     "/importacoes/{importacao_id}/cancelar",
     response_model=CancelarImportacaoResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("extrato.execute"), Depends(require_csrf)],
 )
 async def cancelar_importacao_endpoint(
     empresa_id: UUID,
@@ -168,7 +169,7 @@ async def cancelar_importacao_endpoint(
     )
 
 
-@router.get("/{transacao_id}", response_model=TransacaoResponse)
+@router.get("/{transacao_id}", response_model=TransacaoResponse, dependencies=[requer("extrato.read")])
 async def obter_transacao(
     empresa_id: UUID,
     transacao_id: UUID,

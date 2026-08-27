@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.core.errors import ConflictError, ValidationError
 from src.db.models import Job, NeoDecisao, PlanoConta, Transacao
 from src.db.session import get_db
@@ -62,7 +63,7 @@ router = APIRouter(
     "/processar",
     response_model=JobResponse,
     status_code=202,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def processar(
     empresa_id: UUID,
@@ -103,7 +104,7 @@ async def processar(
     return job
 
 
-@router.get("/decisoes", response_model=NeoDecisaoListResponse)
+@router.get("/decisoes", response_model=NeoDecisaoListResponse, dependencies=[requer("neo.read")])
 async def listar_decisoes(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -174,7 +175,7 @@ async def listar_decisoes(
 
 # A consulta foi criada nesta semana para a futura tela de conflitos; retirar a
 # capacidade só porque essa tela ainda não chegou inverteria a dependência.
-@router.get("/divergencias", response_model=NeoDivergenciasResponse)
+@router.get("/divergencias", response_model=NeoDivergenciasResponse, dependencies=[requer("neo.read")])
 async def consultar_divergencias(
     empresa_id: UUID,
     mes: Competencia | None = Query(default=None, description="Competência AAAA-MM"),
@@ -191,7 +192,7 @@ async def consultar_divergencias(
     )
 
 
-@router.get("/pendencias", response_model=NeoPendenciaListResponse)
+@router.get("/pendencias", response_model=NeoPendenciaListResponse, dependencies=[requer("neo.read")])
 async def listar_pendencias_endpoint(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -241,6 +242,7 @@ async def listar_pendencias_endpoint(
 @router.get(
     "/pendencias/agrupadas",
     response_model=NeoPendenciasAgrupadasResponse,
+    dependencies=[requer("neo.read")],
 )
 async def agrupar_pendencias(
     empresa_id: UUID,
@@ -265,7 +267,7 @@ async def agrupar_pendencias(
 @router.post(
     "/pendencias/classificar-lote",
     response_model=NeoClassificarLoteResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def classificar_lote(
     empresa_id: UUID,
@@ -356,6 +358,7 @@ async def classificar_lote(
 @router.post(
     "/pendencias/simular-regra",
     response_model=NeoSimularRegraResponse,
+    dependencies=[requer("neo.read")],
 )
 async def simular_regra(
     empresa_id: UUID,
@@ -378,7 +381,7 @@ async def simular_regra(
     "/pendencias/criar-regra-e-aplicar",
     response_model=NeoCriarRegraEAplicarResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def criar_regra_e_aplicar(
     empresa_id: UUID,
@@ -410,7 +413,7 @@ async def criar_regra_e_aplicar(
 @router.post(
     "/decisoes/{decisao_id}/associar-manual",
     response_model=NeoDecisaoResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def associar_manual(
     empresa_id: UUID,
@@ -542,7 +545,7 @@ async def associar_manual(
 @router.post(
     "/lancamentos/{lancamento_id}/cancelar",
     response_model=NeoCancelarLancamentoResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def cancelar_lancamento_endpoint(
     empresa_id: UUID,
@@ -571,7 +574,7 @@ async def cancelar_lancamento_endpoint(
     )
 
 
-@router.get("/desfeitas", response_model=NeoDesfeitaListResponse)
+@router.get("/desfeitas", response_model=NeoDesfeitaListResponse, dependencies=[requer("neo.read")])
 async def listar_desfeitas_endpoint(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -598,7 +601,7 @@ async def listar_desfeitas_endpoint(
 @router.post(
     "/transacoes/{transacao_id}/liberar-automatico",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("neo.execute"), Depends(require_csrf)],
 )
 async def liberar_para_automatico_endpoint(
     empresa_id: UUID,
