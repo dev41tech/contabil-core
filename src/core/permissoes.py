@@ -95,6 +95,47 @@ PERMISSOES: dict[str, Permissao] = {
 }
 
 
+# ── Papéis
+#
+# MÓDULO diz ONDE; PAPEL diz O QUANTO.
+#
+# O CSV de módulos (`Permissao.modulos`) já dizia em quais recursos o usuário
+# entra — e continua dizendo. O papel acrescenta a outra metade: quais ações
+# ele pode fazer lá dentro. O efetivo é a interseção:
+#
+#     efetivo = {p do catálogo | p.recurso ∈ modulos} ∩ ações(papel)
+#
+# Por isso não há tabela de overrides. O plano previa `allow`/`deny` por
+# usuário × permissão para casos como "contador sem Open Banking" — mas isso é
+# exatamente o que a lista de módulos já faz, e há anos. Duas máquinas de
+# exceção fariam a mesma pergunta ter duas respostas.
+#
+# São três porque a operação tem três: quem manda, quem opera e quem só olha.
+# Papel novo nasce quando alguém pedir, com nome vindo da operação real.
+PAPEIS: dict[str, tuple[str, ...]] = {
+    # Faz tudo nos módulos que tem — inclusive exclusão estrutural e
+    # importação em massa.
+    "dono": ("read", "write", "execute", "manage"),
+    # Opera: consulta, cadastra e executa. Não reestrutura.
+    "contador": ("read", "write", "execute"),
+    # Só olha. Nem cadastro reversível.
+    "leitura": ("read",),
+}
+
+PAPEL_PADRAO = "contador"
+
+
+def papel_permite(papel: str | None, exigida: Permissao) -> bool:
+    """O papel autoriza esta ação?
+
+    `None` é o admin do escritório, que passa por tudo dentro do tenant — o
+    mesmo comportamento de sempre, agora explícito em vez de implícito.
+    """
+    if papel is None:
+        return True
+    return exigida.acao in PAPEIS.get(papel, ())
+
+
 class PermissaoDesconhecida(LookupError):
     """Código fora do catálogo. É erro de programação, não de runtime."""
 

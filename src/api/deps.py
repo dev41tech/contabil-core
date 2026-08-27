@@ -40,6 +40,9 @@ class AuthContext:
     # (`src/api/autorizacao.py`) não precisar reconsultar a tabela a cada
     # requisição: a permissão já foi lida aqui.
     modulos: frozenset[str] | None = None
+    # Papel do usuário NESTA empresa (`dono`/`contador`/`leitura`). `None` é o
+    # admin do escritório, que passa por todas as ações dentro do tenant.
+    papel: str | None = None
 
 
 async def _get_current_user(
@@ -148,6 +151,7 @@ async def get_company_context(
 
     # Admin tem acesso a todos os módulos, mas não cruza a fronteira do tenant.
     modulos_do_usuario: frozenset[str] = frozenset({"*"})
+    papel_na_empresa: str | None = None
     if ctx.role != "admin":
         result = await db.execute(
             select(Permissao).where(
@@ -171,6 +175,7 @@ async def get_company_context(
         ):
             raise TenantAccessDeniedError()
         modulos_do_usuario = frozenset(modulos)
+        papel_na_empresa = permissao.papel
 
     set_request_context(
         trace_id=structlog.contextvars.get_contextvars().get("trace_id", "-"),
@@ -179,7 +184,7 @@ async def get_company_context(
     )
     # `AuthContext` é frozen: devolve uma cópia com os módulos resolvidos, em
     # vez de mutar o contexto que veio da autenticação.
-    return replace(ctx, modulos=modulos_do_usuario)
+    return replace(ctx, modulos=modulos_do_usuario, papel=papel_na_empresa)
 
 
 async def get_admin_company_context(
