@@ -6,11 +6,22 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+# Módulos que um contador pode receber. O nome é o primeiro segmento da URL
+# depois de `/empresas/{id}/`, com hífen virando underscore — é assim que
+# `get_company_context` resolve o módulo da requisição.
+#
+# Faltar aqui não é detalhe: a validação recusa conceder o que não está na
+# lista, então o administrador é EMPURRADO para o `"*"` — dar tudo — quando
+# queria dar um módulo só. Foi o que aconteceu com `concilpro` e
+# `aplicacoes_financeiras`, que existem como rota desde sempre e nunca puderam
+# ser concedidos isoladamente.
 MODULOS_VALIDOS = frozenset(
     [
         "agencias",
+        "aplicacoes_financeiras",
         "cartoes",
         "comprovantes",
+        "concilpro",
         "contabil",
         "contrapartes",
         "exportacao",
@@ -26,6 +37,18 @@ MODULOS_VALIDOS = frozenset(
         "*",
     ]
 )
+
+# Módulos que existem como rota e NÃO são concedíveis, porque a própria rota
+# exige papel de administrador (`get_admin_company_context` / `require_admin`).
+#
+# Ficam fora de `MODULOS_VALIDOS` de propósito: aceitar a concessão criaria a
+# promessa de um acesso que o guard de papel nega em seguida — o contador
+# receberia o módulo na tela de permissões e continuaria tomando 403.
+#
+# O teste `test_permissoes.py::test_todo_modulo_de_rota_e_concedivel_ou_admin`
+# confronta esta lista com as rotas reais: módulo novo precisa cair num dos
+# dois lados, nunca em nenhum.
+MODULOS_SOMENTE_ADMIN = frozenset(["auditoria", "permissoes"])
 
 
 class PermissaoCreate(BaseModel):

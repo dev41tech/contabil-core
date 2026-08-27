@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,9 @@ from src.api.deps import AuthContext, require_admin, require_csrf
 from src.core.security import hash_password
 from src.db.models import Usuario
 from src.db.session import get_db
+from src.domain.auditoria import registrar_auditoria
+from src.domain.auth.service import AuthService
+from src.schemas.auth import ResetarSenhaRequest
 from src.schemas.usuarios import UsuarioCreate, UsuarioListResponse, UsuarioResponse
 
 router = APIRouter(prefix="/usuarios", tags=["usuarios"])
@@ -91,6 +94,53 @@ async def criar_usuario(
     await db.commit()
     await db.refresh(usuario)
     return UsuarioResponse.model_validate(usuario)
+
+
+@router.patch("/{usuario_id}/senha", status_code=204, dependencies=[Depends(require_csrf)])
+async def resetar_senha(
+    usuario_id: UUID,
+    body: ResetarSenhaRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Define a senha de um usuário do escritório (apenas admins).
+
+    Existe porque não há e-mail nem token de recuperação: quem perde a senha
+    hoje depende de um administrador. Enquanto for assim, a trilha de
+    auditoria é a única evidência de que a senha de alguém foi trocada por
+    outra pessoa — por isso o registro não é opcional aqui.
+
+    As sessões do usuário caem junto. Sem isso, resetar a senha de uma conta
+    comprometida deixaria o invasor logado.
+    """
+    usuario = (
+        await db.execute(
+            select(Usuario).where(
+                Usuario.id == usuario_id,
+                Usuario.tenant_id == ctx.tenant_id,
+                Usuario.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+    sessoes = await AuthService(db).definir_senha(usuario, body.nova_senha)
+    await registrar_auditoria(
+        db,
+        tenant_id=ctx.tenant_id,
+        usuario_id=ctx.user_id,
+        acao="usuario.senha_resetada",
+        entidade="usuario",
+        entidade_id=usuario.id,
+        dados_depois={
+            "alvo_email": usuario.email,
+            "sessoes_revogadas": sessoes,
+            "por_admin": str(ctx.user_id),
+        },
+        ip=request.client.host if request.client else None,
+    )
 
 
 @router.patch("/{usuario_id}/desativar", response_model=UsuarioResponse, dependencies=[Depends(require_csrf)])

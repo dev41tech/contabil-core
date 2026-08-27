@@ -13,6 +13,29 @@ class LoginRequest(BaseModel):
     senha: str = Field(..., min_length=8)
 
 
+class TrocarSenhaRequest(BaseModel):
+    """Troca da própria senha.
+
+    A senha atual é exigida mesmo com a sessão já autenticada: sessão roubada
+    não pode virar conta roubada. Sem isso, quem pegasse o cookie trocaria a
+    senha e expulsaria o dono.
+    """
+
+    senha_atual: str = Field(..., min_length=8)
+    nova_senha: str = Field(..., min_length=8, max_length=200)
+
+
+class ResetarSenhaRequest(BaseModel):
+    """Reset feito por administrador, para quem perdeu o acesso.
+
+    Não pede a senha atual — é justamente o caso de quem não a tem. Por isso a
+    operação é registrada na auditoria com quem resetou e para quem: é a única
+    trilha de que a senha de outra pessoa foi trocada por um terceiro.
+    """
+
+    nova_senha: str = Field(..., min_length=8, max_length=200)
+
+
 class LoginResponse(BaseModel):
     message: str = "Login realizado com sucesso."
     # Tokens trafegam em cookies HttpOnly — não no body.
