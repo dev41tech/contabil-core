@@ -21,29 +21,18 @@ from src.core.permissoes import PERMISSOES, PermissaoDesconhecida, permissao
 
 PREFIXO_EMPRESA = "/empresas/{empresa_id}/"
 
-# Rotas de empresa que ainda não declaram permissão. Herança da autorização por
-# caminho — continuam protegidas por `get_company_context`, que resolve o módulo
-# pela URL, mas ninguém escolheu a política delas.
+# Rotas de empresa que ainda não declaram permissão.
+#
+# Sobrou uma: `permissoes`. As rotas dela dependem de `require_admin`, e não de
+# `get_company_context` — não há contexto de empresa resolvido, então não há
+# módulos do usuário para o `requer()` conferir. Declarar ali acrescentaria
+# `get_company_context` à cadeia e mudaria comportamento: um admin operando
+# sobre empresa inativa passaria a receber 403. Provavelmente é o certo, mas é
+# decisão separada, não efeito colateral de uma declaração.
 #
 # ESTA LISTA SÓ ENCOLHE. Não acrescente nada aqui sem dizer no PR por quê.
 _AINDA_NAO_DECLARAM = {
-    "agencias",
-    "aplicacoes-financeiras",
-    "auditoria",
-    "cartoes",
-    "comprovantes",
-    "concilpro",
-    "contabil",
-    "contrapartes",
-    "exportacao",
-    "jobs",
-    "notas",
-    "openbanking",
     "permissoes",
-    "plano-contas",
-    "regras",
-    "relatorios",
-    "stats",
 }
 
 
@@ -118,7 +107,13 @@ def test_metodo_que_muda_estado_nao_declara_apenas_leitura():
     regra faria, sem gravar nada. Está aqui nomeado, e não por regra geral,
     justamente para o próximo caso do tipo ser uma decisão consciente.
     """
-    consultas_por_post = {"/neo/pendencias/simular-regra"}
+    consultas_por_post = {
+        # Responde o que a regra faria, sem gravar nada.
+        "/neo/pendencias/simular-regra",
+        # Extrai os campos do PDF para pré-preencher o formulário; quem grava é
+        # o POST /comprovantes seguinte.
+        "/comprovantes/extrair-pdf",
+    }
 
     for rota in _rotas_de_empresa():
         declarada = permissao_declarada(rota)

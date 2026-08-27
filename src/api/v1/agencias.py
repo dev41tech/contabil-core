@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.agencias.service import AgenciaService
 from src.schemas.agencias import (
@@ -30,7 +31,7 @@ def _svc(empresa_id: UUID, ctx: AuthContext, db: AsyncSession) -> AgenciaService
     return AgenciaService(db=db, empresa_id=empresa_id, tenant_id=ctx.tenant_id)
 
 
-@router.get("", response_model=AgenciaListResponse)
+@router.get("", response_model=AgenciaListResponse, dependencies=[requer("agencias.read")])
 async def listar_agencias(
     empresa_id: UUID,
     apenas_ativas: bool = Query(default=False, description="Filtrar apenas contas ativas"),
@@ -43,7 +44,7 @@ async def listar_agencias(
 
 # O recurso unitário é o contrato natural para detalhe/edição futura; a lacuna
 # atual é de tela, e não uma indicação de que a capacidade deva ser podada.
-@router.get("/{agencia_id}", response_model=AgenciaResponse)
+@router.get("/{agencia_id}", response_model=AgenciaResponse, dependencies=[requer("agencias.read")])
 async def obter_agencia(
     empresa_id: UUID,
     agencia_id: UUID,
@@ -57,7 +58,7 @@ async def obter_agencia(
     "",
     response_model=AgenciaResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("agencias.write"), Depends(require_csrf)],
 )
 async def criar_agencia(
     empresa_id: UUID,
@@ -72,7 +73,7 @@ async def criar_agencia(
 @router.patch(
     "/{agencia_id}",
     response_model=AgenciaResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("agencias.write"), Depends(require_csrf)],
 )
 async def atualizar_agencia(
     empresa_id: UUID,
@@ -88,7 +89,7 @@ async def atualizar_agencia(
 @router.delete(
     "/{agencia_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("agencias.write"), Depends(require_csrf)],
 )
 async def desativar_agencia(
     empresa_id: UUID,

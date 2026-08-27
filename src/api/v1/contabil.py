@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.contabil.service import ContabilService
 from src.schemas.contabil import RegistroContabilListResponse, RegistroContabilResponse
@@ -23,7 +24,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> ContabilService:
     return ContabilService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=RegistroContabilListResponse)
+@router.get("", response_model=RegistroContabilListResponse, dependencies=[requer("contabil.read")])
 async def listar_registros(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -50,7 +51,7 @@ async def listar_registros(
 
 # O GET unitário mantém o contrato REST pronto para uma tela de detalhe e custa
 # pouco comparado a obrigar todo consumidor futuro a vasculhar a listagem.
-@router.get("/{registro_id}", response_model=RegistroContabilResponse)
+@router.get("/{registro_id}", response_model=RegistroContabilResponse, dependencies=[requer("contabil.read")])
 async def obter_registro(
     empresa_id: UUID,
     registro_id: UUID,

@@ -71,7 +71,8 @@ _CATALOGO: dict[str, tuple[str, ...]] = {
     # Lançamento manual e, quando existir, estorno.
     "contabil": ("read", "write", "execute"),
     "contrapartes": ("read", "write"),
-    "exportacao": ("read",),
+    # `execute`: gerar exportação persiste um ExportJob — é mutação, não leitura.
+    "exportacao": ("read", "execute"),
     # `execute`: importar extrato e cancelar lote — cria e apaga movimento.
     "extrato": ("read", "execute"),
     "jobs": ("read",),

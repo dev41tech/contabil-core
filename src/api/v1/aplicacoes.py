@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.aplicacoes.service import AplicacaoFinanceiraService
 from src.schemas.aplicacoes import (
@@ -27,7 +28,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> AplicacaoFinanceiraService:
     return AplicacaoFinanceiraService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=AplicacaoFinanceiraListResponse)
+@router.get("", response_model=AplicacaoFinanceiraListResponse, dependencies=[requer("aplicacoes_financeiras.read")])
 async def listar_aplicacoes(
     empresa_id: UUID,
     apenas_ativas: bool = Query(default=False, description="Excluir aplicações encerradas"),
@@ -40,7 +41,7 @@ async def listar_aplicacoes(
 
 # O GET unitário preserva a forma REST necessária a uma futura tela de detalhe;
 # removê-lo pela ausência temporária de UI criaria retrabalho sem ganho real.
-@router.get("/{aplicacao_id}", response_model=AplicacaoFinanceiraResponse)
+@router.get("/{aplicacao_id}", response_model=AplicacaoFinanceiraResponse, dependencies=[requer("aplicacoes_financeiras.read")])
 async def obter_aplicacao(
     empresa_id: UUID,
     aplicacao_id: UUID,
@@ -54,7 +55,7 @@ async def obter_aplicacao(
     "",
     response_model=AplicacaoFinanceiraResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("aplicacoes_financeiras.write"), Depends(require_csrf)],
 )
 async def criar_aplicacao(
     empresa_id: UUID,
@@ -69,7 +70,7 @@ async def criar_aplicacao(
 @router.patch(
     "/{aplicacao_id}",
     response_model=AplicacaoFinanceiraResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("aplicacoes_financeiras.write"), Depends(require_csrf)],
 )
 async def atualizar_aplicacao(
     empresa_id: UUID,
@@ -85,7 +86,7 @@ async def atualizar_aplicacao(
 @router.delete(
     "/{aplicacao_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("aplicacoes_financeiras.write"), Depends(require_csrf)],
 )
 async def remover_aplicacao(
     empresa_id: UUID,

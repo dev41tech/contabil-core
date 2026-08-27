@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.contrapartes.service import ContraparteService
 from src.schemas.contrapartes import (
@@ -27,7 +28,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> ContraparteService:
     return ContraparteService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=ContraparteListResponse)
+@router.get("", response_model=ContraparteListResponse, dependencies=[requer("contrapartes.read")])
 async def listar_contrapartes(
     empresa_id: UUID,
     termo: str | None = Query(default=None, description="Busca por razão social, nome fantasia ou documento"),
@@ -43,7 +44,7 @@ async def listar_contrapartes(
     )
 
 
-@router.get("/{contraparte_id}", response_model=ContraparteResponse)
+@router.get("/{contraparte_id}", response_model=ContraparteResponse, dependencies=[requer("contrapartes.read")])
 async def obter_contraparte(
     empresa_id: UUID,
     contraparte_id: UUID,
@@ -57,7 +58,7 @@ async def obter_contraparte(
     "",
     response_model=ContraparteResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("contrapartes.write"), Depends(require_csrf)],
 )
 async def criar_contraparte(
     empresa_id: UUID,
@@ -72,7 +73,7 @@ async def criar_contraparte(
 @router.patch(
     "/{contraparte_id}",
     response_model=ContraparteResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("contrapartes.write"), Depends(require_csrf)],
 )
 async def atualizar_contraparte(
     empresa_id: UUID,
@@ -87,7 +88,7 @@ async def atualizar_contraparte(
 @router.delete(
     "/{contraparte_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("contrapartes.write"), Depends(require_csrf)],
 )
 async def remover_contraparte(
     empresa_id: UUID,

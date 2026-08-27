@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.stats.service import StatsService
 from src.schemas.stats import StatsResponse
@@ -18,7 +19,7 @@ router = APIRouter(
 )
 
 
-@router.get("", response_model=StatsResponse)
+@router.get("", response_model=StatsResponse, dependencies=[requer("stats.read")])
 async def obter_stats(
     empresa_id: UUID,
     meses: int = Query(default=12, ge=1, le=24, description="Quantos meses históricos"),

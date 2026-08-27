@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.openbanking.service import OpenBankingService
 from src.schemas.openbanking import (
@@ -32,7 +33,7 @@ def _svc(
     return OpenBankingService(db=db, empresa_id=empresa_id)
 
 
-@router.get("/conexoes", response_model=ConexaoListResponse)
+@router.get("/conexoes", response_model=ConexaoListResponse, dependencies=[requer("openbanking.read")])
 async def listar_conexoes(
     svc: OpenBankingService = Depends(_svc),
 ) -> ConexaoListResponse:
@@ -43,7 +44,7 @@ async def listar_conexoes(
 @router.post(
     "/connect-token",
     response_model=ConnectTokenResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("openbanking.write"), Depends(require_csrf)],
 )
 async def criar_connect_token(
     svc: OpenBankingService = Depends(_svc),
@@ -56,7 +57,7 @@ async def criar_connect_token(
     "/conexoes",
     response_model=ConexaoListResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("openbanking.write"), Depends(require_csrf)],
 )
 async def salvar_conexao(
     body: SalvarConexaoRequest,
@@ -69,7 +70,7 @@ async def salvar_conexao(
 @router.post(
     "/conexoes/{conexao_id}/sincronizar",
     response_model=SincronizarResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("openbanking.execute"), Depends(require_csrf)],
 )
 async def sincronizar(
     conexao_id: UUID,
@@ -85,7 +86,7 @@ async def sincronizar(
 @router.post(
     "/conexoes/{conexao_id}/reconectar",
     response_model=ConnectTokenResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("openbanking.execute"), Depends(require_csrf)],
 )
 async def reconectar(
     conexao_id: UUID,
@@ -98,7 +99,7 @@ async def reconectar(
 @router.delete(
     "/conexoes/{conexao_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("openbanking.write"), Depends(require_csrf)],
 )
 async def remover_conexao(
     conexao_id: UUID,

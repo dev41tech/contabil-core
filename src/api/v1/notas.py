@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.notas.service import NotaService
 from src.schemas.notas import (
@@ -30,7 +31,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> NotaService:
     return NotaService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=NotaFiscalListResponse)
+@router.get("", response_model=NotaFiscalListResponse, dependencies=[requer("notas.read")])
 async def listar_notas(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -67,7 +68,7 @@ async def listar_notas(
 
 # O GET unitário é a forma REST natural e viabiliza uma futura tela de detalhe
 # sem obrigar o cliente a localizar a nota dentro de uma página da listagem.
-@router.get("/{nota_id}", response_model=NotaFiscalResponse)
+@router.get("/{nota_id}", response_model=NotaFiscalResponse, dependencies=[requer("notas.read")])
 async def obter_nota(
     empresa_id: UUID,
     nota_id: UUID,
@@ -81,7 +82,7 @@ async def obter_nota(
     "",
     response_model=NotaFiscalResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("notas.write"), Depends(require_csrf)],
 )
 async def criar_nota(
     empresa_id: UUID,
@@ -95,7 +96,7 @@ async def criar_nota(
 @router.post(
     "/{nota_id}/associar",
     response_model=NotaFiscalResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("notas.write"), Depends(require_csrf)],
 )
 async def associar_transacao(
     empresa_id: UUID,
@@ -111,7 +112,7 @@ async def associar_transacao(
 @router.delete(
     "/{nota_id}/associar",
     response_model=NotaFiscalResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("notas.write"), Depends(require_csrf)],
 )
 async def desassociar_transacao(
     empresa_id: UUID,
@@ -126,7 +127,7 @@ async def desassociar_transacao(
 @router.post(
     "/{nota_id}/cancelar",
     response_model=NotaFiscalResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("notas.write"), Depends(require_csrf)],
 )
 async def cancelar_nota(
     empresa_id: UUID,
@@ -141,7 +142,7 @@ async def cancelar_nota(
     "/importar-xml",
     response_model=ImportXmlResponse,
     status_code=200,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("notas.write"), Depends(require_csrf)],
 )
 async def importar_xml_nota(
     empresa_id: UUID,

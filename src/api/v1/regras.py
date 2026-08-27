@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.regras.service import RegraService
 from src.schemas.regras import (
@@ -27,7 +28,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> RegraService:
     return RegraService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=RegraListResponse)
+@router.get("", response_model=RegraListResponse, dependencies=[requer("regras.read")])
 async def listar_regras(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -47,7 +48,7 @@ async def listar_regras(
 
 # Mesmo sem tela de detalhe hoje, o GET unitário preserva a forma REST natural
 # para edição/inspeção futura e tem custo de manutenção desprezível.
-@router.get("/{regra_id}", response_model=RegraResponse)
+@router.get("/{regra_id}", response_model=RegraResponse, dependencies=[requer("regras.read")])
 async def obter_regra(
     empresa_id: UUID,
     regra_id: UUID,
@@ -61,7 +62,7 @@ async def obter_regra(
     "",
     response_model=RegraResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("regras.write"), Depends(require_csrf)],
 )
 async def criar_regra(
     empresa_id: UUID,
@@ -75,7 +76,7 @@ async def criar_regra(
 @router.patch(
     "/{regra_id}",
     response_model=RegraResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("regras.write"), Depends(require_csrf)],
 )
 async def atualizar_regra(
     empresa_id: UUID,

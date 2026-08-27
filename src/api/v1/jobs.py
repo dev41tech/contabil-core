@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context
+from src.api.autorizacao import requer
 from src.db.models import Job, Permissao
 from src.db.session import get_db
 from src.schemas.jobs import JobListResponse, JobResponse
@@ -40,7 +41,7 @@ async def _tipos_permitidos(
     return permitidos
 
 
-@router.get("", response_model=JobListResponse)
+@router.get("", response_model=JobListResponse, dependencies=[requer("jobs.read")])
 async def listar_jobs(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -69,7 +70,7 @@ async def listar_jobs(
     return JobListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
-@router.get("/{job_id}", response_model=JobResponse)
+@router.get("/{job_id}", response_model=JobResponse, dependencies=[requer("jobs.read")])
 async def obter_job(
     empresa_id: UUID,
     job_id: UUID,
