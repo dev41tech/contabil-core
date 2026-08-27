@@ -396,3 +396,126 @@ async def test_asterisco_aceito_como_acesso_total(
     )
     assert r.status_code == 201
     assert r.json()["modulos"] == "*"
+
+
+# ── Rota × módulo concedível
+
+
+def test_todo_modulo_de_rota_e_concedivel_ou_admin():
+    """Módulo de rota tem de cair de um dos dois lados — nunca em nenhum.
+
+    O módulo da requisição é o primeiro segmento depois de
+    `/empresas/{empresa_id}/` (`get_company_context`). Se ele não estiver em
+    `MODULOS_VALIDOS`, a validação recusa concedê-lo e o administrador é
+    empurrado para o `"*"` — dar tudo — quando queria dar um módulo só.
+
+    Foi assim que `concilpro` e `aplicacoes_financeiras` passaram a existir
+    como rota sem nunca poderem ser concedidos isoladamente. Este teste é o que
+    impede a próxima rota de nascer com o mesmo buraco.
+    """
+    import re
+
+    from src.api.app import create_app
+    from src.schemas.permissoes import MODULOS_SOMENTE_ADMIN, MODULOS_VALIDOS
+
+    padrao = re.compile(r"/empresas/\{empresa_id\}/([^/]+)")
+    modulos = {
+        m.group(1).replace("-", "_")
+        for rota in create_app().routes
+        if (m := padrao.search(getattr(rota, "path", "")))
+    }
+    assert modulos, "nenhuma rota de empresa encontrada — o padrão mudou?"
+
+    orfaos = modulos - set(MODULOS_VALIDOS) - set(MODULOS_SOMENTE_ADMIN)
+    assert not orfaos, (
+        f"Módulos de rota que ninguém pode receber: {sorted(orfaos)}. "
+        f"Inclua em MODULOS_VALIDOS (se o contador pode ter) ou em "
+        f"MODULOS_SOMENTE_ADMIN (se a rota exige papel de admin)."
+    )
+
+
+def test_modulo_declarado_admin_tem_rota_que_exige_admin():
+    """A lista de só-admin não pode virar depósito do que se quer esconder.
+
+    Se um módulo está lá, alguma rota dele precisa mesmo exigir papel
+    administrativo — senão a exclusão da lista concedível vira acesso negado
+    sem motivo, e o contador fica sem um módulo que poderia ter.
+    """
+    from src.api.app import create_app
+    from src.schemas.permissoes import MODULOS_SOMENTE_ADMIN
+
+    def nomes_das_dependencias(dependant) -> set[str]:
+        """Percorre a árvore de dependências da rota.
+
+        Olhar só o corpo do endpoint não serve: em `permissoes` a exigência de
+        admin mora numa dependência intermediária (`_svc`), e em `auditoria`
+        vem de `get_admin_company_context`. A garantia está na árvore, não no
+        texto da função.
+        """
+        nomes = {getattr(dependant.call, "__name__", "")}
+        for sub in dependant.dependencies:
+            nomes |= nomes_das_dependencias(sub)
+        return nomes
+
+    app = create_app()
+    for modulo in MODULOS_SOMENTE_ADMIN:
+        prefixos = {
+            f"/empresas/{{empresa_id}}/{modulo}",
+            f"/empresas/{{empresa_id}}/{modulo.replace('_', '-')}",
+        }
+        rotas = [
+            r
+            for r in app.routes
+            if any(p in getattr(r, "path", "") for p in prefixos)
+            and getattr(r, "dependant", None) is not None
+        ]
+        assert rotas, f"{modulo} está em MODULOS_SOMENTE_ADMIN e não tem rota"
+        for rota in rotas:
+            nomes = nomes_das_dependencias(rota.dependant)
+            assert any("admin" in n for n in nomes), (
+                f"{rota.path} está sob o módulo {modulo}, declarado só-admin, "
+                f"mas nenhuma dependência exige papel administrativo: {sorted(nomes)}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_conceder_modulo_de_rota_que_nao_era_concedivel(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, contador: Usuario, empresa: Empresa
+):
+    """`concilpro` sozinho tem de ser concedível — sem obrigar o `"*"`.
+
+    Antes desta correção a validação recusava, e quem quisesse dar ConcilPro a
+    um contador precisava dar acesso total à empresa.
+    """
+    csrf = await _login(client, tenant, usuario)
+
+    resposta = await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "concilpro,aplicacoes_financeiras"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 201, resposta.text
+    assert resposta.json()["modulos"] == "aplicacoes_financeiras,concilpro"
+
+
+@pytest.mark.asyncio
+async def test_conceder_modulo_somente_admin_continua_recusado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, contador: Usuario, empresa: Empresa
+):
+    """`auditoria` não pode ser concedida: a rota exige admin de qualquer jeito.
+
+    Aceitar a concessão criaria a promessa de um acesso que o guard de papel
+    nega em seguida — o contador veria o módulo na tela e continuaria tomando
+    403.
+    """
+    csrf = await _login(client, tenant, usuario)
+
+    resposta = await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "auditoria"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 422
+
