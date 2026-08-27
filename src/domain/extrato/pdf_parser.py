@@ -19,17 +19,21 @@ Retorna lista de TransacaoOFX (compatível com OFX parser).
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 from src.core.config import get_settings
+from src.domain.extrato import bancos
+from src.domain.extrato._comum import Bloco
+from src.domain.extrato._comum import gerar_fitid as _gerar_fitid
+from src.domain.extrato._comum import parse_data as _parse_data
+from src.domain.extrato._comum import parse_valor as _parse_valor
 from src.domain.extrato.ofx_parser import TransacaoOFX
 
 logger = logging.getLogger(__name__)
@@ -79,56 +83,6 @@ _DATE_FULL_RE = re.compile(r"\b(\d{2})[/\-](\d{2})[/\-](\d{2,4})\b")
 _DATE_SHORT_RE = re.compile(r"\b(\d{2})[/\-](\d{2})\b")
 _SALDO_RE = re.compile(r"\bSALDO\b|\bBALANCE\b|\bTOTAL\b", re.IGNORECASE)
 _BARCODE_RE = re.compile(r"^\d{17,20}")   # código de barras / nosso número Bradesco
-
-
-def _parse_data(s: str, referencia_ano: int | None = None) -> date | None:
-    """Aceita DD/MM/AAAA, DD/MM/AA ou DD/MM (sem ano).
-
-    Devolve data de calendário: é literalmente o que está impresso na linha do
-    extrato, sem hora e sem fuso para um consumidor reinterpretar.
-    """
-    s = s.strip()
-    m = _DATE_FULL_RE.search(s)
-    if m:
-        d, mo, y = m.group(1), m.group(2), m.group(3)
-        if len(y) == 2:
-            y = "20" + y
-        try:
-            return date(int(y), int(mo), int(d))
-        except ValueError:
-            pass
-    m2 = _DATE_SHORT_RE.search(s)
-    if m2:
-        d, mo = m2.group(1), m2.group(2)
-        ano = referencia_ano or datetime.now(UTC).year
-        try:
-            return date(ano, int(mo), int(d))
-        except ValueError:
-            pass
-    return None
-
-
-def _parse_valor(s: str) -> Decimal | None:
-    s = s.strip().replace("R$", "").replace(" ", "").replace("\xa0", "")
-    negative = s.startswith("-") or s.startswith("(")
-    s = s.lstrip("-(").rstrip(")")
-    if re.match(r"^\d{1,3}(,\d{3})*\.\d{2}$", s):
-        val = Decimal(s.replace(",", ""))
-    elif "," in s and "." in s:
-        val = Decimal(s.replace(".", "").replace(",", "."))
-    elif "," in s:
-        val = Decimal(s.replace(",", "."))
-    else:
-        try:
-            val = Decimal(s)
-        except InvalidOperation:
-            return None
-    return -val if negative else val
-
-
-def _gerar_fitid(data: date, historico: str, valor: Decimal, idx: int) -> str:
-    raw = f"{data.isoformat()}{historico}{valor}{idx}"
-    return "PDF" + hashlib.md5(raw.encode()).hexdigest()[:12].upper()
 
 
 # ──────────────────────────────────────────────────────────── pdfplumber (extração)
@@ -199,6 +153,32 @@ def _extrair_linhas_pdfplumber(
             total_chars += len(text)
             all_lines.extend(text.splitlines())
     return all_lines, total_chars
+
+
+def _extrair_paginas_palavras(
+    conteudo_bytes: bytes, budget: _PDFBudget
+) -> list[list[dict]]:
+    """Palavras de cada página com suas coordenadas (`x0`, `x1`, `top`).
+
+    O `extract_text` entrega a página já achatada em linhas, na ordem de leitura
+    do PDF — que num layout de duas colunas mistura as duas. No Itaú isso põe a
+    legenda lateral ("A = agendamento", "B = ações movimentadas…") no meio dos
+    lançamentos, e nenhuma regex separa depois o que a extração já juntou.
+
+    Com a coordenada dá para descartar a coluna da legenda pelo `x0` e, mais
+    importante, para saber em QUE coluna um valor está — que no Itaú é o que
+    diz se ele é entrada ou saída.
+    """
+    paginas: list[list[dict]] = []
+    with pdfplumber.open(BytesIO(conteudo_bytes)) as pdf:
+        if not pdf.pages:
+            raise PDFParseError("PDF sem páginas.")
+        if len(pdf.pages) > budget.max_pages:
+            raise PDFParseError(f"PDF excede o limite de {budget.max_pages} páginas.")
+        for page in pdf.pages:
+            budget.verificar_tempo()
+            paginas.append(page.extract_words())
+    return paginas
 
 
 # ──────────────────────────────────────────────────────────── pdfplumber (regex parser)
@@ -543,12 +523,18 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
 
 # ──────────────────────────────────────────────────────────── entrypoint
 
-def parse_pdf(conteudo_bytes: bytes) -> list[TransacaoOFX]:
+def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[TransacaoOFX]:
     """Extrai transações de um PDF de extrato bancário.
 
-    Fluxo em três camadas (para-na-primeira-que-funcionar):
+    Fluxo em camadas (para-na-primeira-que-funcionar):
 
-      Camada 1 — pdfplumber + regex
+      Camada 0 — adaptador do banco
+        Escolhido por `banco_sigla` (que vem da agência cadastrada) ou pela
+        assinatura do layout. Determinístico e conferido pela cadeia de saldos
+        de cada bloco. É o único caminho que consegue reconstruir histórico
+        partido em várias linhas (Bradesco) ou data em cabeçalho (Inter).
+
+      Camada 1 — pdfplumber + regex genérico
         Grátis, instantâneo, determinístico.
         Funciona para bancos com layout mapeado (Bradesco X-One, etc.).
 
@@ -588,8 +574,40 @@ def parse_pdf(conteudo_bytes: bytes) -> list[TransacaoOFX]:
         if total_chars >= 50:
             logger.info("pdfplumber: %d chars extraídos", total_chars)
 
-            # ── Camada 1: regex ───────────────────────────────────────────────
             referencia_ano = datetime.now(UTC).year
+
+            # ── Camada 0: adaptador do banco ─────────────────────────────────
+            adaptador = bancos.escolher(banco_sigla, linhas)
+            if adaptador is not None:
+                if hasattr(adaptador, "extrair_de_palavras"):
+                    # Layout de duas colunas: precisa da coordenada, não do
+                    # texto já achatado. Custa uma segunda passada no PDF.
+                    paginas = _extrair_paginas_palavras(conteudo_bytes, budget)
+                    blocos = adaptador.extrair_de_palavras(paginas, referencia_ano)
+                else:
+                    blocos = adaptador.extrair(linhas, referencia_ano)
+                transacoes = [t for bloco in blocos for t in bloco.transacoes]
+                if transacoes:
+                    if not _validar_blocos(blocos, Decimal("0.05")):
+                        # Adaptador sem saldo por lançamento (Itaú imprime só em
+                        # algumas linhas): cai na conferência por totais.
+                        _validar_completude(linhas, transacoes)
+                    # `ordem` é a posição no ARQUIVO, não no bloco.
+                    transacoes = [
+                        replace(t, ordem=i) for i, t in enumerate(transacoes)
+                    ]
+                    logger.info(
+                        "PDF parser: %d transações via adaptador %s (camada 0)",
+                        len(transacoes), adaptador.__name__.rsplit(".", 1)[-1],
+                    )
+                    return transacoes
+                logger.info(
+                    "adaptador %s reconheceu o layout mas não extraiu lançamentos "
+                    "— seguindo para o parser genérico",
+                    adaptador.__name__.rsplit(".", 1)[-1],
+                )
+
+            # ── Camada 1: regex genérico ─────────────────────────────────────
             transacoes = _parse_linhas_multipagina(linhas, referencia_ano)
             if transacoes:
                 _validar_completude(linhas, transacoes)
@@ -684,6 +702,95 @@ def _validar_cadeia_de_saldos(
                 f"'{atual.historico[:60]}' é de {_fmt_reais(atual.valor)} — "
                 "há lançamento faltando ou com valor errado entre os dois."
             )
+    return True
+
+
+def _validar_blocos(blocos: list[Bloco], tolerancia: Decimal) -> bool:
+    """Confere a cadeia de saldos de cada bloco, por segmentos.
+
+    A cadeia só vale DENTRO de um bloco: entre um e outro o saldo reinicia por
+    construção, e conferir a emenda acusaria um salto que não é erro. Foi o que
+    reprovava o Bradesco inteiro — ele emite "Extrato" e "Últimos Lançamentos"
+    no mesmo arquivo, cada um com seu `SALDO ANTERIOR`.
+
+    A conferência é por SEGMENTO, não lançamento a lançamento: nem todo banco
+    imprime saldo em toda linha. O Itaú imprime em 17 das 91, e entre duas
+    linhas com saldo a soma dos valores no meio tem de dar exatamente a
+    diferença. Isso conserva a força da verificação (lançamento perdido no meio
+    do segmento desloca a soma) e deixa de exigir um saldo por linha, que era o
+    que tornava o Itaú inverificável.
+
+    As duas pontas vêm dos saldos impressos do bloco: `saldo_anterior` fecha o
+    primeiro segmento e `saldo_final` fecha a cauda. Sem a cauda coberta o bloco
+    é recusado — e é preciso: foi ali, nas seis linhas depois do último saldo,
+    que uma linha de rodapé do Itaú entrou como crédito de R$ 19.070,30.
+
+    Retorna True se todos os blocos puderam ser conferidos de ponta a ponta.
+    """
+    if not blocos:
+        return False
+
+    for bloco in blocos:
+        if not bloco.transacoes:
+            return False
+
+        ancora = bloco.saldo_anterior
+        acumulado = Decimal("0")
+        pendentes = 0
+        conferidos = 0
+        primeiro_segmento = True
+
+        for transacao in bloco.transacoes:
+            acumulado += transacao.valor
+            pendentes += 1
+            if transacao.saldo_apos is None:
+                continue
+            if ancora is not None:
+                movimento = transacao.saldo_apos - ancora
+                if abs(movimento - acumulado) > tolerancia:
+                    onde = (
+                        "há lançamento faltando no início do extrato."
+                        if primeiro_segmento and bloco.saldo_anterior is not None
+                        else "há lançamento faltando ou com valor errado entre os dois."
+                    )
+                    quantos = (
+                        f"{pendentes} lançamentos somam"
+                        if pendentes > 1
+                        else "o lançamento"
+                    )
+                    raise PDFParseError(
+                        "Extração incompleta: o saldo do extrato não caminha com "
+                        f"os lançamentos. Depois de {_fmt_reais(ancora)} o saldo "
+                        f"vai para {_fmt_reais(transacao.saldo_apos)}, uma variação "
+                        f"de {_fmt_reais(movimento)}, mas {quantos} "
+                        f"{_fmt_reais(acumulado)} até "
+                        f"'{transacao.historico[:60]}' — {onde}"
+                    )
+                conferidos += 1
+                primeiro_segmento = False
+            ancora = transacao.saldo_apos
+            acumulado = Decimal("0")
+            pendentes = 0
+
+        if bloco.saldo_final is not None and ancora is not None:
+            movimento = bloco.saldo_final - ancora
+            if abs(movimento - acumulado) > tolerancia:
+                raise PDFParseError(
+                    "Extração incompleta: os últimos lançamentos não fecham com o "
+                    f"saldo final impresso. De {_fmt_reais(ancora)} para "
+                    f"{_fmt_reais(bloco.saldo_final)} há uma variação de "
+                    f"{_fmt_reais(movimento)}, mas os lançamentos do trecho somam "
+                    f"{_fmt_reais(acumulado)} — há lançamento sobrando ou faltando "
+                    "no fim do extrato."
+                )
+            conferidos += 1
+            pendentes = 0
+
+        if conferidos == 0 or pendentes > 0:
+            # Cadeia inexistente, ou uma cauda que ninguém conferiu: não
+            # alegamos validação e deixamos a conferência por totais decidir.
+            return False
+
     return True
 
 

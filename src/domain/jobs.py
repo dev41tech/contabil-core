@@ -204,10 +204,16 @@ async def _importar_extrato(db: AsyncSession, empresa_id: UUID, agencia_id: UUID
         from src.core.config import get_settings
         from src.core.errors import ValidationError
         from src.domain.extrato.pdf_parser import PDFParseError, parse_pdf
+        # O banco vem da agência cadastrada, não do arquivo: quem escolhe o
+        # adaptador de layout é o cadastro, e o PDF só confirma. Agência sem
+        # sigla preenchida cai na detecção por conteúdo, dentro do parser.
+        agencia = await svc._get_agencia_or_400(agencia_id)
         try:
             timeout = get_settings().pdf_parse_timeout_seconds + 5
-            transacoes = await asyncio.wait_for(run_in_threadpool(parse_pdf, conteudo_bytes),
-                                                timeout=timeout)
+            transacoes = await asyncio.wait_for(
+                run_in_threadpool(parse_pdf, conteudo_bytes, agencia.banco_sigla),
+                timeout=timeout,
+            )
         except TimeoutError:
             raise ValidationError(message="Processamento do PDF excedeu o tempo limite.") from None
         except PDFParseError as exc:

@@ -96,7 +96,15 @@ class Settings(BaseSettings):
     max_upload_mb: int = 25
 
     # PDF bancário: processamento síncrono pesado e, opcionalmente, envio a IA.
-    pdf_max_pages: int = 25
+    #
+    # O teto era 25 páginas e recusava três bancos que o parser lê corretamente:
+    # BBC (31 páginas), Sicoob (26) e Transpocred (48, um extrato do ano
+    # inteiro). Medido nesses três, o caminho determinístico gasta 0,5s, 2,1s e
+    # 8,4s — folga larga dentro do `pdf_parse_timeout_seconds`, que continua
+    # sendo o limite que importa para o custo. O caminho de IA segue contido
+    # por `pdf_max_ai_calls`, então um PDF de imagem com 120 páginas para nas 10
+    # chamadas e não vira conta grande.
+    pdf_max_pages: int = 120
     pdf_parse_timeout_seconds: int = 60
     pdf_max_ai_calls: int = 10
     allow_financial_data_to_openai: bool = False
