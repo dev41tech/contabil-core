@@ -63,6 +63,7 @@ class PermissaoService:
                 usuario_id=p.usuario_id,
                 empresa_id=p.empresa_id,
                 modulos=p.modulos,
+                papel=p.papel,
                 usuario_nome=u.nome,
                 usuario_email=u.email,
                 usuario_role=u.role,
@@ -94,6 +95,7 @@ class PermissaoService:
             usuario_id=data.usuario_id,
             empresa_id=self._empresa_id,
             modulos=data.modulos,
+            papel=data.papel,
         )
         self._db.add(p)
         await self._db.flush()
@@ -112,11 +114,13 @@ class PermissaoService:
             usuario_id=str(data.usuario_id),
             empresa_id=str(self._empresa_id),
             modulos=data.modulos,
+            papel=data.papel,
         )
         return PermissaoResponse(
             usuario_id=p.usuario_id,
             empresa_id=p.empresa_id,
             modulos=p.modulos,
+            papel=p.papel,
             usuario_nome=usuario.nome,
             usuario_email=usuario.email,
             usuario_role=usuario.role,
@@ -129,6 +133,7 @@ class PermissaoService:
         p, usuario = await self._get_or_404(usuario_id)
         antes = _snapshot_permissao(p)
         p.modulos = data.modulos
+        p.papel = data.papel
         await self._db.flush()
         await registrar_auditoria(
             self._db,
@@ -146,11 +151,13 @@ class PermissaoService:
             usuario_id=str(usuario_id),
             empresa_id=str(self._empresa_id),
             modulos=data.modulos,
+            papel=data.papel,
         )
         return PermissaoResponse(
             usuario_id=p.usuario_id,
             empresa_id=p.empresa_id,
             modulos=p.modulos,
+            papel=p.papel,
             usuario_nome=usuario.nome,
             usuario_email=usuario.email,
             usuario_role=usuario.role,
@@ -237,4 +244,5 @@ def _snapshot_permissao(permissao: Permissao) -> dict[str, object]:
         "usuario_id": permissao.usuario_id,
         "empresa_id": permissao.empresa_id,
         "modulos": permissao.modulos,
+        "papel": permissao.papel,
     }

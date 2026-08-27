@@ -14,6 +14,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -182,7 +183,17 @@ class Empresa(Base, TimestampMixin):
 
 
 class Permissao(Base):
-    """Acesso de um usuário a uma empresa específica."""
+    """Acesso de um usuário a uma empresa específica — a membership.
+
+    Duas dimensões, e elas não se substituem:
+
+    `modulos`  ONDE a pessoa entra — "extrato,regras", ou "*" para tudo
+    `papel`    O QUANTO ela faz lá dentro — ver `PAPEIS` em `src.core.permissoes`
+
+    O efetivo é a interseção. Um `contador` com `modulos="extrato"` executa
+    importação de extrato e não enxerga o NEO; um `leitura` com `"*"` abre
+    todas as telas e não grava em nenhuma.
+    """
 
     __tablename__ = "permissoes"
 
@@ -190,9 +201,22 @@ class Permissao(Base):
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), primary_key=True)
     modulos: Mapped[str] = mapped_column(String(500), default="*", nullable=False)
     # "*" = acesso total | "extrato,regras" = módulos específicos
+    # `String` + CHECK, e não enum nomeado: acrescentar um papel depois é uma
+    # linha na constraint, contra um `ALTER TYPE` — e enum neste projeto já
+    # custou um endpoint quebrado (ver DC_ENUM acima).
+    # Sem `server_default`: a 0032 remove o default do schema depois do
+    # backfill, justamente para ninguém inserir permissão sem dizer o papel.
+    # O default aqui é do ORM, e vale para quem cria pelo código.
+    papel: Mapped[str] = mapped_column(String(20), nullable=False, default="contador")
 
     usuario: Mapped[Usuario] = relationship("Usuario", back_populates="permissoes")
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="permissoes")
+
+    __table_args__ = (
+        CheckConstraint(
+            "papel IN ('dono', 'contador', 'leitura')", name="ck_permissao_papel"
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────── Plano de Contas

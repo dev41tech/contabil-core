@@ -644,3 +644,228 @@ async def test_admin_nao_reseta_senha_de_outro_escritorio(
     )
 
     assert r.status_code == 404
+
+
+# ── Papel: módulo diz ONDE, papel diz O QUANTO
+
+
+async def _contador_com(db, tenant, empresa, email: str, modulos: str, papel: str):
+    """Cria um usuário não-admin com módulos e papel nesta empresa."""
+    from src.core.security import hash_password
+    from src.db.models import Permissao as PermissaoModel
+    from src.db.models import Usuario
+
+    u = Usuario(
+        tenant_id=tenant.id,
+        email=email,
+        nome=f"Usuario {papel}",
+        senha_hash=hash_password("senha_segura_123"),
+        role="contador",
+    )
+    db.add(u)
+    await db.flush()
+    db.add(
+        PermissaoModel(
+            usuario_id=u.id,
+            empresa_id=empresa.id,
+            modulos=modulos,
+            papel=papel,
+        )
+    )
+    await db.flush()
+    return u
+
+
+async def _entrar(client, tenant, usuario) -> str:
+    r = await client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(tenant.id),
+            "email": usuario.email,
+            "senha": "senha_segura_123",
+        },
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["csrf_token"]
+
+
+@pytest.mark.asyncio
+async def test_leitura_consulta_mas_nao_executa(client, db, tenant, empresa):
+    """O papel `leitura` abre a tela e não mexe em nada.
+
+    Antes desta entrega isso era impossível de expressar: ter o módulo `neo`
+    era poder processar o NEO.
+    """
+    u = await _contador_com(db, tenant, empresa, "so.leitura@41.com.br", "*", "leitura")
+    csrf = await _entrar(client, tenant, u)
+
+    consulta = await client.get(f"/api/v1/empresas/{empresa.id}/neo/pendencias")
+    assert consulta.status_code == 200
+
+    executa = await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/processar",
+        json={},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert executa.status_code == 403
+    assert "leitura" in executa.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_contador_executa_mas_nao_reestrutura(client, db, tenant, empresa):
+    """`contador` opera; exclusão estrutural e importação em massa são `manage`."""
+    u = await _contador_com(db, tenant, empresa, "opera@41.com.br", "*", "contador")
+    csrf = await _entrar(client, tenant, u)
+
+    executa = await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/processar",
+        json={},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert executa.status_code == 202, executa.text
+
+    estrutural = await client.post(
+        f"/api/v1/empresas/{empresa.id}/plano-contas/excluir-lote",
+        json={"contas_ids": []},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert estrutural.status_code == 403
+    assert "manage" in estrutural.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_dono_reestrutura(client, db, tenant, empresa):
+    """`dono` faz tudo nos módulos que tem — é o papel do backfill da 0032."""
+    u = await _contador_com(db, tenant, empresa, "dono@41.com.br", "*", "dono")
+    csrf = await _entrar(client, tenant, u)
+
+    estrutural = await client.post(
+        f"/api/v1/empresas/{empresa.id}/plano-contas/excluir-lote",
+        json={"contas_ids": []},
+        headers={"X-CSRF-Token": csrf},
+    )
+    # Passa pela autorização; o que vier depois é validação de payload.
+    assert estrutural.status_code != 403
+
+
+@pytest.mark.asyncio
+async def test_modulo_continua_limitando_mesmo_o_dono(client, db, tenant, empresa):
+    """As duas dimensões se compõem: papel alto não amplia o alcance.
+
+    Um `dono` restrito a `extrato` não enxerga o NEO. Sem isto, mudar o papel
+    de alguém viraria uma forma acidental de dar acesso a módulo novo.
+    """
+    u = await _contador_com(
+        db, tenant, empresa, "dono.restrito@41.com.br", "extrato", "dono"
+    )
+    await _entrar(client, tenant, u)
+
+    assert (
+        await client.get(f"/api/v1/empresas/{empresa.id}/extrato")
+    ).status_code == 200
+    assert (
+        await client.get(f"/api/v1/empresas/{empresa.id}/neo/pendencias")
+    ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_do_escritorio_passa_por_todas_as_acoes(
+    client, db, tenant, usuario, empresa
+):
+    """Admin não tem papel de empresa e continua passando — como sempre foi."""
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/plano-contas/excluir-lote",
+        json={"contas_ids": []},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code != 403
+
+
+@pytest.mark.asyncio
+async def test_conceder_registra_o_papel_e_devolve_na_resposta(
+    client, tenant, usuario, contador, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "extrato", "papel": "leitura"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 201, r.text
+    assert r.json()["papel"] == "leitura"
+
+    listagem = (await client.get(_url(empresa.id))).json()
+    assert listagem["items"][0]["papel"] == "leitura"
+
+
+@pytest.mark.asyncio
+async def test_concessao_sem_papel_nasce_contador(
+    client, tenant, usuario, contador, empresa
+):
+    """O padrão é o papel operacional, não o total.
+
+    Quem precisa reestruturar plano de contas recebe `dono` explicitamente —
+    conceder demais por omissão é como se perde o controle de acesso.
+    """
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "*"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 201
+    assert r.json()["papel"] == "contador"
+
+
+@pytest.mark.asyncio
+async def test_papel_invalido_recusado(client, tenant, usuario, contador, empresa):
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "*", "papel": "chefe"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_troca_de_papel_fica_na_auditoria(
+    client, db, tenant, usuario, contador, empresa
+):
+    """Mudar o papel de alguém é mudança de acesso — tem de deixar rastro."""
+    import json
+
+    from sqlalchemy import select
+
+    from src.db.models import AuditLog
+
+    csrf = await _login(client, tenant, usuario)
+    await client.post(
+        _url(empresa.id),
+        json={"usuario_id": str(contador.id), "modulos": "*", "papel": "leitura"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    await client.patch(
+        _url(empresa.id, f"/{contador.id}"),
+        json={"modulos": "*", "papel": "dono"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    log = (
+        await db.execute(
+            select(AuditLog).where(AuditLog.acao == "permissao.atualizada")
+        )
+    ).scalars().first()
+
+    assert log is not None
+    # A coluna é `Text` com JSON dentro — o serviço serializa na escrita.
+    assert json.loads(log.dados_antes)["papel"] == "leitura"
+    assert json.loads(log.dados_depois)["papel"] == "dono"

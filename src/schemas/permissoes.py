@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from src.core.permissoes import PAPEIS, PAPEL_PADRAO
+
 # Módulos que um contador pode receber. O nome é o primeiro segmento da URL
 # depois de `/empresas/{id}/`, com hífen virando underscore — é assim que
 # `get_company_context` resolve o módulo da requisição.
@@ -53,6 +55,15 @@ MODULOS_SOMENTE_ADMIN = frozenset(["auditoria", "permissoes"])
 
 class PermissaoCreate(BaseModel):
     usuario_id: UUID
+    papel: str = Field(
+        default=PAPEL_PADRAO,
+        description=(
+            f"Papel na empresa: {', '.join(sorted(PAPEIS))}. "
+            "Módulo diz ONDE a pessoa entra; papel diz O QUANTO ela faz lá "
+            "dentro. O padrão é 'contador' — quem precisa reestruturar plano "
+            "de contas ou importar em massa recebe 'dono' explicitamente."
+        ),
+    )
     modulos: str = Field(
         default="*",
         description=(
@@ -61,6 +72,14 @@ class PermissaoCreate(BaseModel):
             "extrato, jobs, neo, notas, openbanking, plano_contas, regras, relatorios, stats"
         ),
     )
+
+    @field_validator("papel")
+    @classmethod
+    def valida_papel(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in PAPEIS:
+            raise ValueError(f"Papel inválido: {v!r}. Opções: {sorted(PAPEIS)}")
+        return v
 
     @field_validator("modulos")
     @classmethod
@@ -80,6 +99,12 @@ class PermissaoCreate(BaseModel):
 
 class PermissaoUpdate(BaseModel):
     modulos: str = Field(default="*")
+    papel: str = Field(default=PAPEL_PADRAO)
+
+    @field_validator("papel")
+    @classmethod
+    def valida_papel(cls, v: str) -> str:
+        return PermissaoCreate.valida_papel(v)
 
     @field_validator("modulos")
     @classmethod
@@ -91,6 +116,7 @@ class PermissaoResponse(BaseModel):
     usuario_id: UUID
     empresa_id: UUID
     modulos: str
+    papel: str
     # Dados expandidos do usuário
     usuario_nome: str | None = None
     usuario_email: str | None = None

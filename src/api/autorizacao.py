@@ -37,7 +37,7 @@ from fastapi import Depends, params
 
 from src.api.deps import AuthContext, get_company_context
 from src.core.errors import ForbiddenError
-from src.core.permissoes import Permissao, permissao
+from src.core.permissoes import Permissao, papel_permite, permissao
 
 logger = structlog.get_logger(__name__)
 
@@ -69,18 +69,35 @@ def requer(codigo: str) -> params.Depends:
             # caminho já rodou.
             return ctx
 
-        if "*" in modulos or exigida.recurso in modulos:
-            return ctx
+        # ONDE: o módulo precisa estar na lista do usuário.
+        if "*" not in modulos and exigida.recurso not in modulos:
+            logger.info(
+                "autorizacao.negada",
+                motivo="modulo",
+                permissao=exigida.codigo,
+                user_id=str(ctx.user_id),
+            )
+            raise ForbiddenError(
+                message=f"Sem acesso a {exigida.recurso} nesta empresa."
+            )
 
-        logger.info(
-            "autorizacao.negada",
-            permissao=exigida.codigo,
-            recurso=exigida.recurso,
-            user_id=str(ctx.user_id),
-        )
-        raise ForbiddenError(
-            message=f"Sem permissão para {exigida.recurso} nesta empresa."
-        )
+        # O QUANTO: o papel precisa permitir a ação.
+        if not papel_permite(ctx.papel, exigida):
+            logger.info(
+                "autorizacao.negada",
+                motivo="papel",
+                permissao=exigida.codigo,
+                papel=ctx.papel,
+                user_id=str(ctx.user_id),
+            )
+            raise ForbiddenError(
+                message=(
+                    f"O papel '{ctx.papel}' não permite {exigida.acao} "
+                    f"em {exigida.recurso}."
+                )
+            )
+
+        return ctx
 
     setattr(verificar_permissao, ATRIBUTO_PERMISSAO, exigida)
     return Depends(verificar_permissao)
