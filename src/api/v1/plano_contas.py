@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.plano_contas.service import PlanoContaService
 from src.schemas.plano_contas import (
@@ -48,7 +49,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> PlanoContaService:
     return PlanoContaService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=PlanoContaListResponse)
+@router.get("", response_model=PlanoContaListResponse, dependencies=[requer("plano_contas.read")])
 async def listar_contas(
     empresa_id: UUID,
     ctx: AuthContext = Depends(get_company_context),
@@ -60,7 +61,7 @@ async def listar_contas(
 
 # A árvore e o GET unitário são representações naturais do recurso e serão úteis
 # assim que houver navegação hierárquica/detalhe, mesmo sem consumidor hoje.
-@router.get("/arvore", response_model=PlanoContaTreeResponse)
+@router.get("/arvore", response_model=PlanoContaTreeResponse, dependencies=[requer("plano_contas.read")])
 async def arvore_contas(
     empresa_id: UUID,
     ctx: AuthContext = Depends(get_company_context),
@@ -70,7 +71,7 @@ async def arvore_contas(
     return await _svc(empresa_id, db).arvore()
 
 
-@router.get("/faixas-tipo", response_model=FaixasTipoListResponse)
+@router.get("/faixas-tipo", response_model=FaixasTipoListResponse, dependencies=[requer("plano_contas.read")])
 async def listar_faixas_tipo(
     empresa_id: UUID,
     ctx: AuthContext = Depends(get_company_context),
@@ -83,7 +84,7 @@ async def listar_faixas_tipo(
 @router.put(
     "/faixas-tipo",
     response_model=FaixasTipoListResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.write"), Depends(require_csrf)],
 )
 async def salvar_faixas_tipo(
     empresa_id: UUID,
@@ -99,7 +100,7 @@ async def salvar_faixas_tipo(
     return await _svc(empresa_id, db).salvar_faixas_tipo(body.faixas)
 
 
-@router.get("/{conta_id}", response_model=PlanoContaResponse)
+@router.get("/{conta_id}", response_model=PlanoContaResponse, dependencies=[requer("plano_contas.read")])
 async def obter_conta(
     empresa_id: UUID,
     conta_id: UUID,
@@ -113,7 +114,7 @@ async def obter_conta(
     "",
     response_model=PlanoContaResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.write"), Depends(require_csrf)],
 )
 async def criar_conta(
     empresa_id: UUID,
@@ -128,7 +129,7 @@ async def criar_conta(
 @router.patch(
     "/{conta_id}",
     response_model=PlanoContaResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.write"), Depends(require_csrf)],
 )
 async def atualizar_conta(
     empresa_id: UUID,
@@ -144,7 +145,7 @@ async def atualizar_conta(
 @router.delete(
     "/{conta_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.manage"), Depends(require_csrf)],
 )
 async def remover_conta(
     empresa_id: UUID,
@@ -160,7 +161,7 @@ async def remover_conta(
     "/excluir-lote",
     response_model=PlanoContaExclusaoLoteResultado,
     status_code=200,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.manage"), Depends(require_csrf)],
 )
 async def excluir_contas_em_lote(
     empresa_id: UUID,
@@ -181,7 +182,7 @@ async def excluir_contas_em_lote(
     "/importar",
     response_model=ImportacaoPlanoResult,
     status_code=200,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("plano_contas.manage"), Depends(require_csrf)],
 )
 async def importar_plano_contas(
     empresa_id: UUID,

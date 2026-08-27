@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_admin_company_context
+from src.api.autorizacao import requer
 from src.core.errors import ValidationError
 from src.db.session import get_db
 from src.domain.auditoria import listar_auditoria
@@ -21,7 +22,7 @@ router = APIRouter(
 )
 
 
-@router.get("", response_model=AuditoriaListResponse)
+@router.get("", response_model=AuditoriaListResponse, dependencies=[requer("auditoria.read")])
 async def consultar_auditoria(
     empresa_id: UUID,
     usuario_id: UUID | None = Query(default=None),

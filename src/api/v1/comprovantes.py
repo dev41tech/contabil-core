@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.api.autorizacao import requer
 from src.core.errors import NotFoundError
 from src.db.session import get_db
 from src.domain.comprovantes.service import ComprovanteService
@@ -33,7 +34,7 @@ def _svc(empresa_id: UUID, db: AsyncSession) -> ComprovanteService:
     return ComprovanteService(db=db, empresa_id=empresa_id)
 
 
-@router.get("", response_model=ComprovanteListResponse)
+@router.get("", response_model=ComprovanteListResponse, dependencies=[requer("comprovantes.read")])
 async def listar_comprovantes(
     empresa_id: UUID,
     page: int = Query(default=1, ge=1),
@@ -55,7 +56,7 @@ async def listar_comprovantes(
 
 # O GET unitário é a forma REST natural e prepara a futura tela de detalhe; seu
 # baixo custo não justifica acoplar a API às telas existentes neste momento.
-@router.get("/{comprovante_id}", response_model=ComprovanteResponse)
+@router.get("/{comprovante_id}", response_model=ComprovanteResponse, dependencies=[requer("comprovantes.read")])
 async def obter_comprovante(
     empresa_id: UUID,
     comprovante_id: UUID,
@@ -69,7 +70,7 @@ async def obter_comprovante(
     "",
     response_model=ComprovanteResponse,
     status_code=201,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("comprovantes.write"), Depends(require_csrf)],
 )
 async def criar_comprovante(
     empresa_id: UUID,
@@ -83,7 +84,7 @@ async def criar_comprovante(
 @router.post(
     "/extrair-pdf",
     response_model=ComprovanteExtracaoResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("comprovantes.read"), Depends(require_csrf)],
 )
 async def extrair_dados_pdf(
     empresa_id: UUID,
@@ -161,7 +162,7 @@ async def extrair_dados_pdf(
 @router.post(
     "/{comprovante_id}/associar",
     response_model=ComprovanteResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("comprovantes.write"), Depends(require_csrf)],
 )
 async def associar_transacao(
     empresa_id: UUID,
@@ -177,7 +178,7 @@ async def associar_transacao(
 @router.delete(
     "/{comprovante_id}/associar",
     response_model=ComprovanteResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("comprovantes.write"), Depends(require_csrf)],
 )
 async def desassociar_transacao(
     empresa_id: UUID,
@@ -192,7 +193,7 @@ async def desassociar_transacao(
 @router.delete(
     "/{comprovante_id}",
     status_code=204,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("comprovantes.write"), Depends(require_csrf)],
 )
 async def deletar_comprovante(
     empresa_id: UUID,
@@ -203,7 +204,7 @@ async def deletar_comprovante(
     await _svc(empresa_id, db).deletar(comprovante_id)
 
 
-@router.get("/{comprovante_id}/arquivo")
+@router.get("/{comprovante_id}/arquivo", dependencies=[requer("comprovantes.read")])
 async def obter_arquivo(
     empresa_id: UUID,
     comprovante_id: UUID,

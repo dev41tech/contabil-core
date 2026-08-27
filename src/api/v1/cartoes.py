@@ -11,6 +11,7 @@ from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.cartoes.service import CartaoService
 from src.schemas.cartoes import (
@@ -46,7 +47,7 @@ def _svc(
 
 # ── Cartões ───────────────────────────────────────────────────────────────────
 
-@router.get("", response_model=CartaoListResponse)
+@router.get("", response_model=CartaoListResponse, dependencies=[requer("cartoes.read")])
 async def listar_cartoes(
     svc: CartaoService = Depends(_svc),
 ) -> CartaoListResponse:
@@ -54,7 +55,7 @@ async def listar_cartoes(
 
 
 @router.post("", response_model=CartaoResponse, status_code=201,
-             dependencies=[Depends(require_csrf)])
+             dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def criar_cartao(
     body: CartaoCreate,
     svc: CartaoService = Depends(_svc),
@@ -63,7 +64,7 @@ async def criar_cartao(
 
 
 @router.patch("/{cartao_id}", response_model=CartaoResponse,
-              dependencies=[Depends(require_csrf)])
+              dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def atualizar_cartao(
     cartao_id: UUID,
     body: CartaoUpdate,
@@ -72,7 +73,7 @@ async def atualizar_cartao(
     return await svc.atualizar_cartao(cartao_id, body)
 
 
-@router.delete("/{cartao_id}", status_code=204, dependencies=[Depends(require_csrf)])
+@router.delete("/{cartao_id}", status_code=204, dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def remover_cartao(
     cartao_id: UUID,
     svc: CartaoService = Depends(_svc),
@@ -82,7 +83,7 @@ async def remover_cartao(
 
 # ── Faturas ───────────────────────────────────────────────────────────────────
 
-@router.get("/{cartao_id}/faturas", response_model=FaturaListResponse)
+@router.get("/{cartao_id}/faturas", response_model=FaturaListResponse, dependencies=[requer("cartoes.read")])
 async def listar_faturas(
     cartao_id: UUID,
     svc: CartaoService = Depends(_svc),
@@ -91,7 +92,7 @@ async def listar_faturas(
 
 
 @router.post("/{cartao_id}/faturas", response_model=FaturaResponse, status_code=201,
-             dependencies=[Depends(require_csrf)])
+             dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def criar_fatura(
     cartao_id: UUID,
     body: FaturaCreate,
@@ -101,7 +102,7 @@ async def criar_fatura(
 
 
 @router.patch("/{cartao_id}/faturas/{fatura_id}", response_model=FaturaResponse,
-              dependencies=[Depends(require_csrf)])
+              dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def atualizar_fatura(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -112,7 +113,7 @@ async def atualizar_fatura(
 
 
 @router.post("/{cartao_id}/faturas/{fatura_id}/associar-transacao",
-             response_model=FaturaResponse, dependencies=[Depends(require_csrf)])
+             response_model=FaturaResponse, dependencies=[requer("cartoes.execute"), Depends(require_csrf)])
 async def associar_transacao(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -124,7 +125,7 @@ async def associar_transacao(
 
 
 @router.delete("/{cartao_id}/faturas/{fatura_id}/associar-transacao",
-               response_model=FaturaResponse, dependencies=[Depends(require_csrf)])
+               response_model=FaturaResponse, dependencies=[requer("cartoes.execute"), Depends(require_csrf)])
 async def desassociar_transacao(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -137,7 +138,9 @@ async def desassociar_transacao(
 # ── Lançamentos ───────────────────────────────────────────────────────────────
 
 @router.get("/{cartao_id}/faturas/{fatura_id}/lancamentos",
-            response_model=LancamentoListResponse)
+            response_model=LancamentoListResponse,
+    dependencies=[requer("cartoes.read")],
+)
 async def listar_lancamentos(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -148,7 +151,7 @@ async def listar_lancamentos(
 
 @router.post("/{cartao_id}/faturas/{fatura_id}/lancamentos",
              response_model=LancamentoResponse, status_code=201,
-             dependencies=[Depends(require_csrf)])
+             dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def adicionar_lancamento(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -159,7 +162,7 @@ async def adicionar_lancamento(
 
 
 @router.post("/{cartao_id}/faturas/{fatura_id}/lancamentos/importar-csv",
-             response_model=ImportCSVResponse, dependencies=[Depends(require_csrf)])
+             response_model=ImportCSVResponse, dependencies=[requer("cartoes.execute"), Depends(require_csrf)])
 async def importar_csv(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -172,7 +175,7 @@ async def importar_csv(
 
 
 @router.post("/{cartao_id}/faturas/{fatura_id}/lancamentos/importar-pdf",
-             response_model=ImportCSVResponse, dependencies=[Depends(require_csrf)])
+             response_model=ImportCSVResponse, dependencies=[requer("cartoes.execute"), Depends(require_csrf)])
 async def importar_pdf(
     cartao_id: UUID,
     fatura_id: UUID,
@@ -206,7 +209,7 @@ async def importar_pdf(
 
 
 @router.delete("/{cartao_id}/faturas/{fatura_id}/lancamentos/{lancamento_id}",
-               status_code=204, dependencies=[Depends(require_csrf)])
+               status_code=204, dependencies=[requer("cartoes.write"), Depends(require_csrf)])
 async def remover_lancamento(
     cartao_id: UUID,
     fatura_id: UUID,

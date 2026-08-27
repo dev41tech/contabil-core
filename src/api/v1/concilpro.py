@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_company_context, require_csrf
 from src.api.uploads import ler_upload_limitado
+from src.api.autorizacao import requer
 from src.core.errors import AppError
 from src.db.models import (
     CpArquivo as ArquivoImportado,
@@ -318,7 +319,7 @@ def _processar_arquivo_background(arquivo_id: int, empresa_id: UUID, conteudo: b
 # UPLOAD E PROCESSAMENTO
 # ============================================================================
 
-@router.post("/upload", dependencies=[Depends(require_csrf)])
+@router.post("/upload", dependencies=[requer("concilpro.execute"), Depends(require_csrf)])
 async def upload_arquivo(
     background_tasks: BackgroundTasks,
     empresa_id: UUID,
@@ -485,7 +486,7 @@ async def upload_arquivo(
 # CONSULTAS
 # ============================================================================
 
-@router.get("/arquivos/{arquivo_id}/status")
+@router.get("/arquivos/{arquivo_id}/status", dependencies=[requer("concilpro.read")])
 async def status_arquivo(
     empresa_id: UUID,
     arquivo_id: int,
@@ -510,7 +511,7 @@ async def status_arquivo(
     }
 
 
-@router.get("/arquivos")
+@router.get("/arquivos", dependencies=[requer("concilpro.read")])
 async def listar_arquivos(empresa_id: UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(ArquivoImportado)
@@ -533,7 +534,7 @@ async def listar_arquivos(empresa_id: UUID, db: AsyncSession = Depends(get_db)):
     ]
 
 
-@router.get("/resumo/{arquivo_id}")
+@router.get("/resumo/{arquivo_id}", dependencies=[requer("concilpro.read")])
 async def obter_resumo(
     empresa_id: UUID,
     arquivo_id: int,
@@ -580,7 +581,7 @@ async def obter_resumo(
     }
 
 
-@router.get("/fornecedores")
+@router.get("/fornecedores", dependencies=[requer("concilpro.read")])
 async def listar_fornecedores(
     empresa_id: UUID,
     arquivo_id: int,
@@ -621,7 +622,7 @@ async def listar_fornecedores(
     ]
 
 
-@router.get("/fornecedores/{fornecedor_id}")
+@router.get("/fornecedores/{fornecedor_id}", dependencies=[requer("concilpro.read")])
 async def obter_fornecedor_detalhado(
     empresa_id: UUID,
     fornecedor_id: int,
@@ -697,7 +698,7 @@ async def obter_fornecedor_detalhado(
     }
 
 
-@router.get("/fornecedores/{fornecedor_id}/conciliacao-fifo")
+@router.get("/fornecedores/{fornecedor_id}/conciliacao-fifo", dependencies=[requer("concilpro.read")])
 async def conciliacao_fifo_detalhada(
     empresa_id: UUID,
     fornecedor_id: int,
@@ -773,7 +774,7 @@ async def conciliacao_fifo_detalhada(
     return {"conciliacao": result}
 
 
-@router.get("/divergencias")
+@router.get("/divergencias", dependencies=[requer("concilpro.read")])
 async def listar_divergencias(
     empresa_id: UUID,
     arquivo_id: int,
@@ -808,7 +809,7 @@ async def listar_divergencias(
 # EXPORT
 # ============================================================================
 
-@router.get("/export/excel/{arquivo_id}")
+@router.get("/export/excel/{arquivo_id}", dependencies=[requer("concilpro.read")])
 async def exportar_excel(
     empresa_id: UUID,
     arquivo_id: int,
@@ -884,7 +885,7 @@ async def exportar_excel(
     )
 
 
-@router.get("/export/lancamentos/{arquivo_id}")
+@router.get("/export/lancamentos/{arquivo_id}", dependencies=[requer("concilpro.read")])
 async def exportar_lancamentos_importacao(
     empresa_id: UUID,
     arquivo_id: int,

@@ -9,6 +9,7 @@ from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context, require_csrf
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.exportacao.service import ExportacaoService
 from src.schemas.contabil import ExportJobCreate
@@ -29,7 +30,7 @@ _EXTENSIONS = {"csv": "csv", "xlsx": "xlsx", "txt": "txt"}
 
 @router.post(
     "/gerar",
-    dependencies=[Depends(require_csrf)],
+    dependencies=[requer("exportacao.execute"), Depends(require_csrf)],
 )
 async def gerar_exportacao(
     empresa_id: UUID,

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AuthContext, get_company_context
+from src.api.autorizacao import requer
 from src.db.session import get_db
 from src.domain.relatorios.service import RelatoriosService
 from src.schemas.relatorios import BalanceteResponse, DREResponse, LivroCaixaResponse
@@ -27,7 +28,7 @@ def _svc(
     return RelatoriosService(db=db, empresa_id=empresa_id)
 
 
-@router.get("/dre", response_model=DREResponse)
+@router.get("/dre", response_model=DREResponse, dependencies=[requer("relatorios.read")])
 async def dre(
     data_de: datetime | None = Query(default=None, description="Início do período"),
     data_ate: datetime | None = Query(default=None, description="Fim do período"),
@@ -37,7 +38,7 @@ async def dre(
     return await svc.dre(data_de=data_de, data_ate=data_ate)
 
 
-@router.get("/balancete", response_model=BalanceteResponse)
+@router.get("/balancete", response_model=BalanceteResponse, dependencies=[requer("relatorios.read")])
 async def balancete(
     data_de: datetime | None = Query(default=None),
     data_ate: datetime | None = Query(default=None),
@@ -47,7 +48,7 @@ async def balancete(
     return await svc.balancete(data_de=data_de, data_ate=data_ate)
 
 
-@router.get("/livro-caixa", response_model=LivroCaixaResponse)
+@router.get("/livro-caixa", response_model=LivroCaixaResponse, dependencies=[requer("relatorios.read")])
 async def livro_caixa(
     # Datas de calendário, inclusivas: o livro percorre `Transacao.data`.
     data_de: date | None = Query(default=None, description="AAAA-MM-DD"),
