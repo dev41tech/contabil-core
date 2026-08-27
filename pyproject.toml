@@ -79,6 +79,15 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--tb=short -q"
+# Um event loop para a sessão inteira, e não um por teste.
+#
+# A fixture `engine` é de sessão. Com um loop por teste, o aiosqlite tolera a
+# conexão criada em outro loop, mas o asyncpg não: o segundo teste morre com
+# "cannot perform operation: another operation is in progress". Era isso que
+# impedia a suíte de rodar contra PostgreSQL — e é contra PostgreSQL que ela
+# precisa rodar, porque o SQLite esconde enum, lock e tipo.
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
 
 [tool.coverage.run]
 source = ["src"]

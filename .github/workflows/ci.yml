@@ -1,0 +1,149 @@
+# CI do contabil-core.
+#
+# POR QUE ISTO EXISTE
+#
+# Até 27/08/2026 não havia CI nenhuma: a suíte só rodava quando alguém lembrava
+# de executá-la na própria máquina. Em 25/08 a aba Desfeitas foi para produção
+# quebrada com a suíte verde localmente — a consulta comparava dois enums que o
+# PostgreSQL recusa e o SQLite aceita. Ninguém tinha como perceber.
+#
+# Daí os três jobs serem o que são:
+#
+#   testes-sqlite     rápido, dá o sinal em ~1 min para o caso comum
+#   testes-postgres   a mesma suíte no banco de produção de verdade — é o que
+#                     teria pego o bug dos enums
+#   migrations        sobe e desce a cadeia inteira; migration que falha aqui
+#                     falharia no `alembic upgrade head` do startup, e derruba
+#                     o container em produção
+#
+# Não há job de lint: `ruff check` acusa 585 erros hoje, e uma CI que nasce
+# vermelha é uma CI que se aprende a ignorar. Limpar isso é tarefa própria.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Push seguido em PR cancela a execução anterior — o que importa é o último commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # O Settings valida a URL e exige PostgreSQL, mesmo quando o banco do teste
+  # é SQLite. A URL real de cada job entra por `TEST_DATABASE_URL_REAL`.
+  DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
+  SECRET_KEY: chave-de-ci-com-mais-de-32-caracteres-aqui
+  ENVIRONMENT: development
+  COOKIE_SECURE: "false"
+
+jobs:
+  testes-sqlite:
+    name: Testes (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # mesma da imagem de produção
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -e ".[dev]"
+
+      - name: Rodar a suíte
+        run: pytest -q
+
+  testes-postgres:
+    name: Testes (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine   # produção roda 17; 16 é o do compose local
+        env:
+          POSTGRES_USER: contabil
+          POSTGRES_PASSWORD: contabil
+          POSTGRES_DB: contabil_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U contabil -d contabil_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -e ".[dev]"
+
+      - name: Rodar a suíte contra PostgreSQL
+        # O schema sai de `Base.metadata.create_all` (conftest), não das
+        # migrations — quem cobre a cadeia é o job `migrations`. Aqui o que se
+        # ganha é o dialeto real: tipo, enum, lock, `FOR UPDATE` em outer join.
+        env:
+          TEST_DATABASE_URL_REAL: postgresql+asyncpg://contabil:contabil@localhost:5432/contabil_test
+        run: pytest -q
+
+  migrations:
+    name: Migrations (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: contabil
+          POSTGRES_PASSWORD: contabil
+          POSTGRES_DB: contabil_migracoes
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U contabil -d contabil_migracoes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://contabil:contabil@localhost:5432/contabil_migracoes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -e ".[dev]"
+
+      - name: Cabeça única
+        # Duas cabeças fazem o `alembic upgrade head` do startup falhar, e a
+        # falha só aparece no deploy.
+        run: |
+          set -e
+          cabecas=$(alembic heads | grep -c "(head)")
+          test "$cabecas" -eq 1 || { alembic heads; echo "Esperava 1 cabeça, achei $cabecas"; exit 1; }
+
+      - name: Subir a cadeia inteira (deploy novo)
+        run: alembic upgrade head
+
+      - name: Descer e subir de novo (o caminho de volta existe?)
+        # `downgrade` é o que ninguém testa e é o que se usa às pressas quando
+        # um deploy dá errado.
+        run: |
+          set -e
+          alembic downgrade -1
+          alembic upgrade head
+
+      - name: Models e migrations dizem a mesma coisa
+        # Sem isto, `alembic revision --autogenerate` gera DROP INDEX e DROP
+        # COLUMN a partir da diferença — foi o estado do repo até 26/08.
+        run: alembic check
