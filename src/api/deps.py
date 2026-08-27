@@ -11,7 +11,7 @@ Uso nos routers:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import structlog
@@ -31,6 +31,15 @@ class AuthContext:
     tenant_id: UUID
     role: str
     email: str
+    # Módulos que o usuário tem NESTA empresa, resolvidos por
+    # `get_company_context`. `None` significa "não resolvido" — contexto só de
+    # autenticação, ou admin, que passa por todos. `frozenset({"*"})` é acesso
+    # total explícito.
+    #
+    # Viaja no contexto para a checagem por permissão declarada
+    # (`src/api/autorizacao.py`) não precisar reconsultar a tabela a cada
+    # requisição: a permissão já foi lida aqui.
+    modulos: frozenset[str] | None = None
 
 
 async def _get_current_user(
@@ -138,6 +147,7 @@ async def get_company_context(
         modulo = ""
 
     # Admin tem acesso a todos os módulos, mas não cruza a fronteira do tenant.
+    modulos_do_usuario: frozenset[str] = frozenset({"*"})
     if ctx.role != "admin":
         result = await db.execute(
             select(Permissao).where(
@@ -160,13 +170,16 @@ async def get_company_context(
             "*" not in modulos and modulos.isdisjoint(modulos_aceitos)
         ):
             raise TenantAccessDeniedError()
+        modulos_do_usuario = frozenset(modulos)
 
     set_request_context(
         trace_id=structlog.contextvars.get_contextvars().get("trace_id", "-"),
         user_id=ctx.user_id,
         company_id=empresa_id,
     )
-    return ctx
+    # `AuthContext` é frozen: devolve uma cópia com os módulos resolvidos, em
+    # vez de mutar o contexto que veio da autenticação.
+    return replace(ctx, modulos=modulos_do_usuario)
 
 
 async def get_admin_company_context(
