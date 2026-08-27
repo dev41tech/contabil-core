@@ -16,11 +16,17 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
-from src.core.errors import InvalidCredentialsError, InvalidTokenError, TokenExpiredError
+from src.core.errors import (
+    InvalidCredentialsError,
+    InvalidTokenError,
+    TokenExpiredError,
+    ValidationError,
+)
 from src.core.security import (
     create_access_token,
     create_refresh_token,
     decode_refresh_token,
+    hash_password,
     verify_password,
 )
 from src.db.models import RefreshToken, Tenant, Usuario
@@ -125,6 +131,62 @@ class AuthService:
 
         logger.info("auth.refresh.success", user_id=str(user_id))
         return new_access, new_refresh
+
+    async def revogar_sessoes(self, user_id: UUID) -> int:
+        """Revoga todos os refresh tokens vivos do usuário.
+
+        É o que dá sentido a trocar a senha por suspeita de vazamento: sem
+        isso, quem já estava logado com a senha antiga continuaria renovando a
+        sessão indefinidamente. Devolve quantas sessões caíram, para a
+        auditoria registrar o alcance.
+        """
+        resultado = await self._db.execute(
+            update(RefreshToken)
+            .where(
+                RefreshToken.usuario_id == user_id,
+                RefreshToken.revogado == False,  # noqa: E712
+            )
+            .values(revogado=True)
+            .returning(RefreshToken.jti)
+        )
+        revogados = len(resultado.scalars().all())
+        logger.info("auth.sessoes_revogadas", user_id=str(user_id), sessoes=revogados)
+        return revogados
+
+    async def trocar_senha(
+        self, user_id: UUID, senha_atual: str, nova_senha: str
+    ) -> int:
+        """Troca a senha do próprio usuário e derruba as outras sessões.
+
+        A verificação da senha atual acontece com o hash real do usuário, e a
+        mensagem de erro é a mesma de credencial inválida em qualquer outro
+        ponto — não confirma nem nega nada além do necessário.
+        """
+        usuario = (
+            await self._db.execute(select(Usuario).where(Usuario.id == user_id))
+        ).scalar_one()
+
+        if not verify_password(senha_atual, usuario.senha_hash):
+            logger.warning("auth.trocar_senha.atual_invalida", user_id=str(user_id))
+            raise InvalidCredentialsError(message="Senha atual incorreta.")
+
+        if verify_password(nova_senha, usuario.senha_hash):
+            raise ValidationError(message="A nova senha precisa ser diferente da atual.")
+
+        usuario.senha_hash = hash_password(nova_senha)
+        await self._db.flush()
+        return await self.revogar_sessoes(user_id)
+
+    async def definir_senha(self, usuario: Usuario, nova_senha: str) -> int:
+        """Define a senha de um usuário sem exigir a anterior — uso do admin.
+
+        Separada de `trocar_senha` de propósito: quem chama assume a
+        responsabilidade de ter autorizado a operação, e o registro na
+        auditoria é obrigação de quem chama, não deste método.
+        """
+        usuario.senha_hash = hash_password(nova_senha)
+        await self._db.flush()
+        return await self.revogar_sessoes(usuario.id)
 
     async def logout(self, refresh_token: str) -> None:
         """Revoga o refresh token, invalidando a sessão."""

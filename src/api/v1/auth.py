@@ -6,7 +6,7 @@ from fastapi import APIRouter, Cookie, Depends, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import AuthContext, require_auth
+from src.api.deps import AuthContext, require_auth, require_csrf
 from src.core.config import get_settings
 from src.core.errors import AuthError
 from src.core.security import (
@@ -18,7 +18,14 @@ from src.core.security import (
 from src.db.models import Tenant, Usuario
 from src.db.session import get_db
 from src.domain.auth.service import AuthService
-from src.schemas.auth import LoginRequest, LoginResponse, MeResponse, RefreshResponse
+from src.domain.auditoria import registrar_auditoria
+from src.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    MeResponse,
+    RefreshResponse,
+    TrocarSenhaRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -112,6 +119,35 @@ async def logout(
         service = AuthService(db)
         await service.logout(refresh_token)
     _clear_auth_cookies(response)
+
+
+@router.post("/senha", status_code=204, dependencies=[Depends(require_csrf)])
+async def trocar_senha(
+    body: TrocarSenhaRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Troca a senha do próprio usuário e derruba as demais sessões.
+
+    Derrubar as sessões é o ponto: trocar a senha por suspeita de vazamento
+    não serve de nada se quem tem a senha antiga continua com a sessão viva.
+    A sessão que fez a troca também cai — o cliente refaz o login, que é o
+    comportamento esperado e o mais simples de explicar.
+    """
+    sessoes = await AuthService(db).trocar_senha(
+        ctx.user_id, body.senha_atual, body.nova_senha
+    )
+    await registrar_auditoria(
+        db,
+        tenant_id=ctx.tenant_id,
+        usuario_id=ctx.user_id,
+        acao="usuario.senha_trocada",
+        entidade="usuario",
+        entidade_id=ctx.user_id,
+        dados_depois={"sessoes_revogadas": sessoes},
+        ip=request.client.host if request.client else None,
+    )
 
 
 @router.get("/me", response_model=MeResponse)

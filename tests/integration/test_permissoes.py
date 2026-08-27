@@ -519,3 +519,128 @@ async def test_conceder_modulo_somente_admin_continua_recusado(
 
     assert resposta.status_code == 422
 
+
+# ── Reset de senha pelo administrador
+
+
+def _senha_url(usuario_id) -> str:
+    return f"/api/v1/usuarios/{usuario_id}/senha"
+
+
+@pytest.mark.asyncio
+async def test_admin_reseta_senha_de_outro_usuario(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, contador: Usuario
+):
+    """Existe porque não há e-mail de recuperação: quem perde a senha depende
+    de um administrador."""
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.patch(
+        _senha_url(contador.id),
+        json={"nova_senha": "senha_definida_pelo_admin"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 204, r.text
+
+    entrada = await client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(tenant.id),
+            "email": contador.email,
+            "senha": "senha_definida_pelo_admin",
+        },
+    )
+    assert entrada.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reset_derruba_as_sessoes_do_alvo(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, contador: Usuario
+):
+    """Resetar a senha de uma conta comprometida tem de expulsar o invasor."""
+    from sqlalchemy import select
+
+    from src.db.models import RefreshToken
+
+    await _login(client, tenant, contador)
+    csrf_admin = await _login(client, tenant, usuario)
+
+    r = await client.patch(
+        _senha_url(contador.id),
+        json={"nova_senha": "senha_definida_pelo_admin"},
+        headers={"X-CSRF-Token": csrf_admin},
+    )
+    assert r.status_code == 204
+
+    vivos = (
+        await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.usuario_id == contador.id,
+                RefreshToken.revogado == False,  # noqa: E712
+            )
+        )
+    ).scalars().all()
+    assert vivos == []
+
+
+@pytest.mark.asyncio
+async def test_reset_fica_registrado_na_auditoria(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario, contador: Usuario
+):
+    """É a única evidência de que a senha de alguém foi trocada por um terceiro."""
+    from sqlalchemy import select
+
+    from src.db.models import AuditLog
+
+    csrf = await _login(client, tenant, usuario)
+    await client.patch(
+        _senha_url(contador.id),
+        json={"nova_senha": "senha_definida_pelo_admin"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    log = (
+        await db.execute(
+            select(AuditLog).where(AuditLog.acao == "usuario.senha_resetada")
+        )
+    ).scalars().first()
+
+    assert log is not None
+    assert log.usuario_id == usuario.id, "quem resetou"
+    assert str(contador.id) in str(log.entidade_id), "para quem"
+    assert "nova_senha" not in str(log.dados_depois), "a senha nunca vai para o log"
+
+
+@pytest.mark.asyncio
+async def test_contador_nao_reseta_senha_de_ninguem(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, contador: Usuario
+):
+    csrf = await _login(client, tenant, contador)
+
+    r = await client.patch(
+        _senha_url(usuario.id),
+        json={"nova_senha": "tentativa_do_contador"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_nao_reseta_senha_de_outro_escritorio(
+    client: AsyncClient,
+    tenant: Tenant,
+    usuario: Usuario,
+    usuario_de_outro_escritorio: Usuario,
+):
+    """Isolamento entre escritórios: 404, não 403 — a existência do usuário de
+    outro tenant não é informação a revelar."""
+    csrf = await _login(client, tenant, usuario)
+
+    r = await client.patch(
+        _senha_url(usuario_de_outro_escritorio.id),
+        json={"nova_senha": "tentativa_cross_tenant"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 404
