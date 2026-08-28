@@ -309,3 +309,99 @@ def test_reconhece_as_duas_variantes_pelo_cabecalho():
     assert itau.reconhece(
         ["Data Lançamentos Razão Social CNPJ/CPF Valor (R$) Saldo (R$)"]
     ) is True
+
+
+# ────────────────────────────── terceira variante: lançamentos com ag/origem
+
+# Geometria medida: data x0=28, lançamentos x0=77, ag/origem x0=321,
+# bordas direitas valor≈438 e saldo≈558 (dos rótulos "(R$)").
+_CABECALHO_LANCAMENTOS = [
+    _p("data", 28, 260),
+    _p("lançamentos", 77, 260),
+    _p("ag/origem", 321, 260),
+    _p("valor", 400, 260),
+    _p("(R$)", 423, 260, largura=15),
+    _p("saldo", 519, 260),
+    _p("(R$)", 543, 260, largura=15),
+]
+
+
+def _dia(dia: str, mes: str, top: float) -> list[dict]:
+    return [_p(dia, 28, top), _p("/", 41, top), _p(mes, 46, top)]
+
+
+_ITAU_LANCAMENTOS = [
+    _p("lançamentos", 28, 230),
+    _p("período:", 81, 230),
+    _p("01/01/2026", 111, 230, largura=39),
+    _p("até", 150, 230),
+    _p("31/01/2026", 163, 230, largura=39),
+    *_CABECALHO_LANCAMENTOS,
+    # Abertura — o valor cai na coluna de SALDO
+    *_dia("02", "jan", 279),
+    _p("SALDO", 77, 279),
+    _p("INICIAL", 106, 279),
+    _direita("1,00", 557, 279),
+    # Lançamento de crédito
+    *_dia("02", "jan", 297),
+    _p("PIX", 77, 297),
+    _p("TRANSF", 92, 297),
+    _p("EXEMPLO", 125, 297),
+    _p("9122", 321, 297),
+    _direita("276,50", 429, 297),
+    # Lançamento de débito
+    *_dia("02", "jan", 315),
+    _p("APL", 77, 315),
+    _p("APLIC", 94, 315),
+    _p("AUT", 120, 315),
+    _p("MAIS", 139, 315),
+    _direita("-276,50", 429, 315),
+    # Saldo da APLICAÇÃO — não é lançamento nem âncora
+    *_dia("02", "jan", 333),
+    _p("SALDO", 77, 333),
+    _p("APLIC", 106, 333),
+    _p("AUT", 132, 333),
+    _p("MAIS", 151, 333),
+    _direita("89.155,95", 550, 333),
+    # Fecho — este vem na coluna de VALOR, não na de saldo
+    *_dia("30", "jan", 351),
+    _p("SALDO", 77, 351),
+    _p("FINAL", 106, 351),
+    _direita("1,00", 435, 351),
+]
+
+
+def test_itau_lancamentos_e_a_variante_escolhida():
+    """O cabeçalho `ag/origem` não pode cair na leitura da variante do extrato.
+
+    As duas trazem "data lançamentos … valor … saldo"; o que separa é a coluna
+    de razão social, que só a do internet banking tem. Sem essa exigência o
+    despacho pegava a leitura errada e o arquivo saía vazio.
+    """
+    (bloco,) = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 1999)
+    assert len(bloco.transacoes) == 2
+
+
+def test_itau_lancamentos_tira_o_ano_do_periodo():
+    (bloco,) = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 1999)
+    assert all(t.data.isoformat() == "2026-01-02" for t in bloco.transacoes)
+
+
+def test_itau_lancamentos_ignora_o_saldo_da_aplicacao():
+    (bloco,) = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 2026)
+    assert all("APLIC AUT MAIS" not in t.historico or t.valor < 0
+               for t in bloco.transacoes)
+    assert Decimal("89155.95") not in [t.saldo_apos for t in bloco.transacoes]
+    assert all(t.saldo_apos is None for t in bloco.transacoes)
+
+
+def test_itau_lancamentos_le_as_duas_pontas_em_colunas_diferentes():
+    """O INICIAL sai na coluna de saldo e o FINAL na de valor — medido."""
+    (bloco,) = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 2026)
+    assert bloco.saldo_anterior == Decimal("1.00")
+    assert bloco.saldo_final == Decimal("1.00")
+
+
+def test_itau_lancamentos_a_cadeia_fecha_pelas_pontas():
+    blocos = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 2026)
+    assert _validar_blocos(blocos, TOLERANCIA) is True

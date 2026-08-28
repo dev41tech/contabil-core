@@ -142,7 +142,9 @@ _ASSINATURA_EXTRATO = re.compile(
 
 def reconhece(linhas: list[str]) -> bool:
     return any(
-        _ASSINATURA_MENSAL.search(linha) or _ASSINATURA_EXTRATO.search(linha)
+        _ASSINATURA_MENSAL.search(linha)
+        or _ASSINATURA_EXTRATO.search(linha)
+        or _ASSINATURA_LANCAMENTOS.search(linha)
         for linha in linhas
     )
 
@@ -297,6 +299,13 @@ def _ler_cabecalho_extrato(linhas: list[list[dict]]) -> _ColunasExtrato | None:
         if "data" not in textos or not any(t.startswith("lan") for t in textos):
             continue
         if "valor" not in textos or "saldo" not in textos:
+            continue
+        # Exige a coluna de razão social, como a assinatura desta variante já
+        # exigia. Sem isso o leitor era mais frouxo que o `reconhece` e ficava
+        # com o cabeçalho da variante `ag/origem`, que tem "data lançamentos …
+        # valor … saldo" igual — o despacho escolhia a leitura errada e o
+        # arquivo saía vazio.
+        if not any(t.startswith("raz") for t in textos):
             continue
 
         valor = _borda_direita(textos, palavras, "valor")
@@ -455,4 +464,194 @@ def extrair_de_palavras(paginas: list[list[dict]], referencia_ano: int) -> list[
             return _extrair_mensal(paginas, referencia_ano)
         if _ler_cabecalho_extrato(linhas) is not None:
             return _extrair_internet(paginas, referencia_ano)
+        if _ler_cabecalho_lancamentos(linhas) is not None:
+            return _extrair_lancamentos(paginas, referencia_ano)
     return []
+
+
+# ─────────────────────────────────── variante: lançamentos do internet banking
+
+# `data lançamentos ag/origem valor (R$) saldo (R$)` — a terceira do Itaú.
+# Distingue-se da do extrato pelo "ag/origem" onde aquela traz "Razão Social".
+_ASSINATURA_LANCAMENTOS = re.compile(
+    r"\bdata\b.*\blan[çc]amentos\b.*\bag/origem\b.*\bvalor\b.*\bsaldo\b",
+    re.IGNORECASE,
+)
+
+# `02 / jan` — dia e mês abreviado, em três palavras e sem ano.
+_MESES_ABREV = {
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
+}
+_PERIODO_LANCAMENTOS = re.compile(
+    r"per[ií]odo:\s*\d{2}/\d{2}/(\d{4})", re.IGNORECASE
+)
+
+
+class _ColunasLancamentos:
+    __slots__ = ("x_data", "x_lancamentos", "valor", "saldo")
+
+    def __init__(self, x_data: float, x_lancamentos: float,
+                 valor: float, saldo: float) -> None:
+        self.x_data = x_data
+        self.x_lancamentos = x_lancamentos
+        self.valor = valor
+        self.saldo = saldo
+
+    def qual_lancamentos(self, x1: float) -> str | None:
+        """Coluna do número, pela borda direita — valor ou saldo."""
+        melhor, distancia = None, _TOLERANCIA_COLUNA
+        for nome, borda in (("valor", self.valor), ("saldo", self.saldo)):
+            d = abs(x1 - borda)
+            if d < distancia:
+                melhor, distancia = nome, d
+        return melhor
+
+
+def _ler_cabecalho_lancamentos(linhas: list[list[dict]]) -> _ColunasLancamentos | None:
+    for palavras in linhas:
+        textos = [p["text"].lower() for p in palavras]
+        if "data" not in textos or "valor" not in textos or "saldo" not in textos:
+            continue
+        if not any(t.startswith("lan") for t in textos):
+            continue
+        if not any(t.startswith("ag/") for t in textos):
+            continue
+        valor = _borda_direita(textos, palavras, "valor")
+        saldo = _borda_direita(textos, palavras, "saldo")
+        if valor is None or saldo is None:
+            continue
+        return _ColunasLancamentos(
+            x_data=float(palavras[textos.index("data")]["x0"]),
+            x_lancamentos=float(
+                palavras[next(i for i, t in enumerate(textos) if t.startswith("lan"))]["x0"]
+            ),
+            valor=valor,
+            saldo=saldo,
+        )
+    return None
+
+
+def _extrair_lancamentos(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
+    """Lançamentos do internet banking — o valor é a única coluna que interessa.
+
+    A conta corrente aqui é varrida para a aplicação automática a cada dia, então
+    o saldo dela fica em R$ 1,00 e o extrato NÃO imprime saldo por lançamento: a
+    coluna de saldo é usada só por três tipos de linha, e duas delas não são
+    lançamento nenhum.
+
+    - `SALDO INICIAL` e `SALDO FINAL` — as duas pontas da cadeia, e a única
+      conferência possível neste layout: `inicial + soma == final`.
+    - `SALDO APLIC AUT MAIS` — o saldo da APLICAÇÃO, não o da conta. Aparece na
+      mesma coluna e, tomado como saldo da conta, jogaria a cadeia para outra
+      ordem de grandeza (89.155,95 contra 1,00).
+
+    A data vem em três palavras e sem ano (`02 / jan`); o ano sai do
+    "período: 01/01/2026 até 31/01/2026" do cabeçalho.
+    """
+    ano = referencia_ano
+    transacoes: list[TransacaoOFX] = []
+    saldo_inicial: Decimal | None = None
+    saldo_final: Decimal | None = None
+    fim = False
+    idx = 0
+    colunas: _ColunasLancamentos | None = None
+
+    for palavras in paginas:
+        if fim:
+            break
+        linhas = _agrupar_linhas(palavras)
+        colunas = _ler_cabecalho_lancamentos(linhas) or colunas
+
+        for linha in linhas:
+            texto_cru = " ".join(p["text"] for p in linha)
+            achado = _PERIODO_LANCAMENTOS.search(texto_cru)
+            if achado:
+                ano = int(achado.group(1))
+            if colunas is None or fim:
+                continue
+
+            dia = mes = None
+            descricao: list[str] = []
+            valores: dict[str, Decimal] = {}
+
+            for palavra in linha:
+                bruto = palavra["text"]
+                x0, x1 = float(palavra["x0"]), float(palavra["x1"])
+
+                if abs(x0 - colunas.x_data) <= 6 and bruto.isdigit():
+                    dia = int(bruto)
+                    continue
+                if bruto == "/" and x0 < colunas.x_lancamentos:
+                    continue
+                if bruto.lower() in _MESES_ABREV and x0 < colunas.x_lancamentos:
+                    mes = _MESES_ABREV[bruto.lower()]
+                    continue
+
+                if _VALOR.match(bruto):
+                    coluna = colunas.qual_lancamentos(x1)
+                    if coluna:
+                        convertido = parse_valor(bruto)
+                        if convertido is not None:
+                            valores[coluna] = convertido
+                        continue
+
+                if x0 >= colunas.x_lancamentos - 3:
+                    descricao.append(bruto)
+
+            texto_descricao = re.sub(r"\s+", " ", " ".join(descricao)).strip()
+            if not texto_descricao:
+                continue
+            maiuscula = texto_descricao.upper()
+
+            # As duas pontas não saem na mesma coluna: medido neste extrato, o
+            # SALDO INICIAL vem na coluna de saldo (borda 557) e o SALDO FINAL
+            # na de valor (borda 435). Por isso aqui vale QUALQUER número da
+            # linha — exigir a coluna de saldo perdia o fecho, e sem o fecho não
+            # há o que conferir neste layout.
+            ponta = valores.get("saldo", valores.get("valor"))
+            if maiuscula.startswith("SALDO INICIAL"):
+                if ponta is not None and saldo_inicial is None:
+                    saldo_inicial = ponta
+                continue
+            if maiuscula.startswith("SALDO FINAL"):
+                if ponta is not None:
+                    saldo_final = ponta
+                    fim = True
+                continue
+            if maiuscula.startswith("SALDO"):
+                # Saldo da aplicação automática: não é lançamento nem âncora.
+                continue
+
+            if "valor" not in valores or dia is None or mes is None:
+                continue
+            valor = valores["valor"]
+            if valor == 0:
+                continue
+            try:
+                data_lida = date(ano, mes, dia)
+            except ValueError:
+                continue
+
+            transacoes.append(
+                TransacaoOFX(
+                    fitid=gerar_fitid(data_lida, texto_descricao, valor, idx),
+                    data=data_lida,
+                    valor=valor,
+                    historico=texto_descricao[:200],
+                    tipo_ofx="CREDIT" if valor > 0 else "DEBIT",
+                    saldo_apos=None,
+                    ordem=idx,
+                )
+            )
+            idx += 1
+
+    if not transacoes:
+        return []
+    return [
+        Bloco(
+            transacoes=transacoes,
+            saldo_anterior=saldo_inicial,
+            saldo_final=saldo_final,
+        )
+    ]

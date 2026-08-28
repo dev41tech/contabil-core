@@ -29,14 +29,17 @@ import pytest
 
 from src.domain.extrato import bancos
 from src.domain.extrato.bancos import (
+    bb,
     bbc,
     c6,
+    caixa,
     cresol,
     fitbank,
     mercadopago,
     nubank,
     santander,
     sicoob,
+    sicredi,
 )
 from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos
 
@@ -481,3 +484,278 @@ def test_santander_nao_confunde_com_o_cabecalho_do_sicredi():
     do_sicredi = ["Data Descricao Documento Valor (R$) Saldo (R$)"]
     assert santander.reconhece(do_sicredi) is False
     assert santander.reconhece(["Data Histórico Documento Valor (R$) Saldo (R$)"]) is True
+
+
+# ───────────────────────────────────────── Sicredi — relatório da cooperativa
+
+# Geometria medida: DATA x0=44, DOCUMENTO x0=81, HISTORICO x0=126,
+# bordas direitas DEBITO≈401, CREDITO≈482, SALDO≈565.
+_CABECALHO_SICREDI = [
+    _p("DATA", 44, 122),
+    _p("DOCUMENTO", 81, 122),
+    _p("HISTORICO", 126, 122),
+    _p("DEBITO", 379, 122, largura=22),
+    _p("CREDITO", 456, 122, largura=26),
+    _p("SALDO", 546, 122, largura=19),
+]
+
+
+def _direita_sic(texto: str, x1: float, top: float) -> dict:
+    return {"text": texto, "x0": x1 - len(texto) * 3.5, "x1": x1, "top": top}
+
+
+_SICREDI_COOP = [
+    *_CABECALHO_SICREDI,
+    # Abertura, com as letras separadas
+    _p("**/**/****", 32, 136),
+    *[_p(letra, 126 + i * 8, 136) for i, letra in enumerate("SALDOANTERIOR")],
+    _direita_sic("0,00", 565, 136),
+    # Débito sem saldo na linha
+    _p("09/01/2024", 32, 143, largura=43),
+    _p("PIX_DEB", 81, 143),
+    _p("PAGAMENTO", 126, 143),
+    _direita_sic("150,00", 401, 143),
+    # Crédito com saldo
+    _p("09/01/2024", 32, 150, largura=43),
+    _p("CAPTACAO", 81, 150),
+    _p("RESG.APLIC", 126, 150),
+    _direita_sic("150,00", 482, 150),
+    _direita_sic("0,00", 565, 150),
+]
+
+
+def test_sicredi_coop_tira_o_sinal_da_coluna_e_nao_do_numero():
+    """Os dois lançamentos têm 150,00; só a coluna diz qual é saída."""
+    (bloco,) = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-150.00"),
+        Decimal("150.00"),
+    ]
+
+
+def test_sicredi_coop_le_a_abertura_com_letras_separadas():
+    (bloco,) = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert bloco.saldo_anterior == Decimal("0.00")
+    assert all("ANTERIOR" not in t.historico.upper() for t in bloco.transacoes)
+
+
+def test_sicredi_coop_a_cadeia_fecha_por_segmento():
+    """O saldo só aparece em algumas linhas, como no Itaú."""
+    blocos = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert blocos[0].transacoes[0].saldo_apos is None
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+def test_sicredi_devolve_vazio_no_outro_layout_para_o_generico_assumir():
+    """O layout `Data Descrição Documento Valor Saldo` é do parser genérico.
+
+    Reivindicar a sigla SICREDI não pode tirar de funcionamento o que já
+    funcionava: quando o arquivo não é o relatório da cooperativa, este
+    adaptador devolve lista vazia e o `parse_pdf` segue adiante sozinho.
+    """
+    outro_layout = [_p("Data", 20, 100), _p("Descricao", 60, 100), _p("Saldo", 300, 100)]
+    assert sicredi.extrair_de_palavras([outro_layout], 2026) == []
+    assert sicredi.reconhece(["Data Descricao Documento Valor (R$) Saldo (R$)"]) is False
+
+
+# ────────────────────────────────────────────────────────────────────── Caixa
+
+# Geometria medida: Data/Hora x0=25, Descrição x0=147,
+# bordas direitas valor≈447 e saldo≈565; a letra D/C vem ~6 pontos à direita.
+_CABECALHO_CAIXA = [
+    _p("Data/Hora", 25, 271),
+    _p("Nr.", 95, 271),
+    _p("Doc.", 110, 271),
+    _p("Descrição/Detalhamento", 147, 271),
+    _p("Valor", 406, 271),
+    _p("(R$)", 432, 271, largura=15),
+    _p("Saldo(R$)", 527, 271, largura=38),
+]
+
+
+def _caixa_linha(top, data=None, hora=None, desc=(), valor=None, dc="D",
+                 saldo=None, saldo_dc="D"):
+    palavras = []
+    if data:
+        palavras.append(_p(data, 25, top, largura=43))
+    if hora:
+        palavras.append(_p(hora, 25, top + 9, largura=34))
+    for i, texto in enumerate(desc):
+        palavras.append(_p(texto, 147 + i * 40, top, largura=38))
+    if valor:
+        palavras.append({"text": valor, "x0": 410, "x1": 440, "top": top + 4})
+        palavras.append({"text": dc, "x0": 443, "x1": 449, "top": top + 4})
+    if saldo:
+        palavras.append({"text": saldo, "x0": 537, "x1": 558, "top": top + 4})
+        palavras.append({"text": saldo_dc, "x0": 563, "x1": 569, "top": top + 4})
+    return palavras
+
+
+_CAIXA = [
+    *_CABECALHO_CAIXA,
+    *_caixa_linha(292, data="04/08/2025", hora="14:36:09", desc=("DEB", "PIX"),
+                  valor="3.797,58", dc="D", saldo="592,08", saldo_dc="D"),
+    *_caixa_linha(317, data="05/08/2025", desc=("RESGATE",),
+                  valor="592,08", dc="C", saldo="0,00", saldo_dc="C"),
+    # Cheque depositado: credita e o saldo NÃO anda — não é movimento
+    *_caixa_linha(342, data="13/08/2025", desc=("DEPOSITO", "CHEQUE"),
+                  valor="5.110,00", dc="C", saldo="0,00", saldo_dc="C"),
+    # A liberação, dias depois: aqui o saldo se move
+    *_caixa_linha(367, data="15/08/2025", desc=("DESBLOQ", "CHEQUE"),
+                  valor="5.110,00", dc="C", saldo="5.110,00", saldo_dc="C"),
+]
+
+
+def test_caixa_junta_as_tres_alturas_num_lancamento_so():
+    """Data, valores e hora ficam a ~4,6 pontos; o lançamento seguinte a ~25."""
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    primeiro = bloco.transacoes[0]
+    assert primeiro.data.isoformat() == "2025-08-04"
+    assert primeiro.valor == Decimal("-3797.58")
+    assert primeiro.saldo_apos == Decimal("-592.08")
+
+
+def test_caixa_le_o_sinal_da_letra_separada_do_numero():
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    assert [t.valor for t in bloco.transacoes][:2] == [
+        Decimal("-3797.58"),
+        Decimal("592.08"),
+    ]
+
+
+def test_caixa_nao_importa_o_cheque_depositado_que_nao_moveu_o_saldo():
+    """Importar depósito e desbloqueio dobraria o valor no razão."""
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    historicos = " ".join(t.historico.upper() for t in bloco.transacoes)
+    assert "DEPOSITO CHEQUE" not in historicos
+    assert "DESBLOQ CHEQUE" in historicos
+    de_5110 = [t for t in bloco.transacoes if t.valor == Decimal("5110.00")]
+    assert len(de_5110) == 1
+
+
+def test_caixa_a_cadeia_fecha_sem_a_linha_bloqueada():
+    """Com o depósito dentro, ela acusaria 5.110,00 de diferença que não existe."""
+    blocos = caixa.extrair_de_palavras([_CAIXA], 2025)
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# ───────────────────────────────────────────── Banco do Brasil — dois layouts
+
+# Layout B ("Dia Lote"): cada lançamento em três alturas, sinal em (+)/(-).
+_CABECALHO_BB_DIA = [
+    _p("Dia", 30, 103),
+    _p("Lote", 91, 103),
+    _p("Documento", 152, 103),
+    _p("Histórico", 266, 103),
+    _p("Valor", 547, 103, largura=22),
+]
+
+
+def _bb_grupo(top, data=None, hist=(), lote=None, valor=None, sinal="-", compl=()):
+    palavras = []
+    if data:
+        palavras.append(_p(data, 30, top, largura=43))
+    for i, texto in enumerate(hist):
+        palavras.append(_p(texto, 266 + i * 42, top, largura=40))
+    if lote:
+        palavras.append(_p(lote, 91, top + 5, largura=24))
+    if valor:
+        palavras.append({"text": valor, "x0": 536, "x1": 557, "top": top + 5})
+        palavras.append({"text": f"({sinal})", "x0": 561, "x1": 573, "top": top + 5})
+    for i, texto in enumerate(compl):
+        palavras.append(_p(texto, 266 + i * 42, top + 10, largura=40))
+    return palavras
+
+
+# Os grupos ficam a 24 pontos uns dos outros: dentro do grupo as alturas somam
+# 10, e o agrupamento usa 14 — precisa separar do grupo seguinte.
+_BB_DIA_LOTE = [
+    *_CABECALHO_BB_DIA,
+    *_bb_grupo(121, hist=("Saldo", "Anterior"), valor="13,44", sinal="-"),
+    *_bb_grupo(145, data="02/01/2026", hist=("Cobrança", "de I.O.F."),
+               lote="13601", valor="0,29", sinal="-", compl=("IOF", "Saldo Devedor")),
+    *_bb_grupo(175, data="00/00/0000", hist=("Saldo", "do dia"),
+               lote="13113", valor="13,73", sinal="-"),
+]
+
+
+def test_bb_dia_lote_junta_as_tres_alturas():
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert len(bloco.transacoes) == 1
+    assert bloco.transacoes[0].valor == Decimal("-0.29")
+
+
+def test_bb_dia_lote_le_o_sinal_entre_parenteses():
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert bloco.saldo_anterior == Decimal("-13.44")
+
+
+def test_bb_dia_lote_usa_saldo_do_dia_como_ancora_e_ignora_a_data_invalida():
+    """A data `00/00/0000` é do MARCADOR de saldo, não de um lançamento."""
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert bloco.transacoes[-1].saldo_apos == Decimal("-13.73")
+    assert all(t.data.isoformat() == "2026-01-02" for t in bloco.transacoes)
+
+
+def test_bb_dia_lote_a_cadeia_fecha():
+    blocos = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# Layout A ("Dt. balancete"): uma linha por lançamento, sinal em D/C.
+_CABECALHO_BB_BAL = [
+    _p("Dt.", 60, 195),
+    _p("balancete", 73, 195),
+    _p("Dt.", 118, 195),
+    _p("movimento", 132, 195),
+    _p("Lote", 228, 195),
+    _p("Histórico", 250, 195),
+    _p("Documento", 407, 195),
+    _p("Valor", 471, 195),
+    _p("R$", 494, 195, largura=8),
+    _p("Saldo", 525, 195, largura=18),
+]
+
+_BB_BALANCETE = [
+    *_CABECALHO_BB_BAL,
+    _p("30/01/2026", 65, 206, largura=43),
+    _p("Saldo", 266, 206),
+    _p("Anterior", 289, 206),
+    {"text": "100,00", "x0": 507, "x1": 535, "top": 206},
+    {"text": "D", "x0": 542, "x1": 548, "top": 206},
+    _p("02/02/2026", 65, 218, largura=43),
+    _p("Pix", 266, 218),
+    _p("Recebido", 284, 218),
+    {"text": "350,00", "x0": 471, "x1": 492, "top": 218},
+    {"text": "C", "x0": 499, "x1": 505, "top": 218},
+    # A letra do sinal do VALOR grudada no número do SALDO: `D0,00`.
+    # -100,00 (abertura) + 350,00 - 250,00 = 0,00, que é o saldo impresso.
+    _p("02/02/2026", 65, 242, largura=43),
+    _p("BB", 266, 242),
+    _p("Rende", 284, 242),
+    {"text": "250,00", "x0": 471, "x1": 492, "top": 242},
+    {"text": "D0,00", "x0": 499, "x1": 535, "top": 242},
+    {"text": "C", "x0": 542, "x1": 548, "top": 242},
+]
+
+
+def test_bb_balancete_separa_a_letra_grudada_no_numero_seguinte():
+    """`D0,00` é o sinal do valor mais o saldo — dois campos num token só.
+
+    Sem separar, o saldo se perde e o valor fica sem sinal. No extrato real
+    isso escondia sete lançamentos e derrubava a cadeia.
+    """
+    (bloco,) = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
+    sweep = bloco.transacoes[-1]
+    assert sweep.valor == Decimal("-250.00")
+    assert sweep.saldo_apos == Decimal("0.00")
+
+
+def test_bb_balancete_le_a_abertura_da_coluna_de_saldo():
+    (bloco,) = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
+    assert bloco.saldo_anterior == Decimal("-100.00")
+
+
+def test_bb_balancete_a_cadeia_fecha():
+    blocos = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
+    assert _validar_blocos(blocos, TOLERANCIA) is True

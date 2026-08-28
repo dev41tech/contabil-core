@@ -16,12 +16,15 @@ de existir adaptador:
   aparece na linha do lançamento.
 """
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
 
 from src.domain.extrato import bancos
+from src.domain.extrato._comum import Bloco
 from src.domain.extrato.bancos import bradesco, inter
+from src.domain.extrato.ofx_parser import TransacaoOFX
 from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos
 
 TOLERANCIA = Decimal("0.05")
@@ -98,17 +101,37 @@ def test_bradesco_le_o_saldo_anterior_do_bloco():
     assert bloco.saldo_anterior == Decimal("1000.00")
 
 
-def test_bradesco_separa_os_dois_extratos_do_mesmo_arquivo():
-    blocos = _bradesco(_BRADESCO_LANCAMENTOS + _BRADESCO_SEGUNDO_EXTRATO)
-    assert len(blocos) == 2
-    assert [len(b.transacoes) for b in blocos] == [3, 1]
-    assert blocos[1].saldo_anterior == Decimal("-3000.00")
+def test_validador_confere_cada_bloco_por_si():
+    """A emenda entre blocos não é salto: a cadeia vale DENTRO de cada um.
 
+    O Bradesco deixou de emitir dois blocos quando passamos a descartar os
+    "Últimos Lançamentos", mas a capacidade continua valendo — qualquer extrato
+    que reinicie o saldo depende dela. Por isso o teste é do validador, montando
+    os blocos à mão, e não mais de um banco específico.
+    """
+    def _tx(valor: str, saldo: str, ordem: int) -> TransacaoOFX:
+        return TransacaoOFX(
+            fitid=f"X{ordem}",
+            data=date(2026, 1, 1 + ordem),
+            valor=Decimal(valor),
+            historico="EXEMPLO",
+            tipo_ofx="CREDIT" if Decimal(valor) > 0 else "DEBIT",
+            saldo_apos=Decimal(saldo),
+            ordem=ordem,
+        )
 
-def test_bradesco_dois_blocos_passam_na_validacao_por_bloco():
-    """A emenda entre os blocos não é salto: a cadeia vale dentro de cada um."""
-    blocos = _bradesco(_BRADESCO_LANCAMENTOS + _BRADESCO_SEGUNDO_EXTRATO)
-    assert _validar_blocos(blocos, TOLERANCIA) is True
+    primeiro = Bloco(
+        transacoes=[_tx("-100.00", "900.00", 0), _tx("50.00", "950.00", 1)],
+        saldo_anterior=Decimal("1000.00"),
+    )
+    # O segundo reinicia num saldo sem relação com o fim do primeiro: se a
+    # validação fosse contínua, isto acusaria um salto que não existe.
+    segundo = Bloco(
+        transacoes=[_tx("-25.00", "-3025.00", 2)],
+        saldo_anterior=Decimal("-3000.00"),
+    )
+
+    assert _validar_blocos([primeiro, segundo], TOLERANCIA) is True
 
 
 def test_bradesco_primeiro_lancamento_perdido_e_recusado_pelo_saldo_anterior():
@@ -196,3 +219,19 @@ def test_registro_cai_na_deteccao_por_conteudo_quando_a_sigla_nao_ajuda():
 def test_registro_prefere_a_sigla_ao_conteudo():
     """Sigla cadastrada ganha: é o cadastro que define o banco, não o arquivo."""
     assert bancos.escolher("INTER", _BRADESCO_CABECALHO) is inter
+
+
+def test_bradesco_descarta_o_bloco_de_ultimos_lancamentos():
+    """"Últimos Lançamentos" é prévia do mês seguinte, não parte do extrato.
+
+    O Bradesco anexa, depois do total do período, uma prévia dos dias seguintes
+    com cabeçalho e `SALDO ANTERIOR` próprios. São movimentos de FORA do período
+    pedido, e voltam no extrato seguinte como o extrato de verdade. Decisão do
+    Nathan em 2026-08-28, depois de conferir em produção.
+    """
+    com_previa = _BRADESCO_LANCAMENTOS + _BRADESCO_SEGUNDO_EXTRATO
+    blocos = _bradesco(com_previa)
+
+    assert len(blocos) == 1
+    assert [t.data.month for t in blocos[0].transacoes] == [1, 1, 1]
+    assert all("COOPERATIVA" not in t.historico for t in blocos[0].transacoes)

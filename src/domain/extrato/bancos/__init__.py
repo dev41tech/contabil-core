@@ -28,9 +28,11 @@ from __future__ import annotations
 from types import ModuleType
 
 from src.domain.extrato.bancos import (
+    bb,
     bbc,
     bradesco,
     c6,
+    caixa,
     cresol,
     fitbank,
     grafeno,
@@ -40,13 +42,16 @@ from src.domain.extrato.bancos import (
     nubank,
     santander,
     sicoob,
+    sicredi,
     stone,
 )
 
 ADAPTADORES: tuple[ModuleType, ...] = (
+    bb,
     bbc,
     bradesco,
     c6,
+    caixa,
     cresol,
     fitbank,
     grafeno,
@@ -56,6 +61,7 @@ ADAPTADORES: tuple[ModuleType, ...] = (
     nubank,
     santander,
     sicoob,
+    sicredi,
     stone,
 )
 

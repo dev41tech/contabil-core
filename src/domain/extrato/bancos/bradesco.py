@@ -49,6 +49,17 @@ _TEM_LETRA = re.compile(r"[A-Za-zÀ-ÿ]")
 # (o mês fechado) e "Últimos Lançamentos" (os dias seguintes), cada um com sua
 # própria cadeia de saldos.
 _CABECALHO_TABELA = re.compile(r"^Data\s+Lan[cç]amento\s+Dcto", re.IGNORECASE)
+
+# "Últimos Lançamentos" ENCERRA a leitura — não é continuação do extrato.
+#
+# O Bradesco anexa, depois do mês fechado, uma prévia dos dias seguintes, com
+# cabeçalho e `SALDO ANTERIOR` próprios. São lançamentos de FORA do período
+# pedido: entram como movimento de um mês que o contador não solicitou e voltam
+# de novo no extrato seguinte, agora como o extrato de verdade.
+#
+# Decisão do Nathan em 2026-08-28, depois da conferência em produção: o extrato
+# vale até o total do período; o que vem sob esse título é descartado.
+_FIM_DO_EXTRATO = re.compile(r"^[ÚU]ltimos\s+Lan[cç]amentos", re.IGNORECASE)
 _SALDO_ANTERIOR = re.compile(
     rf"SALDO ANTERIOR\s+({_VALOR})\s*$", re.IGNORECASE
 )
@@ -97,6 +108,9 @@ def extrair(linhas: list[str], referencia_ano: int) -> list[Bloco]:
     for i, linha in enumerate(limpas):
         if not linha:
             continue
+
+        if _FIM_DO_EXTRATO.match(linha):
+            break
 
         if _CABECALHO_TABELA.match(linha):
             fechar()
