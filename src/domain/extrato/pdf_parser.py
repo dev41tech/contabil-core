@@ -30,7 +30,7 @@ from io import BytesIO
 
 from src.core.config import get_settings
 from src.domain.extrato import bancos
-from src.domain.extrato._comum import Bloco
+from src.domain.extrato._comum import Bloco, ordenar_do_mais_antigo
 from src.domain.extrato._comum import gerar_fitid as _gerar_fitid
 from src.domain.extrato._comum import parse_data as _parse_data
 from src.domain.extrato._comum import parse_valor as _parse_valor
@@ -470,6 +470,7 @@ _FIELD_DATA      = ("data", "date", "data_lancamento", "dt", "data_transacao", "
 _FIELD_HISTORICO = ("historico", "description", "descricao", "memo", "historic",
                     "historico_extrato", "desc", "narrative", "details")
 _FIELD_VALOR     = ("valor", "value", "amount", "montante", "quantia", "vlr")
+_FIELD_SALDO     = ("saldo", "balance", "saldo_apos", "saldo_atual", "running_balance")
 
 
 def _get_field(item: dict, aliases: tuple) -> str | None:
@@ -507,6 +508,19 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
             valor = -valor
         elif dc_hint in ("C", "CR", "CREDITO", "CREDIT", "ENTRADA") and valor < 0:
             valor = abs(valor)
+        # O saldo da linha é o que permite conferir a saída da IA: sem ele, a
+        # extração por imagem não teria como ser verificada e não deveria ser
+        # importada. `None` quando aquela linha não traz saldo impresso.
+        saldo_apos = None
+        saldo_raw = _get_field(item, _FIELD_SALDO)
+        if saldo_raw is not None:
+            try:
+                saldo_apos = Decimal(
+                    saldo_raw.replace("R$", "").replace(" ", "").replace("\xa0", "")
+                )
+            except (TypeError, InvalidOperation):
+                saldo_apos = _parse_valor(saldo_raw)
+
         fitid = _gerar_fitid(data, historico, valor, idx)
         return TransacaoOFX(
             fitid=fitid,
@@ -514,11 +528,169 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
             valor=valor,
             historico=historico[:200],
             tipo_ofx="CREDIT" if valor >= 0 else "DEBIT",
+            saldo_apos=saldo_apos,
             ordem=idx,
         )
     except Exception as e:
         logger.warning("IA: item inválido descartado (%s)", type(e).__name__)
         return None
+
+
+# ──────────────────────────────────────────────── Camada 3: Vision (PDF de imagem)
+
+_MODELO_VISION = "gpt-4o"
+
+# Uma chamada por página. Renderizar em 150 dpi mantém o texto legível sem
+# estourar o tamanho da imagem.
+_DPI_VISION = 150
+
+_AI_PROMPT_VISION = """\
+Esta é a imagem de UMA página de extrato bancário brasileiro.
+
+Retorne SOMENTE um objeto JSON com estas duas chaves:
+
+  "saldo_anterior" → número decimal, ou null.
+       Só preencha se a página trouxer explicitamente o saldo de ABERTURA do
+       extrato (rótulos como "SALDO ANTERIOR", "Saldo em DD/MM", "Saldo
+       inicial"). Não invente e não use o saldo de um dia qualquer.
+
+  "transacoes" → array de objetos, um por LANÇAMENTO, na ordem em que aparecem
+       na página (de cima para baixo, sem reordenar), cada um com:
+
+       "data"      → "DD/MM/AAAA"
+       "historico" → a descrição do lançamento
+       "valor"     → decimal com ponto: NEGATIVO para débito/saída/pagamento,
+                     POSITIVO para crédito/entrada/recebimento
+       "saldo"     → o saldo impresso NA MESMA LINHA, com sinal, ou null se
+                     aquela linha não trouxer saldo
+
+Regras que não podem ser quebradas:
+
+- Transcreva os números EXATAMENTE como impressos. "1.234,56" vira 1234.56.
+- O sinal vem do que está impresso: um "D" ou "-" ou a cor vermelha indicam
+  saída; "C" ou "+" indicam entrada.
+- Linhas de SALDO (por exemplo "SALDO DIA", "SALDO ANTERIOR", "Saldo do dia",
+  "SALDO TOTAL DISPONÍVEL") NÃO são lançamentos: não as inclua em "transacoes".
+  Quando uma linha dessas trouxer o saldo do dia, ele já aparece na coluna de
+  saldo dos lançamentos daquele dia — não é preciso repeti-lo.
+- Não invente lançamento, não junte dois numa linha só e não pule nenhum: os
+  saldos são conferidos um contra o outro depois, e qualquer linha faltando
+  faz a importação inteira ser recusada.
+- Se a página não tiver lançamento nenhum (capa, legenda, rodapé), devolva
+  {"saldo_anterior": null, "transacoes": []}."""
+
+
+def _parse_por_ai_vision(
+    conteudo_bytes: bytes, budget: _PDFBudget
+) -> tuple[list[TransacaoOFX], Decimal | None]:
+    """Camada 3: lê um PDF SEM camada de texto renderizando cada página.
+
+    Existe porque quatro extratos do escritório são PDF de imagem — não são
+    escaneados, são exportações vetoriais do internet banking, com texto
+    perfeitamente legível e nenhuma camada de texto para o pdfplumber.
+
+    **O que torna isto seguro é a cadeia de saldos.** Os quatro trazem saldo,
+    e o prompt pede o saldo de cada linha junto do valor. Depois disso a saída
+    da IA passa exatamente pela mesma conferência de um adaptador determinístico
+    (`_validar_blocos`): se ela alucinar um valor, pular uma linha ou trocar um
+    sinal, o saldo deixa de caminhar e a importação é recusada. Sem essa
+    conferência esta camada não deveria existir — foi por isso que ela ficou
+    documentada e não implementada até agora.
+
+    Devolve (transações, saldo_anterior).
+    """
+    settings = get_settings()
+    if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
+        logger.info("Vision desabilitada para dados financeiros — pulando camada 3")
+        return [], None
+    if not _FITZ_AVAILABLE:
+        logger.warning("Vision indisponível: PyMuPDF não instalado")
+        return [], None
+
+    doc = fitz.open(stream=conteudo_bytes, filetype="pdf")
+    total_paginas = len(doc)
+    doc.close()
+
+    if total_paginas > budget.ai_calls_restantes:
+        raise PDFParseError(
+            f"O PDF tem {total_paginas} páginas sem camada de texto e a leitura "
+            f"por imagem processa no máximo {budget.ai_calls_restantes}. "
+            "Exporte o extrato em um período menor, ou peça ao banco o arquivo "
+            "com texto selecionável."
+        )
+
+    from openai import OpenAI
+    client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
+
+    transacoes: list[TransacaoOFX] = []
+    saldo_anterior: Decimal | None = None
+    idx = 0
+
+    for numero in range(total_paginas):
+        budget.consumir_chamada_ai()
+        try:
+            png = _render_page_to_png(conteudo_bytes, numero, dpi=_DPI_VISION)
+        except Exception as e:
+            logger.warning("Vision: falha ao renderizar página %d: %s", numero + 1, e)
+            continue
+
+        img_b64 = base64.b64encode(png).decode()
+        try:
+            response = client.chat.completions.create(
+                model=_MODELO_VISION,
+                timeout=budget.timeout_restante,
+                max_tokens=4096,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": _AI_SYSTEM},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}",
+                            "detail": "high",
+                        }},
+                        {"type": "text", "text": _AI_PROMPT_VISION},
+                    ]},
+                ],
+            )
+        except Exception as e:
+            logger.warning("Vision: falha na chamada OpenAI (página %d): %s", numero + 1, e)
+            return [], None
+
+        bruto = response.choices[0].message.content or ""
+        conteudo = _parse_ai_response_vision(bruto)
+        if saldo_anterior is None and conteudo.get("saldo_anterior") is not None:
+            saldo_anterior = _parse_valor(str(conteudo["saldo_anterior"]))
+
+        for item in conteudo.get("transacoes", []):
+            transacao = _transacao_from_ai(item, idx)
+            if transacao:
+                transacoes.append(transacao)
+                idx += 1
+
+    logger.info(
+        "Vision: %d transações em %d páginas (saldo anterior=%s)",
+        len(transacoes), total_paginas, saldo_anterior,
+    )
+    return transacoes, saldo_anterior
+
+
+def _parse_ai_response_vision(raw: str) -> dict:
+    """Aceita o objeto com `saldo_anterior`/`transacoes`, ou só a lista."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```\s*$", "", raw).strip()
+    try:
+        resultado = json.loads(raw, parse_float=Decimal)
+    except json.JSONDecodeError as e:
+        logger.warning("Vision: JSON inválido (%s)", e)
+        return {"saldo_anterior": None, "transacoes": []}
+    if isinstance(resultado, list):
+        return {"saldo_anterior": None, "transacoes": resultado}
+    if isinstance(resultado, dict):
+        return {
+            "saldo_anterior": resultado.get("saldo_anterior"),
+            "transacoes": resultado.get("transacoes") or resultado.get("transactions") or [],
+        }
+    return {"saldo_anterior": None, "transacoes": []}
 
 
 # ──────────────────────────────────────────────────────────── entrypoint
@@ -631,11 +803,38 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
 
             logger.info("AI texto: 0 transações extraídas")
         else:
+            # ── Camada 3: Vision ──────────────────────────────────────────────
+            # PDF sem camada de texto. Os quatro do escritório que caem aqui não
+            # são escaneados: são exportações do internet banking em que o texto
+            # foi desenhado, não escrito. Todos trazem saldo, e é isso que
+            # permite conferir a saída da IA como se fosse a de um adaptador.
             logger.info(
-                "pdfplumber: PDF sem camada de texto (%d chars) — "
-                "extração verificável indisponível",
+                "pdfplumber: PDF sem camada de texto (%d chars) — tentando "
+                "leitura por imagem (camada 3)",
                 total_chars,
             )
+            transacoes, saldo_anterior = _parse_por_ai_vision(conteudo_bytes, budget)
+            if transacoes:
+                cronologicas = ordenar_do_mais_antigo(transacoes)
+                bloco = Bloco(
+                    transacoes=cronologicas, saldo_anterior=saldo_anterior
+                )
+                # A conferência é a MESMA de um adaptador determinístico. Se a
+                # IA pulou uma linha ou trocou um sinal, o saldo não caminha e
+                # nada é importado.
+                if not _validar_blocos([bloco], Decimal("0.05")):
+                    raise PDFParseError(
+                        "A leitura por imagem não pôde ser conferida: o extrato "
+                        "não trouxe saldo suficiente para verificar os "
+                        "lançamentos, e importar sem conferência não é seguro."
+                    )
+                transacoes = [
+                    replace(t, ordem=i) for i, t in enumerate(cronologicas)
+                ]
+                logger.info(
+                    "PDF parser: %d transações via Vision (camada 3)", len(transacoes)
+                )
+                return transacoes
 
     raise PDFParseError(
         "Não foi possível obter uma extração com saldos/totais verificáveis; "
