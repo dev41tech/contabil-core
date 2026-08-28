@@ -31,6 +31,7 @@ from src.domain.extrato import bancos
 from src.domain.extrato.bancos import (
     bbc,
     c6,
+    caixa,
     cresol,
     fitbank,
     mercadopago,
@@ -554,3 +555,84 @@ def test_sicredi_devolve_vazio_no_outro_layout_para_o_generico_assumir():
     outro_layout = [_p("Data", 20, 100), _p("Descricao", 60, 100), _p("Saldo", 300, 100)]
     assert sicredi.extrair_de_palavras([outro_layout], 2026) == []
     assert sicredi.reconhece(["Data Descricao Documento Valor (R$) Saldo (R$)"]) is False
+
+
+# ────────────────────────────────────────────────────────────────────── Caixa
+
+# Geometria medida: Data/Hora x0=25, Descrição x0=147,
+# bordas direitas valor≈447 e saldo≈565; a letra D/C vem ~6 pontos à direita.
+_CABECALHO_CAIXA = [
+    _p("Data/Hora", 25, 271),
+    _p("Nr.", 95, 271),
+    _p("Doc.", 110, 271),
+    _p("Descrição/Detalhamento", 147, 271),
+    _p("Valor", 406, 271),
+    _p("(R$)", 432, 271, largura=15),
+    _p("Saldo(R$)", 527, 271, largura=38),
+]
+
+
+def _caixa_linha(top, data=None, hora=None, desc=(), valor=None, dc="D",
+                 saldo=None, saldo_dc="D"):
+    palavras = []
+    if data:
+        palavras.append(_p(data, 25, top, largura=43))
+    if hora:
+        palavras.append(_p(hora, 25, top + 9, largura=34))
+    for i, texto in enumerate(desc):
+        palavras.append(_p(texto, 147 + i * 40, top, largura=38))
+    if valor:
+        palavras.append({"text": valor, "x0": 410, "x1": 440, "top": top + 4})
+        palavras.append({"text": dc, "x0": 443, "x1": 449, "top": top + 4})
+    if saldo:
+        palavras.append({"text": saldo, "x0": 537, "x1": 558, "top": top + 4})
+        palavras.append({"text": saldo_dc, "x0": 563, "x1": 569, "top": top + 4})
+    return palavras
+
+
+_CAIXA = [
+    *_CABECALHO_CAIXA,
+    *_caixa_linha(292, data="04/08/2025", hora="14:36:09", desc=("DEB", "PIX"),
+                  valor="3.797,58", dc="D", saldo="592,08", saldo_dc="D"),
+    *_caixa_linha(317, data="05/08/2025", desc=("RESGATE",),
+                  valor="592,08", dc="C", saldo="0,00", saldo_dc="C"),
+    # Cheque depositado: credita e o saldo NÃO anda — não é movimento
+    *_caixa_linha(342, data="13/08/2025", desc=("DEPOSITO", "CHEQUE"),
+                  valor="5.110,00", dc="C", saldo="0,00", saldo_dc="C"),
+    # A liberação, dias depois: aqui o saldo se move
+    *_caixa_linha(367, data="15/08/2025", desc=("DESBLOQ", "CHEQUE"),
+                  valor="5.110,00", dc="C", saldo="5.110,00", saldo_dc="C"),
+]
+
+
+def test_caixa_junta_as_tres_alturas_num_lancamento_so():
+    """Data, valores e hora ficam a ~4,6 pontos; o lançamento seguinte a ~25."""
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    primeiro = bloco.transacoes[0]
+    assert primeiro.data.isoformat() == "2025-08-04"
+    assert primeiro.valor == Decimal("-3797.58")
+    assert primeiro.saldo_apos == Decimal("-592.08")
+
+
+def test_caixa_le_o_sinal_da_letra_separada_do_numero():
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    assert [t.valor for t in bloco.transacoes][:2] == [
+        Decimal("-3797.58"),
+        Decimal("592.08"),
+    ]
+
+
+def test_caixa_nao_importa_o_cheque_depositado_que_nao_moveu_o_saldo():
+    """Importar depósito e desbloqueio dobraria o valor no razão."""
+    (bloco,) = caixa.extrair_de_palavras([_CAIXA], 2025)
+    historicos = " ".join(t.historico.upper() for t in bloco.transacoes)
+    assert "DEPOSITO CHEQUE" not in historicos
+    assert "DESBLOQ CHEQUE" in historicos
+    de_5110 = [t for t in bloco.transacoes if t.valor == Decimal("5110.00")]
+    assert len(de_5110) == 1
+
+
+def test_caixa_a_cadeia_fecha_sem_a_linha_bloqueada():
+    """Com o depósito dentro, ela acusaria 5.110,00 de diferença que não existe."""
+    blocos = caixa.extrair_de_palavras([_CAIXA], 2025)
+    assert _validar_blocos(blocos, TOLERANCIA) is True

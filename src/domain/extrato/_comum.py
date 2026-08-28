@@ -139,13 +139,21 @@ class Bloco:
 ALTURA_LINHA = 3.0
 
 
-def agrupar_linhas(palavras: list[dict]) -> list[list[dict]]:
+def agrupar_linhas(
+    palavras: list[dict], altura: float = ALTURA_LINHA
+) -> list[list[dict]]:
     """Agrupa palavras em linhas por proximidade vertical.
 
     Agrupar por faixa fixa (`int(top / altura)`) parte uma linha em duas sempre
     que as duas metades caem em faixas vizinhas — e elas caem: no Itaú a mesma
     linha visual traz palavras com `top` 415,4 e 415,6. A comparação é com o
     topo da linha em aberto, não com uma grade.
+
+    `altura` é ajustável porque nem todo banco escreve a linha na mesma altura.
+    A Caixa quebra CADA lançamento em três alturas — data, valores e hora ficam
+    a ~4,6 pontos uma da outra, e o lançamento seguinte a ~25. Com o padrão de
+    3 pontos, um lançamento vira três "linhas" e nenhuma delas tem data, valor e
+    saldo ao mesmo tempo.
     """
     if not palavras:
         return []
@@ -153,7 +161,7 @@ def agrupar_linhas(palavras: list[dict]) -> list[list[dict]]:
     linhas: list[list[dict]] = [[ordenadas[0]]]
     topo = float(ordenadas[0]["top"])
     for palavra in ordenadas[1:]:
-        if float(palavra["top"]) - topo > ALTURA_LINHA:
+        if float(palavra["top"]) - topo > altura:
             linhas.append([])
             topo = float(palavra["top"])
         linhas[-1].append(palavra)
