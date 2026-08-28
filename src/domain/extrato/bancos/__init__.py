@@ -40,6 +40,7 @@ from src.domain.extrato.bancos import (
     nubank,
     santander,
     sicoob,
+    sicredi,
     stone,
 )
 
@@ -56,6 +57,7 @@ ADAPTADORES: tuple[ModuleType, ...] = (
     nubank,
     santander,
     sicoob,
+    sicredi,
     stone,
 )
 

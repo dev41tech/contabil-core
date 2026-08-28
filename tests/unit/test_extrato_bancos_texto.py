@@ -37,6 +37,7 @@ from src.domain.extrato.bancos import (
     nubank,
     santander,
     sicoob,
+    sicredi,
 )
 from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos
 
@@ -481,3 +482,75 @@ def test_santander_nao_confunde_com_o_cabecalho_do_sicredi():
     do_sicredi = ["Data Descricao Documento Valor (R$) Saldo (R$)"]
     assert santander.reconhece(do_sicredi) is False
     assert santander.reconhece(["Data Histórico Documento Valor (R$) Saldo (R$)"]) is True
+
+
+# ───────────────────────────────────────── Sicredi — relatório da cooperativa
+
+# Geometria medida: DATA x0=44, DOCUMENTO x0=81, HISTORICO x0=126,
+# bordas direitas DEBITO≈401, CREDITO≈482, SALDO≈565.
+_CABECALHO_SICREDI = [
+    _p("DATA", 44, 122),
+    _p("DOCUMENTO", 81, 122),
+    _p("HISTORICO", 126, 122),
+    _p("DEBITO", 379, 122, largura=22),
+    _p("CREDITO", 456, 122, largura=26),
+    _p("SALDO", 546, 122, largura=19),
+]
+
+
+def _direita_sic(texto: str, x1: float, top: float) -> dict:
+    return {"text": texto, "x0": x1 - len(texto) * 3.5, "x1": x1, "top": top}
+
+
+_SICREDI_COOP = [
+    *_CABECALHO_SICREDI,
+    # Abertura, com as letras separadas
+    _p("**/**/****", 32, 136),
+    *[_p(letra, 126 + i * 8, 136) for i, letra in enumerate("SALDOANTERIOR")],
+    _direita_sic("0,00", 565, 136),
+    # Débito sem saldo na linha
+    _p("09/01/2024", 32, 143, largura=43),
+    _p("PIX_DEB", 81, 143),
+    _p("PAGAMENTO", 126, 143),
+    _direita_sic("150,00", 401, 143),
+    # Crédito com saldo
+    _p("09/01/2024", 32, 150, largura=43),
+    _p("CAPTACAO", 81, 150),
+    _p("RESG.APLIC", 126, 150),
+    _direita_sic("150,00", 482, 150),
+    _direita_sic("0,00", 565, 150),
+]
+
+
+def test_sicredi_coop_tira_o_sinal_da_coluna_e_nao_do_numero():
+    """Os dois lançamentos têm 150,00; só a coluna diz qual é saída."""
+    (bloco,) = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-150.00"),
+        Decimal("150.00"),
+    ]
+
+
+def test_sicredi_coop_le_a_abertura_com_letras_separadas():
+    (bloco,) = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert bloco.saldo_anterior == Decimal("0.00")
+    assert all("ANTERIOR" not in t.historico.upper() for t in bloco.transacoes)
+
+
+def test_sicredi_coop_a_cadeia_fecha_por_segmento():
+    """O saldo só aparece em algumas linhas, como no Itaú."""
+    blocos = sicredi.extrair_de_palavras([_SICREDI_COOP], 2024)
+    assert blocos[0].transacoes[0].saldo_apos is None
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+def test_sicredi_devolve_vazio_no_outro_layout_para_o_generico_assumir():
+    """O layout `Data Descrição Documento Valor Saldo` é do parser genérico.
+
+    Reivindicar a sigla SICREDI não pode tirar de funcionamento o que já
+    funcionava: quando o arquivo não é o relatório da cooperativa, este
+    adaptador devolve lista vazia e o `parse_pdf` segue adiante sozinho.
+    """
+    outro_layout = [_p("Data", 20, 100), _p("Descricao", 60, 100), _p("Saldo", 300, 100)]
+    assert sicredi.extrair_de_palavras([outro_layout], 2026) == []
+    assert sicredi.reconhece(["Data Descricao Documento Valor (R$) Saldo (R$)"]) is False
