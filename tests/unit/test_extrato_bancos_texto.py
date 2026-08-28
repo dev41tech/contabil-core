@@ -28,7 +28,16 @@ from decimal import Decimal
 import pytest
 
 from src.domain.extrato import bancos
-from src.domain.extrato.bancos import bbc, c6, cresol, fitbank, mercadopago, nubank, sicoob
+from src.domain.extrato.bancos import (
+    bbc,
+    c6,
+    cresol,
+    fitbank,
+    mercadopago,
+    nubank,
+    santander,
+    sicoob,
+)
 from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos
 
 TOLERANCIA = Decimal("0.05")
@@ -384,3 +393,91 @@ def test_nenhuma_amostra_casa_com_dois_adaptadores():
             if m.reconhece(linhas)
         ]
         assert casam == [esperado], f"{esperado} ficou ambíguo: {casam}"
+
+
+# ──────────────────────────────────────────── Omie.CASH, variante de uma coluna
+
+# O mesmo gerador do FitBank, exportando para uma conta Sicredi: sem colunas
+# separadas de Entradas/Saídas, só `Valor`. O adaptador é escolhido pela
+# assinatura e não pela sigla — a agência pode estar cadastrada como SICREDI.
+_OMIE_UMA_COLUNA = [
+    "Extrato de Sicredi",
+    "Período de 01/07/2026 até 31/07/2026 (Página 1/1)",
+    "Situação Data Cliente ou Fornecedor Documento Categoria Valor Saldo",
+    "30/06 SALDO ANTERIOR 1.000,00",
+    "Conciliado 01/07 EXEMPLO ALIMENTOS LTDA Clientes - Revenda 2.000,00 3.000,00",
+    "Conciliado 02/07 TARIFA EXEMPLO Tarifas Bancárias -500,00 2.500,00",
+]
+
+
+def test_omie_uma_coluna_e_reconhecido_mesmo_sem_entradas_e_saidas():
+    assert fitbank.reconhece(_OMIE_UMA_COLUNA) is True
+
+
+def test_omie_uma_coluna_le_o_sinal_do_proprio_numero():
+    (bloco,) = fitbank.extrair(_OMIE_UMA_COLUNA, 2026)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("2000.00"),
+        Decimal("-500.00"),
+    ]
+
+
+def test_omie_uma_coluna_fecha_a_cadeia():
+    blocos = fitbank.extrair(_OMIE_UMA_COLUNA, 2026)
+    assert blocos[0].saldo_anterior == Decimal("1000.00")
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+def test_omie_duas_colunas_continua_funcionando():
+    """A variante nova não pode ter quebrado a do FitBank."""
+    (bloco,) = fitbank.extrair(_FITBANK, 2026)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("3570.00"),
+        Decimal("-1.99"),
+    ]
+
+
+# ──────────────────────────────────────────────────────────────── Santander
+
+_SANTANDER = [
+    "Santander Empresas",
+    "Períodos: 01/06/2026 a 30/06/2026 Data/Hora: 01/07/2026 as 09h28",
+    "Saldo disponível para uso: R$ 60,00",
+    "Data Histórico Documento Valor (R$) Saldo (R$)",
+    "24/06/2026 Tarifa Avulsa Envio Pix 23/06/2026 -10,00 60,00",
+    "Tarifa Mensalidade Pacote Servicos",
+    "23/06/2026 -30,00 70,00",
+    "MAIO / 2026",
+    "11/06/2026 Ted Recebida 10580480000160 100,00 100,00",
+]
+
+
+def test_santander_inverte_para_a_ordem_cronologica():
+    (bloco,) = santander.extrair(_SANTANDER, 2026)
+    datas = [t.data for t in bloco.transacoes]
+    assert datas == sorted(datas)
+    assert bloco.transacoes[0].valor == Decimal("100.00")
+
+
+def test_santander_monta_a_descricao_quebrada_em_volta_da_linha():
+    """A linha de dados vem só com data, valor e saldo quando a descrição quebra."""
+    (bloco,) = santander.extrair(_SANTANDER, 2026)
+    do_meio = next(t for t in bloco.transacoes if t.valor == Decimal("-30.00"))
+    assert do_meio.historico == "Tarifa Mensalidade Pacote Servicos MAIO / 2026"
+
+
+def test_santander_usa_a_descricao_da_propria_linha_quando_ela_existe():
+    (bloco,) = santander.extrair(_SANTANDER, 2026)
+    tarifa = next(t for t in bloco.transacoes if t.valor == Decimal("-10.00"))
+    assert tarifa.historico == "Tarifa Avulsa Envio Pix 23/06/2026"
+
+
+def test_santander_a_cadeia_fecha():
+    assert _validar_blocos(santander.extrair(_SANTANDER, 2026), TOLERANCIA) is True
+
+
+def test_santander_nao_confunde_com_o_cabecalho_do_sicredi():
+    """Os dois cabeçalhos só diferem em `Histórico` × `Descrição`."""
+    do_sicredi = ["Data Descricao Documento Valor (R$) Saldo (R$)"]
+    assert santander.reconhece(do_sicredi) is False
+    assert santander.reconhece(["Data Histórico Documento Valor (R$) Saldo (R$)"]) is True

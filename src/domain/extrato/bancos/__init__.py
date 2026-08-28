@@ -38,6 +38,7 @@ from src.domain.extrato.bancos import (
     itau,
     mercadopago,
     nubank,
+    santander,
     sicoob,
     stone,
 )
@@ -53,6 +54,7 @@ ADAPTADORES: tuple[ModuleType, ...] = (
     itau,
     mercadopago,
     nubank,
+    santander,
     sicoob,
     stone,
 )
