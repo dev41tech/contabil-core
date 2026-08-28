@@ -507,3 +507,60 @@ async def test_conexao_removida_nao_sincroniza_mais(
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sincronizar_traz_de_volta_transacao_que_foi_apagada(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa,
+    db: AsyncSession,
+):
+    """Transação apagada não pode bloquear a volta dela pela sincronização.
+
+    A dedup consultava `hash_dedup` sem olhar `deleted_at`, e havia unicidade
+    total no banco. Uma transação removida — por cancelamento de importação ou
+    à mão — reservava o hash para sempre, e a sincronização seguinte devolvia
+    zero. Aqui é pior que na importação manual: ela roda sozinha, então ninguém
+    está olhando quando o lançamento deixa de voltar. Ver migration 0033.
+    """
+    from sqlalchemy import select, update
+
+    csrf = await _login(client, tenant, usuario)
+    conexao = await _conectar(client, empresa, csrf)
+    url = _url(empresa.id, f"/conexoes/{conexao['id']}/sincronizar")
+
+    primeira = (
+        await client.post(url, json={"dias": 30}, headers={"X-CSRF-Token": csrf})
+    ).json()
+    assert primeira["importadas"] > 0
+
+    from datetime import UTC, datetime
+
+    from src.db.models import Transacao
+
+    await db.execute(
+        update(Transacao)
+        .where(Transacao.empresa_id == empresa.id)
+        .values(deleted_at=datetime.now(UTC))
+    )
+    # flush, nao commit: a fixture `engine` e de sessao (um SQLite em memoria
+    # para a execucao inteira) e o isolamento entre testes depende do rollback.
+    # Um commit aqui persiste o tenant de CNPJ fixo e derruba os arquivos
+    # seguintes com UNIQUE constraint failed: tenants.cnpj.
+    await db.flush()
+
+    segunda = (
+        await client.post(url, json={"dias": 30}, headers={"X-CSRF-Token": csrf})
+    ).json()
+
+    assert segunda["importadas"] == primeira["importadas"], (
+        "a sincronização não recuperou as transações apagadas"
+    )
+    vivas = (
+        await db.execute(
+            select(Transacao).where(
+                Transacao.empresa_id == empresa.id,
+                Transacao.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    assert len(vivas) == primeira["importadas"]

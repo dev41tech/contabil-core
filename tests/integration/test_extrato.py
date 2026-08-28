@@ -717,3 +717,40 @@ async def test_cancelar_lote_exige_motivo(client, db, tenant, usuario, empresa):
     )
 
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reimportar_depois_de_cancelar_traz_as_transacoes_de_volta(
+    client, tenant, usuario, empresa
+):
+    """Cancelar um lote precisa liberar o arquivo para ser importado de novo.
+
+    É o fluxo de conserto do escritório: subiu o extrato errado, cancela, sobe o
+    certo. Se o cancelamento não libera, o segundo upload volta zerado e o
+    contador fica sem o extrato — sem nenhuma mensagem que explique por quê,
+    porque as linhas aparecem como "duplicadas".
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    primeira = await _importar(client, empresa, agencia["id"], csrf)
+    assert primeira.json()["importadas"] == 2
+
+    lotes = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/extrato/importacoes")
+    ).json()["items"]
+    assert len(lotes) == 1
+
+    cancelamento = await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importacoes/{lotes[0]['id']}/cancelar",
+        json={"motivo": "arquivo errado"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert cancelamento.status_code == 200
+    assert cancelamento.json()["transacoes_removidas"] == 2
+
+    segunda = await _importar(client, empresa, agencia["id"], csrf)
+    assert segunda.status_code == 202
+    assert segunda.json()["importadas"] == 2, (
+        "o cancelamento não liberou o arquivo: a reimportação veio zerada"
+    )

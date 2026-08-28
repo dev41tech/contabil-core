@@ -93,10 +93,15 @@ class ExtratoService:
                     duplicadas += 1
                     continue
 
+                # Só linha VIVA duplica. Linha cancelada mantém o hash no
+                # banco (soft delete) e, sem este filtro, bloqueava para
+                # sempre a reimportação do arquivo que o próprio usuário
+                # cancelou — ver migration 0033.
                 existing = await self._db.execute(
                     select(Transacao).where(
                         Transacao.empresa_id == self._empresa_id,
                         Transacao.hash_dedup == hash_dedup,
+                        Transacao.deleted_at.is_(None),
                     )
                 )
                 if existing.scalar_one_or_none():
@@ -199,10 +204,15 @@ class ExtratoService:
                     continue
 
                 # 2. Duplicata já persistida no banco
+                # Só linha VIVA duplica. Linha cancelada mantém o hash no
+                # banco (soft delete) e, sem este filtro, bloqueava para
+                # sempre a reimportação do arquivo que o próprio usuário
+                # cancelou — ver migration 0033.
                 existing = await self._db.execute(
                     select(Transacao).where(
                         Transacao.empresa_id == self._empresa_id,
                         Transacao.hash_dedup == hash_dedup,
+                        Transacao.deleted_at.is_(None),
                     )
                 )
                 if existing.scalar_one_or_none():
