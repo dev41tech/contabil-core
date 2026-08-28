@@ -106,7 +106,12 @@ class Settings(BaseSettings):
     # chamadas e não vira conta grande.
     pdf_max_pages: int = 120
     pdf_parse_timeout_seconds: int = 60
-    pdf_max_ai_calls: int = 10
+    # A leitura por imagem (camada 3) gasta UMA chamada por página, então este
+    # teto é, na prática, o limite de páginas de um PDF sem camada de texto. Em
+    # 10 ele recusava o extrato da Unicred, que tem 12. Em 30 cobre os extratos
+    # reais do escritório e mantém o custo de um único arquivo na casa de
+    # centavos — a camada 2, que lê texto, gasta uma chamada só.
+    pdf_max_ai_calls: int = 30
     allow_financial_data_to_openai: bool = False
 
     @property
