@@ -261,11 +261,16 @@ class OpenBankingService:
             hash_dedup = hashlib.sha256(hash_raw.encode()).hexdigest()
 
             # Pula duplicatas
+            # Só linha VIVA duplica — mesmo motivo da importação de extrato
+            # (ver migration 0033). Aqui pesa mais: a sincronização roda
+            # sozinha, então uma transação cancelada bloquearia a volta do
+            # lançamento sem ninguém olhando.
             existe = (
                 await self._db.execute(
                     select(Transacao).where(
                         Transacao.empresa_id == self._empresa_id,
                         Transacao.hash_dedup == hash_dedup,
+                        Transacao.deleted_at.is_(None),
                     )
                 )
             ).scalar_one_or_none()

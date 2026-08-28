@@ -565,7 +565,21 @@ class Transacao(Base, TimestampMixin):
     )
 
     __table_args__ = (
-        UniqueConstraint("empresa_id", "hash_dedup", name="uq_transacao_empresa_hash"),
+        # Dedup vale só entre transações VIVAS. A unicidade era total
+        # (`uq_transacao_empresa_hash`) e, como cancelar uma importação faz soft
+        # delete, o hash da linha cancelada continuava ocupando o lugar: o mesmo
+        # extrato nunca mais entrava. É o fluxo de conserto do escritório —
+        # subiu o arquivo errado, cancela, sobe o certo — e ele voltava zerado,
+        # com as linhas contadas como "duplicadas" e nenhuma mensagem
+        # explicando. Mesmo padrão de `uq_registro_transacao_dc_ativo`.
+        Index(
+            "uq_transacao_empresa_hash_ativo",
+            "empresa_id",
+            "hash_dedup",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_transacao_empresa_status", "empresa_id", "status"),
         # Ordem de leitura do extrato (`extrato/ordenacao.py`).
         Index("ix_transacao_empresa_data_ordem", "empresa_id", "data", "ordem"),
