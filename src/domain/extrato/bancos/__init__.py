@@ -28,6 +28,7 @@ from __future__ import annotations
 from types import ModuleType
 
 from src.domain.extrato.bancos import (
+    bb,
     bbc,
     bradesco,
     c6,
@@ -46,6 +47,7 @@ from src.domain.extrato.bancos import (
 )
 
 ADAPTADORES: tuple[ModuleType, ...] = (
+    bb,
     bbc,
     bradesco,
     c6,

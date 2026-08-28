@@ -29,6 +29,7 @@ import pytest
 
 from src.domain.extrato import bancos
 from src.domain.extrato.bancos import (
+    bb,
     bbc,
     c6,
     caixa,
@@ -635,4 +636,126 @@ def test_caixa_nao_importa_o_cheque_depositado_que_nao_moveu_o_saldo():
 def test_caixa_a_cadeia_fecha_sem_a_linha_bloqueada():
     """Com o depósito dentro, ela acusaria 5.110,00 de diferença que não existe."""
     blocos = caixa.extrair_de_palavras([_CAIXA], 2025)
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# ───────────────────────────────────────────── Banco do Brasil — dois layouts
+
+# Layout B ("Dia Lote"): cada lançamento em três alturas, sinal em (+)/(-).
+_CABECALHO_BB_DIA = [
+    _p("Dia", 30, 103),
+    _p("Lote", 91, 103),
+    _p("Documento", 152, 103),
+    _p("Histórico", 266, 103),
+    _p("Valor", 547, 103, largura=22),
+]
+
+
+def _bb_grupo(top, data=None, hist=(), lote=None, valor=None, sinal="-", compl=()):
+    palavras = []
+    if data:
+        palavras.append(_p(data, 30, top, largura=43))
+    for i, texto in enumerate(hist):
+        palavras.append(_p(texto, 266 + i * 42, top, largura=40))
+    if lote:
+        palavras.append(_p(lote, 91, top + 5, largura=24))
+    if valor:
+        palavras.append({"text": valor, "x0": 536, "x1": 557, "top": top + 5})
+        palavras.append({"text": f"({sinal})", "x0": 561, "x1": 573, "top": top + 5})
+    for i, texto in enumerate(compl):
+        palavras.append(_p(texto, 266 + i * 42, top + 10, largura=40))
+    return palavras
+
+
+# Os grupos ficam a 24 pontos uns dos outros: dentro do grupo as alturas somam
+# 10, e o agrupamento usa 14 — precisa separar do grupo seguinte.
+_BB_DIA_LOTE = [
+    *_CABECALHO_BB_DIA,
+    *_bb_grupo(121, hist=("Saldo", "Anterior"), valor="13,44", sinal="-"),
+    *_bb_grupo(145, data="02/01/2026", hist=("Cobrança", "de I.O.F."),
+               lote="13601", valor="0,29", sinal="-", compl=("IOF", "Saldo Devedor")),
+    *_bb_grupo(175, data="00/00/0000", hist=("Saldo", "do dia"),
+               lote="13113", valor="13,73", sinal="-"),
+]
+
+
+def test_bb_dia_lote_junta_as_tres_alturas():
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert len(bloco.transacoes) == 1
+    assert bloco.transacoes[0].valor == Decimal("-0.29")
+
+
+def test_bb_dia_lote_le_o_sinal_entre_parenteses():
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert bloco.saldo_anterior == Decimal("-13.44")
+
+
+def test_bb_dia_lote_usa_saldo_do_dia_como_ancora_e_ignora_a_data_invalida():
+    """A data `00/00/0000` é do MARCADOR de saldo, não de um lançamento."""
+    (bloco,) = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert bloco.transacoes[-1].saldo_apos == Decimal("-13.73")
+    assert all(t.data.isoformat() == "2026-01-02" for t in bloco.transacoes)
+
+
+def test_bb_dia_lote_a_cadeia_fecha():
+    blocos = bb.extrair_de_palavras([_BB_DIA_LOTE], 2026)
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# Layout A ("Dt. balancete"): uma linha por lançamento, sinal em D/C.
+_CABECALHO_BB_BAL = [
+    _p("Dt.", 60, 195),
+    _p("balancete", 73, 195),
+    _p("Dt.", 118, 195),
+    _p("movimento", 132, 195),
+    _p("Lote", 228, 195),
+    _p("Histórico", 250, 195),
+    _p("Documento", 407, 195),
+    _p("Valor", 471, 195),
+    _p("R$", 494, 195, largura=8),
+    _p("Saldo", 525, 195, largura=18),
+]
+
+_BB_BALANCETE = [
+    *_CABECALHO_BB_BAL,
+    _p("30/01/2026", 65, 206, largura=43),
+    _p("Saldo", 266, 206),
+    _p("Anterior", 289, 206),
+    {"text": "100,00", "x0": 507, "x1": 535, "top": 206},
+    {"text": "D", "x0": 542, "x1": 548, "top": 206},
+    _p("02/02/2026", 65, 218, largura=43),
+    _p("Pix", 266, 218),
+    _p("Recebido", 284, 218),
+    {"text": "350,00", "x0": 471, "x1": 492, "top": 218},
+    {"text": "C", "x0": 499, "x1": 505, "top": 218},
+    # A letra do sinal do VALOR grudada no número do SALDO: `D0,00`.
+    # -100,00 (abertura) + 350,00 - 250,00 = 0,00, que é o saldo impresso.
+    _p("02/02/2026", 65, 242, largura=43),
+    _p("BB", 266, 242),
+    _p("Rende", 284, 242),
+    {"text": "250,00", "x0": 471, "x1": 492, "top": 242},
+    {"text": "D0,00", "x0": 499, "x1": 535, "top": 242},
+    {"text": "C", "x0": 542, "x1": 548, "top": 242},
+]
+
+
+def test_bb_balancete_separa_a_letra_grudada_no_numero_seguinte():
+    """`D0,00` é o sinal do valor mais o saldo — dois campos num token só.
+
+    Sem separar, o saldo se perde e o valor fica sem sinal. No extrato real
+    isso escondia sete lançamentos e derrubava a cadeia.
+    """
+    (bloco,) = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
+    sweep = bloco.transacoes[-1]
+    assert sweep.valor == Decimal("-250.00")
+    assert sweep.saldo_apos == Decimal("0.00")
+
+
+def test_bb_balancete_le_a_abertura_da_coluna_de_saldo():
+    (bloco,) = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
+    assert bloco.saldo_anterior == Decimal("-100.00")
+
+
+def test_bb_balancete_a_cadeia_fecha():
+    blocos = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
     assert _validar_blocos(blocos, TOLERANCIA) is True
