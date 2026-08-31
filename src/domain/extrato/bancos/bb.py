@@ -120,6 +120,9 @@ _LETRA_COLADA = re.compile(r"^([DC])(\d{1,3}(?:\.\d{3})*,\d{2})$")
 # Largura aproximada da letra, para devolver ao número a borda direita que ele
 # já tinha — é ela que identifica a coluna.
 _LARGURA_DA_LETRA = 6.0
+# Um valor como `12.376,74` ocupa ~30 pontos; 40 cobre a coluna inteira com
+# folga e ainda fica muito à direita da coluna de descrição.
+_LARGURA_DA_COLUNA_NUMERICA = 40.0
 
 
 def _separar_letra_colada(palavras: list[dict]) -> list[dict]:
@@ -199,6 +202,11 @@ def _colunas_balancete(linhas: list[list[dict]]) -> dict | None:
 _CODIGO_DO_HISTORICO = re.compile(r"^\d{1,4}\s+(?=\D)")
 
 
+def _e_linha_de_fecho(texto: str) -> str:
+    """`S A L D O`, com as letras soltas, é a linha de fecho do extrato."""
+    return texto.replace(" ", "").upper() == "SALDO"
+
+
 def _limpar_codigo_do_historico(texto: str) -> str:
     return _CODIGO_DO_HISTORICO.sub("", texto, count=1)
 
@@ -218,6 +226,7 @@ def _palavra_vizinha(linhas: list[list[dict]], indice: int, alvo: str) -> dict |
 def _extrair_balancete(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
     transacoes: list[TransacaoOFX] = []
     saldo_anterior: Decimal | None = None
+    saldo_final: Decimal | None = None
     idx = 0
     colunas: dict | None = None
 
@@ -243,7 +252,15 @@ def _extrair_balancete(paginas: list[list[dict]], referencia_ano: int) -> list[B
                 if _DATA.match(texto) and abs(x0 - colunas["x_data"]) <= 14:
                     data_lida = parse_data(texto, referencia_ano)
                     continue
-                if texto.upper() in ("D", "C") and len(texto) == 1:
+                # A letra do sinal mora à direita das colunas numéricas. Sem
+                # essa condição, QUALQUER `D` ou `C` solto da linha virava
+                # marcador — e a linha de fecho `S A L D O`, que traz as letras
+                # separadas, perdia o próprio D e deixava de ser reconhecida.
+                if (
+                    texto.upper() in ("D", "C")
+                    and len(texto) == 1
+                    and x0 >= colunas["valor"] - _LARGURA_DA_COLUNA_NUMERICA
+                ):
                     marcas.append((x0, -1 if texto.upper() == "D" else 1))
                     continue
                 if _VALOR.match(texto):
@@ -280,6 +297,20 @@ def _extrair_balancete(paginas: list[list[dict]], referencia_ano: int) -> list[B
                     saldo_anterior = saldo if saldo is not None else valor
                 continue
 
+            # O fecho do extrato vem com as letras SEPARADAS — `S A L D O` —,
+            # numa linha de código de histórico 999. Sem reconhecê-la, ela virava
+            # complemento do último lançamento e o bloco ficava sem saldo final:
+            #
+            #     30/04/2026  0000 00000 123  Cobrança de Juros   6,74 D
+            #     30/04/2026  0000 00000 999  S A L D O                  0,80 C
+            #
+            # A cauda depois da última âncora fica então inconferível, e um mês
+            # inteiro é recusado por causa da linha que justamente o fecharia.
+            if _e_linha_de_fecho(texto_descricao):
+                if saldo is not None:
+                    saldo_final = saldo
+                continue
+
             if valor is None or valor == 0:
                 # Linha de complemento: pertence ao lançamento de cima.
                 if texto_descricao and transacoes:
@@ -308,7 +339,13 @@ def _extrair_balancete(paginas: list[list[dict]], referencia_ano: int) -> list[B
 
     if not transacoes:
         return []
-    return [Bloco(transacoes=transacoes, saldo_anterior=saldo_anterior)]
+    return [
+        Bloco(
+            transacoes=transacoes,
+            saldo_anterior=saldo_anterior,
+            saldo_final=saldo_final,
+        )
+    ]
 
 
 # ──────────────────────────────────────────────────────── layout B: dia/lote
