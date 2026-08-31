@@ -130,9 +130,60 @@ _ASSINATURA_GERENCIADOR = re.compile(
 )
 
 
+# ──────────────────────────────────────────── layout "Extrato por período"
+#
+#     Data Mov.   Nr. Doc.  Histórico        Valor        Saldo
+#                 000000    SALDO ANTERIOR    0,00   57.315,62 D
+#     02/01/2026  000000    DEB IOF         215,80 D 57.531,42 D
+#     02/01/2026  000000    SALDO DIA         0,00 C 65.315,41 D
+#
+# É o mais simples dos três layouts da Caixa: uma linha por lançamento e a letra
+# D/C tanto no valor quanto no saldo — nada a inferir, ao contrário do
+# "Gerenciador", que imprime o saldo devedor sem sinal.
+#
+# Por isso ele NÃO ganha corpo próprio: só o cabeçalho muda, e o corpo do layout
+# com D/C lê este igual. Duplicar a extração seria criar dois lugares para o
+# mesmo erro.
+
+
+_ASSINATURA_PERIODO = re.compile(
+    r"\bdata\s+mov\.\s+nr\.\s+doc\..*\bhist[óo]rico\b.*\bvalor\b.*\bsaldo\b",
+    re.IGNORECASE,
+)
+
+
+def _ler_cabecalho_periodo(linhas: list[list[dict]]) -> _Colunas | None:
+    for palavras in linhas:
+        textos = [p["text"].lower() for p in palavras]
+        if "data" not in textos or "mov." not in textos:
+            continue
+        if not any(t.startswith("hist") for t in textos):
+            continue
+        valor = borda_direita(textos, palavras, "valor")
+        saldo = borda_direita(textos, palavras, "saldo")
+        if valor is None or saldo is None:
+            continue
+        return _Colunas(
+            x_data=float(palavras[textos.index("data")]["x0"]),
+            x_descricao=float(
+                palavras[next(i for i, t in enumerate(textos) if t.startswith("hist"))]["x0"]
+            ),
+            valor=valor,
+            saldo=saldo,
+        )
+    return None
+
+
+def _ler_cabecalho_com_letra(linhas: list[list[dict]]) -> _Colunas | None:
+    """Os dois layouts que trazem a letra D/C, por qualquer um dos cabeçalhos."""
+    return _ler_cabecalho(linhas) or _ler_cabecalho_periodo(linhas)
+
+
 def reconhece(linhas: list[str]) -> bool:
     return any(
-        _ASSINATURA.search(linha) or _ASSINATURA_GERENCIADOR.search(linha)
+        _ASSINATURA.search(linha)
+        or _ASSINATURA_GERENCIADOR.search(linha)
+        or _ASSINATURA_PERIODO.search(linha)
         for linha in linhas
     )
 
@@ -335,12 +386,12 @@ def extrair_de_palavras(paginas: list[list[dict]], referencia_ano: int) -> list[
 
     for palavras in paginas:
         linhas = agrupar_linhas(palavras, altura=_ALTURA_DO_LANCAMENTO)
-        colunas = _ler_cabecalho(linhas) or colunas
+        colunas = _ler_cabecalho_com_letra(linhas) or colunas
         if colunas is None:
             continue
 
         for linha in linhas:
-            if _ler_cabecalho([linha]) is not None:
+            if _ler_cabecalho_com_letra([linha]) is not None:
                 continue
 
             data_lida: date | None = None

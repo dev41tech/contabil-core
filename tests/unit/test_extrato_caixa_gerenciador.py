@@ -160,3 +160,65 @@ def test_gerenciador_e_reconhecido_pelo_conteudo():
     assert caixa.reconhece(
         ["Documento Histórico Valor(R$) Saldo(R$)", "lançamento movimento"]
     ) is True
+
+
+# ── terceiro layout: "Extrato por período", com D/C explícito ────────────────
+#
+#     Data Mov.   Nr. Doc.  Histórico        Valor        Saldo
+#                 000000    SALDO ANTERIOR    0,00   57.315,62 D
+#     02/01/2026  000000    DEB IOF         215,80 D 57.531,42 D
+#     02/01/2026  000000    SALDO DIA         0,00 C 65.315,41 D
+#
+# É o mais simples dos três: a letra diz o sinal do valor E do saldo, então não
+# há nada a inferir. Só o cabeçalho muda — o corpo que lê o layout com D/C lê
+# este igual, e é por isso que ele não ganhou extração própria.
+
+_PERIODO = [
+    _p("Data", 40, 58, 225.1), _p("Mov.", 61, 78, 225.1),
+    _p("Nr.", 102, 112, 225.1), _p("Doc.", 115, 132, 225.1),
+    _p("Histórico", 168, 201, 225.1),
+    _p("Valor", 399, 418, 225.1), _p("Saldo", 525, 546, 225.1),
+
+    _p("02/01/2026", 40, 85, 265.6), _p("000000", 102, 130, 265.6),
+    _p("DEB", 168, 184, 265.6), _p("IOF", 187, 200, 265.6),
+    _p("215,80", 383, 410, 265.6), _p("D", 412, 418, 265.6),
+    _p("57.531,42", 499, 538, 265.6), _p("D", 540, 546, 265.6),
+
+    _p("02/01/2026", 40, 85, 285.8), _p("000000", 102, 130, 285.8),
+    _p("DEB", 168, 184, 285.8), _p("JUROS", 187, 212, 285.8),
+    _p("7.783,99", 376, 410, 285.8), _p("D", 412, 418, 285.8),
+    _p("65.315,41", 499, 538, 285.8), _p("D", 540, 546, 285.8),
+
+    _p("02/01/2026", 40, 85, 306.1), _p("000000", 102, 130, 306.1),
+    _p("SALDO", 168, 194, 306.1), _p("DIA", 197, 211, 306.1),
+    _p("0,00", 393, 410, 306.1), _p("C", 413, 418, 306.1),
+    _p("65.315,41", 499, 538, 306.1), _p("D", 540, 546, 306.1),
+
+    _p("08/01/2026", 40, 85, 326.3), _p("000033", 102, 130, 326.3),
+    _p("CRED", 168, 190, 326.3), _p("TED", 193, 210, 326.3),
+    _p("4.932,00", 376, 410, 326.3), _p("C", 413, 418, 326.3),
+    _p("60.383,41", 499, 538, 326.3), _p("D", 540, 546, 326.3),
+]
+
+
+def test_periodo_le_o_sinal_da_letra_no_valor_e_no_saldo():
+    """Nada a inferir aqui: a letra diz tudo, inclusive que o saldo é devedor."""
+    (bloco,) = caixa.extrair_de_palavras([_PERIODO], 2026)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-215.80"), Decimal("-7783.99"), Decimal("4932.00")
+    ]
+    assert [t.saldo_apos for t in bloco.transacoes] == [
+        Decimal("-57531.42"), Decimal("-65315.41"), Decimal("-60383.41")
+    ]
+
+
+def test_periodo_ignora_saldo_dia():
+    (bloco,) = caixa.extrair_de_palavras([_PERIODO], 2026)
+    assert all("SALDO DIA" not in t.historico for t in bloco.transacoes)
+
+
+def test_periodo_e_reconhecido_pelo_conteudo():
+    assert caixa.reconhece(
+        ["Data Mov. Nr. Doc. Histórico Valor Saldo",
+         "02/01/2026 000000 DEB IOF 215,80 D 57.531,42 D"]
+    ) is True

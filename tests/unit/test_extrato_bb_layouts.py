@@ -198,3 +198,56 @@ def test_painel_e_reconhecido_pelo_conteudo():
         "31/12/2025 Saldo Anterior -R$ 245,30",
     ]
     assert bb.reconhece(linhas) is True
+
+
+# ── a linha de fecho, com as letras separadas ────────────────────────────────
+
+_COM_FECHO = [
+    *_CONSULTAS[:12],
+    _p("30/03/2026", 51, 89, 219.1), _p("0000", 149, 166, 219.1),
+    _p("00000", 185, 206, 219.1), _p("000", 215, 228, 219.1),
+    _p("Saldo", 230, 249, 219.1), _p("Anterior", 251, 277, 219.1),
+    _p("7,54", 521, 540, 219.1), _p("C", 542, 547, 219.1),
+
+    # Lançamento SEM saldo: fica na cauda, depois da última âncora.
+    _p("30/04/2026", 51, 89, 234.6), _p("0000", 149, 166, 234.6),
+    _p("13601", 185, 206, 234.6), _p("123", 215, 228, 234.6),
+    _p("Cobrança", 230, 266, 234.6), _p("de", 268, 277, 234.6),
+    _p("Juros", 279, 300, 234.6),
+    _p("6,74", 469, 488, 234.6), _p("D", 490, 496, 234.6),
+
+    # O fecho: `S A L D O`, letra por letra, com código de histórico 999.
+    _p("30/04/2026", 51, 89, 250.6), _p("0000", 149, 166, 250.6),
+    _p("00000", 185, 206, 250.6), _p("999", 215, 228, 250.6),
+    _p("S", 230, 235, 250.6), _p("A", 237, 242, 250.6),
+    _p("L", 244, 248, 250.6), _p("D", 250, 256, 250.6),
+    _p("O", 258, 264, 250.6),
+    _p("0,80", 521, 540, 250.6), _p("C", 542, 547, 250.6),
+]
+
+
+def test_fecho_com_letras_separadas_vira_saldo_final():
+    """`S A L D O` é a linha de fecho, e sem ela a cauda fica inconferível.
+
+    O extrato de abr/2026 da JS BERTOLDO termina com um lançamento sem saldo na
+    própria linha. O saldo que o cobre está na linha seguinte, com as letras
+    soltas — e, não reconhecida, ela virava complemento do lançamento de cima.
+    Um mês inteiro era recusado por causa da linha que justamente o fechava.
+    """
+    (bloco,) = bb.extrair_de_palavras([_COM_FECHO], 2026)
+    assert bloco.saldo_final == Decimal("0.80")
+    assert len(bloco.transacoes) == 1
+    assert bloco.transacoes[0].historico.startswith("Cobrança de Juros")
+    assert _validar_blocos([bloco], TOLERANCIA) is True
+
+
+def test_letra_solta_na_descricao_nao_e_marcador_de_sinal():
+    """O `D` de `S A L D O` estava sendo comido como sinal.
+
+    A letra D/C era capturada em QUALQUER posição da linha. O fecho perdia o
+    próprio D, virava "S A L O" e deixava de ser reconhecido.
+    """
+    (bloco,) = bb.extrair_de_palavras([_COM_FECHO], 2026)
+    # Se o D tivesse sido consumido, o fecho não seria detectado e a linha
+    # entraria como complemento do lançamento.
+    assert "S A L" not in bloco.transacoes[0].historico
