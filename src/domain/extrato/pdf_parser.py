@@ -590,17 +590,29 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
 
 # ──────────────────────────────────────────────── Camada 3: Vision (PDF de imagem)
 
-# Medido nos extratos do Itaú da JS BERTOLDO, com o MESMO prompt e a MESMA
-# imagem, o gpt-4o não dava conta: fundia lançamentos, perdia o menos que o Itaú
-# imprime DEPOIS do número e trocava datas. A 200 dpi continuava errando — não
-# era resolução, era o modelo.
+# ESTE MODELO FOI ESCOLHIDO POR MEDIÇÃO, NÃO POR PREÇO DE TABELA.
 #
-#     gpt-4o        funde linhas, `5.969,14-` vira +5969.14, 2 de 8 saldos
-#                   de dia trocados por valores de lançamento
-#     gpt-5.5       página inteira correta, 8 de 8 saldos de dia
-#     gpt-5.6-sol   idem, com metade dos tokens de saída
+# Cada linha abaixo é uma rodada COMPLETA dos quatro extratos do Itaú da JS
+# BERTOLDO (13 páginas), pelo `parse_pdf`, com este mesmo prompt. O critério é
+# ler os quatro; "a cadeia fechou" não basta, e o `luna` explica por quê.
 #
-# `gpt-5.5` serve de reserva: mesma precisão, mesmo formato de chamada.
+#     modelo          R$/página   resultado
+#     gpt-5.6-luna      0,010     recusa 3 de 4 — e no que passa PERDE 5
+#                                 lançamentos com a cadeia fechando mesmo assim
+#     gpt-5.6-terra     0,101     recusa 1 de 4
+#     gpt-5.4           0,127     recusa 2 de 4
+#     gpt-5.6-sol       0,181     LÊ OS QUATRO (56, 56, 91, 53)
+#     gpt-5.5           0,400     lê, com o dobro dos tokens de saída
+#     gpt-4o            0,080     funde linhas, `5.969,14-` vira +5969.14,
+#                                 troca datas; a 200 dpi continua errando
+#
+# O `sol` é o mais barato que lê tudo. Baratear mais já foi tentado e não é
+# questão de ajustar o prompt: `luna` e `terra` erram de formas diferentes
+# (quantidade e layout), e o caso do `luna` mostra que lançamento perdido entre
+# duas âncoras pode passar pela conferência. Reserva: `gpt-5.5`.
+#
+# Sem `temperature=0` (o modelo não aceita), duas execuções independentes dos
+# quatro arquivos deram exatamente 56, 56, 91 e 53.
 _MODELO_VISION = "gpt-5.6-sol"
 
 # Uma chamada por página. Renderizar em 150 dpi mantém o texto legível sem
