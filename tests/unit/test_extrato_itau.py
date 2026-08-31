@@ -405,3 +405,82 @@ def test_itau_lancamentos_le_as_duas_pontas_em_colunas_diferentes():
 def test_itau_lancamentos_a_cadeia_fecha_pelas_pontas():
     blocos = itau.extrair_de_palavras([_ITAU_LANCAMENTOS], 2026)
     assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# ── varredura para a aplicação automática que o extrato não imprime ──────────
+#
+# Reproduz o dia 02/02 do extrato real de fev/2026 da JS BERTOLDO:
+#
+#     29/01  Saldo anterior                              64,34
+#     02/02  PIX ENVIADO JS BERTOLDO       15.200,00-
+#            Sispag SIG COMBIBLOC DO  15.200,00           1,01
+#            SALDO APLIC AUT MAIS                        63,33
+#
+# O saldo cai de 64,34 para 1,01 e nenhuma linha explica os 63,33. Eles foram
+# varridos para a aplicação — o extrato mostra só o saldo de destino.
+
+_VARREDURA = [
+    *_CABECALHO_MENSAL,
+    _p("29/01", 150, 606, largura=22),
+    _p("Saldo", 208, 606), _p("anterior", 232, 606),
+    _direita("64,34", 549, 606),
+
+    _p("02/02", 150, 624, largura=22),
+    _p("PIX", 208, 624), _p("ENVIADO", 224, 624), _p("BERTOLDO", 262, 624),
+    _direita("15.200,00-", 456, 624),
+
+    _p("Sispag", 208, 640), _p("SIG", 236, 640), _p("COMBIBLOC", 252, 640),
+    _direita("15.200,00", 396, 640),
+    _direita("1,01", 549, 640),
+
+    _p("SALDO", 208, 656), _p("APLIC", 236, 656), _p("AUT", 262, 656),
+    _p("MAIS", 280, 656),
+    _direita("63,33", 549, 656),
+]
+
+
+def test_itau_deriva_a_varredura_que_o_extrato_nao_imprime():
+    """O dinheiro saiu da conta de verdade; não importar deixaria o razão errado."""
+    (bloco,) = itau.extrair_de_palavras([_VARREDURA], 2026)
+
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-15200.00"), Decimal("-63.33"), Decimal("15200.00")
+    ]
+    derivado = bloco.transacoes[1]
+    assert "APLICACAO AUTOMATICA" in derivado.historico
+    assert derivado.data.isoformat() == "2026-02-02"
+    # A âncora impressa continua sendo a do banco — nada de saldo reescrito.
+    assert derivado.saldo_apos is None
+    assert bloco.transacoes[2].saldo_apos == Decimal("1.01")
+
+
+def test_itau_varredura_derivada_fecha_a_cadeia():
+    (bloco,) = itau.extrair_de_palavras([_VARREDURA], 2026)
+    assert _validar_blocos([bloco], Decimal("0.05")) is True
+
+
+def test_itau_nao_deriva_quando_os_dois_numeros_discordam():
+    """A derivação é autorizada por DOIS números impressos que concordam.
+
+    Aqui o saldo da aplicação diz 10,00 e o buraco da conta corrente diz 63,33.
+    Um dos dois está errado, ou falta outra coisa — e inventar o lançamento
+    seria fabricar exatamente o valor que faz a conferência passar. Nada é
+    criado, e o extrato é recusado como qualquer outro que não se explica.
+    """
+    discordante = [
+        p if p["text"] != "63,33" else {**p, "text": "10,00"} for p in _VARREDURA
+    ]
+    (bloco,) = itau.extrair_de_palavras([discordante], 2026)
+
+    assert len(bloco.transacoes) == 2
+    assert all("APLICACAO" not in t.historico for t in bloco.transacoes)
+    with pytest.raises(PDFParseError, match="não caminha"):
+        _validar_blocos([bloco], Decimal("0.05"))
+
+
+def test_itau_sem_aplicacao_nada_muda():
+    """O caminho comum não pode ganhar lançamento nenhum."""
+    sem_aplicacao = [p for p in _VARREDURA if p["top"] != 656]
+    # Sem a linha da aplicação, o buraco fica sem explicação e nada é derivado.
+    (bloco,) = itau.extrair_de_palavras([sem_aplicacao], 2026)
+    assert len(bloco.transacoes) == 2

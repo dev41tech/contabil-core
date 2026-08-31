@@ -149,6 +149,83 @@ def reconhece(linhas: list[str]) -> bool:
     )
 
 
+_APLICACAO = re.compile(r"APLIC\w*\s+AUT", re.IGNORECASE)
+_TOLERANCIA_VARREDURA = Decimal("0.05")
+
+
+def _derivar_varredura_da_aplicacao(
+    transacoes: list[TransacaoOFX],
+    saldo_anterior: Decimal | None,
+    aplicacoes: list[tuple[int, Decimal]],
+) -> list[TransacaoOFX]:
+    """Repõe a varredura para a aplicação automática que o extrato não imprime.
+
+    O Itaú varre o que sobra na conta corrente para a aplicação automática. Às
+    vezes ele imprime a linha (`Apl Aplic Aut Mais 279,61-`) e às vezes não —
+    no extrato de fev/2026 da JS BERTOLDO, o dia 02/02 mostra o saldo pulando
+    de 64,34 para 1,01 sem uma única linha que explique os 63,33:
+
+        02/02  PIX ENVIADO JS BERTOLDO           15.200,00-
+               Sispag SIG COMBIBLOC DO  15.200,00        1,01
+               SALDO APLIC AUT MAIS                     63,33
+
+    O dinheiro saiu da conta de verdade. Não importar o lançamento deixaria o
+    razão 63,33 acima do extrato — e importar sem conferir seria inventar.
+
+    **O que autoriza a derivação são dois números impressos que concordam.** O
+    buraco da cadeia da conta corrente diz quanto falta; a VARIAÇÃO do saldo da
+    aplicação diz para onde foi. Só quando os dois batem, dentro da tolerância
+    de centavos, o lançamento é criado — e ele é criado com o valor que ambos
+    exigem, não com um valor escolhido. Se discordarem, nada é criado e a
+    recusa acontece como antes: um extrato que não se explica não entra.
+
+    O lançamento derivado entra ANTES da linha que carrega o saldo impresso.
+    Dentro do dia a ordem não muda a soma, e assim a âncora impressa continua
+    sendo a âncora — nenhum saldo do banco é reescrito.
+    """
+    if saldo_anterior is None or not aplicacoes:
+        return transacoes
+
+    # posição na lista → saldo da aplicação impresso logo depois dela
+    por_posicao = dict(aplicacoes)
+    resultado: list[TransacaoOFX] = []
+    corrente = saldo_anterior
+    saldo_aplicacao = Decimal("0")
+
+    for posicao, transacao in enumerate(transacoes):
+        impresso = transacao.saldo_apos
+        aplicacao_seguinte = por_posicao.get(posicao + 1)
+
+        if impresso is not None and aplicacao_seguinte is not None:
+            buraco = impresso - (corrente + transacao.valor)
+            movido_para_aplicacao = aplicacao_seguinte - saldo_aplicacao
+            if (
+                abs(buraco) > _TOLERANCIA_VARREDURA
+                and abs(buraco + movido_para_aplicacao) <= _TOLERANCIA_VARREDURA
+            ):
+                derivado = TransacaoOFX(
+                    fitid=gerar_fitid(
+                        transacao.data, "APLICACAO AUTOMATICA", buraco, len(resultado)
+                    ),
+                    data=transacao.data,
+                    valor=buraco,
+                    historico="APLICACAO AUTOMATICA (derivado do saldo da aplicacao)",
+                    tipo_ofx="CREDIT" if buraco >= 0 else "DEBIT",
+                    saldo_apos=None,
+                    ordem=len(resultado),
+                )
+                resultado.append(derivado)
+                corrente += buraco
+
+        if aplicacao_seguinte is not None:
+            saldo_aplicacao = aplicacao_seguinte
+
+        corrente = impresso if impresso is not None else corrente + transacao.valor
+        resultado.append(replace(transacao, ordem=len(resultado)))
+
+    return resultado
+
+
 def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
     """Extrato mensal impresso — duas colunas, entradas e saídas separadas."""
     transacoes: list[TransacaoOFX] = []
@@ -157,6 +234,8 @@ def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloc
     fim_da_tabela = False
     idx = 0
     ultima_data: date | None = None
+    # (posição na lista de lançamentos, saldo da aplicação naquele ponto)
+    aplicacoes: list[tuple[int, Decimal]] = []
 
     for palavras in paginas:
         if fim_da_tabela:
@@ -235,8 +314,12 @@ def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloc
                 break
 
             # Saldo de aplicação automática impresso na coluna de saldo da conta
-            # corrente: não é lançamento e não pode ancorar a cadeia.
+            # corrente: não é lançamento e não pode ancorar a cadeia. Mas é
+            # ANOTADO, porque a variação dele explica a varredura que o extrato
+            # às vezes deixa de imprimir — ver `_derivar_varredura_da_aplicacao`.
             if texto_descricao.upper().startswith("SALDO"):
+                if _APLICACAO.search(texto_descricao) and "saldo" in valores:
+                    aplicacoes.append((len(transacoes), valores["saldo"]))
                 continue
 
             if "credito" in valores:
@@ -267,7 +350,9 @@ def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloc
         return []
     return [
         Bloco(
-            transacoes=transacoes,
+            transacoes=_derivar_varredura_da_aplicacao(
+                transacoes, saldo_anterior, aplicacoes
+            ),
             saldo_anterior=saldo_anterior,
             saldo_final=saldo_final,
         )
