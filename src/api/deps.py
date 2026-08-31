@@ -121,7 +121,8 @@ async def require_csrf(
         logger.warning("csrf.cookie_ausente", path=request.url.path,
                        tem_header=bool(x_csrf_token))
         raise ForbiddenError(
-            message="Sessão sem token de segurança — recarregue a página para continuar."
+            message="Sessão sem token de segurança — recarregue a página para continuar.",
+            code="CSRF_INVALID",
         )
     if csrf_cookie != x_csrf_token:
         # Com cookie e header diferentes: a aba guardou um valor que outra aba
@@ -129,8 +130,12 @@ async def require_csrf(
         # ter passado a preservar o token).
         logger.warning("csrf.header_divergente", path=request.url.path,
                        tem_header=bool(x_csrf_token))
+        # Código próprio, distinto de um 403 de PERMISSÃO: o frontend precisa
+        # saber que este 403 se resolve buscando o token de novo e repetindo, e
+        # não mandando o usuário procurar quem lhe dê acesso.
         raise ForbiddenError(
-            message="Token de segurança desatualizado — recarregue a página para continuar."
+            message="Token de segurança desatualizado — recarregue a página para continuar.",
+            code="CSRF_INVALID",
         )
 
 

@@ -135,3 +135,7 @@ async def test_gravacao_sem_header_nenhum_e_recusada(client: AsyncClient, usuari
     )
     assert resposta.status_code == 403
     assert "desatualizado" in resposta.json()["message"]
+    # O frontend distingue ESTE 403 de um 403 de permissão por este código, e
+    # repete a requisição depois de buscar o token atual. Se o campo ou o valor
+    # mudar, a recuperação para de disparar em silêncio — daí a asserção.
+    assert resposta.json()["error"] == "CSRF_INVALID"
