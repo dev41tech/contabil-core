@@ -590,51 +590,109 @@ def _transacao_from_ai(item: dict, idx: int) -> TransacaoOFX | None:
 
 # ──────────────────────────────────────────────── Camada 3: Vision (PDF de imagem)
 
-_MODELO_VISION = "gpt-4o"
+# Medido nos extratos do Itaú da JS BERTOLDO, com o MESMO prompt e a MESMA
+# imagem, o gpt-4o não dava conta: fundia lançamentos, perdia o menos que o Itaú
+# imprime DEPOIS do número e trocava datas. A 200 dpi continuava errando — não
+# era resolução, era o modelo.
+#
+#     gpt-4o        funde linhas, `5.969,14-` vira +5969.14, 2 de 8 saldos
+#                   de dia trocados por valores de lançamento
+#     gpt-5.5       página inteira correta, 8 de 8 saldos de dia
+#     gpt-5.6-sol   idem, com metade dos tokens de saída
+#
+# `gpt-5.5` serve de reserva: mesma precisão, mesmo formato de chamada.
+_MODELO_VISION = "gpt-5.6-sol"
 
 # Uma chamada por página. Renderizar em 150 dpi mantém o texto legível sem
 # estourar o tamanho da imagem.
 _DPI_VISION = 150
 
+# O prompt abaixo é fruto de rodar a Vision nos extratos reais do Itaú da JS
+# BERTOLDO e LER a saída. A primeira versão pedia interpretação demais, e cada
+# pedaço de interpretação virou um erro:
+#
+#   - `5.969,14-` voltava como 5969.14: o menos vinha DEPOIS do número, e o
+#     prompt só falava do menos antes. Numa conta no vermelho isso inverte
+#     TODOS os saldos, e a cadeia quebra no primeiro passo;
+#   - o saldo impresso uma vez na última linha do dia era repetido nos três
+#     lançamentos daquele dia, criando três âncoras onde havia uma;
+#   - o histórico saía como a concatenação do bloco inteiro, igual em todas as
+#     linhas dele;
+#   - as linhas `SALDO TOTAL DISPONÍVEL DIA`, que o prompt mandava DESCARTAR,
+#     eram no layout "lançamentos do período" o único lugar onde o saldo
+#     existe. Descartá-las deixava o extrato sem âncora nenhuma.
+#
+# A correção não é pedir mais cuidado: é parar de pedir julgamento. O modelo
+# transcreve o que vê, linha por linha, e QUEM DECIDE onde o saldo se encaixa é
+# o código — ver `_ancorar_saldos_do_dia`.
 _AI_PROMPT_VISION = """\
 Esta é a imagem de UMA página de extrato bancário brasileiro.
 
-Retorne SOMENTE um objeto JSON com estas duas chaves:
+Retorne SOMENTE um objeto JSON com estas três chaves:
 
-  "saldo_anterior" → número decimal, ou null.
-       Só preencha se a página trouxer explicitamente o saldo de ABERTURA do
-       extrato (rótulos como "SALDO ANTERIOR", "Saldo em DD/MM", "Saldo
-       inicial"). Não invente e não use o saldo de um dia qualquer.
+  "saldos_declarados" → array de objetos
+       {"rotulo": texto, "data": "DD/MM/AAAA" ou null, "saldo": número}
+       para TODO saldo que a página declara fora das linhas de lançamento:
+       "SALDO ANTERIOR", "Saldo anterior", "saldo em DD/MM/AA", "Saldo em C/C",
+       "Saldo final", "SALDO ATUAL".
 
-  "transacoes" → array de objetos, um por LANÇAMENTO, na ordem em que aparecem
-       na página (de cima para baixo, sem reordenar), cada um com:
+       Copie o RÓTULO como está impresso, e a data quando houver — alguns não
+       têm. Não decida qual é abertura e qual é encerramento: só transcreva.
+
+  "transacoes" → array de objetos, um por LINHA de lançamento, na ordem em que
+       aparecem na página (de cima para baixo, sem reordenar), cada um com:
 
        "data"      → "DD/MM/AAAA"
-       "historico" → a descrição do lançamento
-       "valor"     → decimal com ponto: NEGATIVO para débito/saída/pagamento,
-                     POSITIVO para crédito/entrada/recebimento
-       "saldo"     → o saldo impresso NA MESMA LINHA, com sinal, ou null se
-                     aquela linha não trouxer saldo
+       "historico" → a descrição DAQUELA LINHA, só dela
+       "valor"     → decimal com ponto, negativo para saída, positivo para
+                     entrada
+       "saldo"     → o saldo impresso NAQUELA MESMA LINHA, ou null
+
+  "saldos_do_dia" → array de objetos {"data": "DD/MM/AAAA", "saldo": número},
+       um para cada linha que declara o saldo DA CONTA no fim de um dia
+       ("SALDO DIA", "Saldo do dia", "SALDO TOTAL DISPONÍVEL DIA" e
+       semelhantes). Elas NÃO entram em "transacoes" — o saldo delas é
+       aproveitado separadamente.
 
 Regras que não podem ser quebradas:
 
+- O SINAL PODE VIR ANTES OU DEPOIS DO NÚMERO. "-1.234,56" e "1.234,56-" são o
+  MESMO valor negativo. Isso vale tanto para "valor" quanto para "saldo" e para
+  "saldo_anterior": um saldo com o menos no fim é NEGATIVO, a conta está no
+  vermelho. Um "D" à direita também indica negativo; "C" indica positivo.
+- UM SALDO PERTENCE A UMA LINHA SÓ. Preencha "saldo" apenas na linha em que ele
+  está impresso. Quando o extrato imprime o saldo uma vez por dia ou por grupo,
+  as outras linhas daquele dia levam null. NUNCA repita o mesmo saldo em várias
+  linhas — isso cria âncoras falsas e faz a importação ser recusada.
+- UMA LINHA, UM HISTÓRICO. Não junte a descrição de linhas diferentes num
+  histórico só, mesmo quando elas pertencem ao mesmo dia ou ao mesmo bloco.
+- SÓ É LANÇAMENTO O QUE ESTÁ NA TABELA DE MOVIMENTAÇÃO DA CONTA CORRENTE — a
+  que tem colunas de data, descrição, valor e saldo. A linha "Saldo final"
+  ENCERRA essa tabela: nada abaixo dela é lançamento.
+
+  Estes quadros trazem datas e valores e NÃO são lançamentos:
+  "Aviso de débito(s)" (é o aviso de uma tarifa que já foi lançada na tabela —
+  incluí-la cobra a mesma tarifa duas vezes), "totalizador de aplicações
+  automáticas", "movimentação - aplicações/resgates antecipados", resumos de
+  tarifas, limites de cheque especial e notas explicativas. Se a página tiver
+  só quadros desses, devolva as listas vazias.
+- SALDO DE OUTRA CONTA NÃO É NADA DISTO. Linhas como "SALDO APLIC AUT MAIS",
+  "SALDO APLICAÇÃO" ou saldo de poupança mostram quanto há na aplicação
+  automática, que é outra conta: não são lançamento e não são saldo do dia da
+  conta corrente. IGNORE essas linhas por completo — não crie lançamento algum
+  a partir delas, nem com nome inventado como "Aplicação realizada".
 - Transcreva os números EXATAMENTE como impressos. "1.234,56" vira 1234.56.
-- O sinal vem do que está impresso: um "D" ou "-" ou a cor vermelha indicam
-  saída; "C" ou "+" indicam entrada.
-- Linhas de SALDO (por exemplo "SALDO DIA", "SALDO ANTERIOR", "Saldo do dia",
-  "SALDO TOTAL DISPONÍVEL") NÃO são lançamentos: não as inclua em "transacoes".
-  Quando uma linha dessas trouxer o saldo do dia, ele já aparece na coluna de
-  saldo dos lançamentos daquele dia — não é preciso repeti-lo.
 - Não invente lançamento, não junte dois numa linha só e não pule nenhum: os
   saldos são conferidos um contra o outro depois, e qualquer linha faltando
   faz a importação inteira ser recusada.
-- Se a página não tiver lançamento nenhum (capa, legenda, rodapé), devolva
-  {"saldo_anterior": null, "transacoes": []}."""
+- Se a página não tiver lançamento nenhum (capa, legenda, rodapé), devolva as
+  listas vazias — mas a CAPA costuma declarar os saldos de abertura e de
+  encerramento, e esses vão em "saldos_declarados" mesmo sem lançamento algum."""
 
 
 def _parse_por_ai_vision(
     conteudo_bytes: bytes, budget: _PDFBudget
-) -> tuple[list[TransacaoOFX], Decimal | None]:
+) -> tuple[list[TransacaoOFX], Decimal | None, Decimal | None]:
     """Camada 3: lê um PDF SEM camada de texto renderizando cada página.
 
     Existe porque quatro extratos do escritório são PDF de imagem — não são
@@ -654,10 +712,10 @@ def _parse_por_ai_vision(
     settings = get_settings()
     if not settings.openai_enabled or not settings.allow_financial_data_to_openai:
         logger.info("Vision desabilitada para dados financeiros — pulando camada 3")
-        return [], None
+        return [], None, None
     if not _FITZ_AVAILABLE:
         logger.warning("Vision indisponível: PyMuPDF não instalado")
-        return [], None
+        return [], None, None
 
     doc = fitz.open(stream=conteudo_bytes, filetype="pdf")
     total_paginas = len(doc)
@@ -689,8 +747,16 @@ def _parse_por_ai_vision(
         response = client.chat.completions.create(
             model=_MODELO_VISION,
             timeout=budget.timeout_chamada(settings.pdf_vision_call_timeout_seconds),
-            max_tokens=4096,
-            temperature=0,
+            # `max_completion_tokens`, e NÃO `max_tokens`: este modelo recusa o
+            # parâmetro antigo com 400. Também recusa `temperature=0` — só
+            # aceita o padrão. Trocar o nome do modelo sem trocar os dois teria
+            # feito toda chamada falhar.
+            #
+            # Uma página densa do Itaú (40 lançamentos com CNPJ no histórico)
+            # mede ~1.600 tokens de saída. O teto dá folga para históricos mais
+            # longos; estourar significa perder a página inteira, e por isso
+            # `finish_reason == "length"` virou recusa explícita abaixo.
+            max_completion_tokens=8192,
             messages=[
                 {"role": "system", "content": _AI_SYSTEM},
                 {"role": "user", "content": [
@@ -702,7 +768,20 @@ def _parse_por_ai_vision(
                 ]},
             ],
         )
-        return _parse_ai_response_vision(response.choices[0].message.content or "")
+        escolha = response.choices[0]
+        # Resposta cortada no meio é a falha mais traiçoeira desta camada: o
+        # JSON fica inválido, a página vira uma lista vazia com um aviso no log,
+        # e o arquivo é recusado por "extração não verificável" — culpando o
+        # extrato por um teto nosso. Medido, uma página de 40 lançamentos gasta
+        # ~2.100 tokens; em 4.096 ela cabia por pouco e estourava assim que os
+        # históricos ficavam mais longos.
+        if escolha.finish_reason == "length":
+            raise PDFParseError(
+                f"A leitura por imagem da página {numero + 1} veio incompleta: "
+                "a página tem lançamentos demais para uma resposta só. Exporte "
+                "o extrato em um período menor."
+            )
+        return _parse_ai_response_vision(escolha.message.content or "")
 
     # Páginas são independentes — a ordem de leitura não importa porque ela é
     # restaurada pelo número da página logo abaixo, e é a ordem restaurada que
@@ -734,6 +813,9 @@ def _parse_por_ai_vision(
     saldo_anterior: Decimal | None = None
     idx = 0
 
+    saldos_do_dia: list[tuple[date, Decimal]] = []
+    declarados: list[tuple[str, date | None, Decimal]] = []
+
     for numero in range(total_paginas):
         conteudo = paginas[numero]
         if saldo_anterior is None and conteudo.get("saldo_anterior") is not None:
@@ -745,30 +827,157 @@ def _parse_por_ai_vision(
                 transacoes.append(transacao)
                 idx += 1
 
-    logger.info(
-        "Vision: %d transações em %d páginas (saldo anterior=%s)",
-        len(transacoes), total_paginas, saldo_anterior,
+        for item in conteudo.get("saldos_do_dia", []):
+            if not isinstance(item, dict):
+                continue
+            data_lida = _parse_data(str(item.get("data", "")))
+            saldo = _parse_valor(str(item.get("saldo", "")))
+            if data_lida is not None and saldo is not None:
+                saldos_do_dia.append((data_lida, saldo))
+
+        # Aqui a data pode faltar: `Saldo em C/C` vem sem ela, e é justamente
+        # esse que fecha a conta corrente.
+        for item in conteudo.get("saldos_declarados", []):
+            if not isinstance(item, dict):
+                continue
+            saldo = _parse_valor(str(item.get("saldo", "")))
+            if saldo is None:
+                continue
+            declarados.append((
+                str(item.get("rotulo") or ""),
+                _parse_data(str(item.get("data") or "")),
+                saldo,
+            ))
+
+    # A ordem cronológica precisa vir ANTES de encaixar os saldos do dia: o
+    # saldo de um dia é o que vale depois do último lançamento dele, e "último"
+    # só existe depois de ordenar. O extrato do Itaú sai do mais recente para o
+    # mais antigo, então na ordem da página o último é o primeiro.
+    transacoes = _ancorar_saldos_do_dia(
+        ordenar_do_mais_antigo(transacoes), saldos_do_dia
     )
-    return transacoes, saldo_anterior
+    abertura, saldo_final = _pontas_declaradas(declarados, transacoes)
+    if saldo_anterior is None:
+        saldo_anterior = abertura
+
+    logger.info(
+        "Vision: %d transações em %d páginas (abertura=%s, fecho=%s, "
+        "%d saldos de dia)",
+        len(transacoes), total_paginas, saldo_anterior, saldo_final,
+        len(saldos_do_dia),
+    )
+    return transacoes, saldo_anterior, saldo_final
 
 
 def _parse_ai_response_vision(raw: str) -> dict:
     """Aceita o objeto com `saldo_anterior`/`transacoes`, ou só a lista."""
+    vazio = {"saldo_anterior": None, "transacoes": [], "saldos_do_dia": []}
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     raw = re.sub(r"\s*```\s*$", "", raw).strip()
     try:
         resultado = json.loads(raw, parse_float=Decimal)
     except json.JSONDecodeError as e:
         logger.warning("Vision: JSON inválido (%s)", e)
-        return {"saldo_anterior": None, "transacoes": []}
+        return vazio
     if isinstance(resultado, list):
-        return {"saldo_anterior": None, "transacoes": resultado}
+        return {**vazio, "transacoes": resultado}
     if isinstance(resultado, dict):
         return {
             "saldo_anterior": resultado.get("saldo_anterior"),
             "transacoes": resultado.get("transacoes") or resultado.get("transactions") or [],
+            "saldos_do_dia": resultado.get("saldos_do_dia") or [],
+            "saldos_declarados": resultado.get("saldos_declarados") or [],
         }
-    return {"saldo_anterior": None, "transacoes": []}
+    return vazio
+
+
+_ROTULO_ABERTURA = re.compile(r"saldo\s+anterior|saldo\s+inicial", re.IGNORECASE)
+_ROTULO_FECHO_DA_CONTA = re.compile(r"saldo\s+em\s+c\s*/?\s*c\b", re.IGNORECASE)
+
+
+def _pontas_declaradas(
+    declarados: list[tuple[str, date | None, Decimal]],
+    transacoes: list[TransacaoOFX],
+) -> tuple[Decimal | None, Decimal | None]:
+    """Escolhe, entre os saldos que a página declara, quais fecham a cadeia.
+
+    **O rótulo decide, não o valor nem a posição.** O extrato do Itaú declara
+    três saldos e só um deles fecha a conta corrente:
+
+        capa      saldo em 25/02/26   5.969,14-   ┐ conta corrente MAIS a
+        capa      saldo em 31/03/26  17.138,32    ┘ aplicação automática
+        rodapé    Saldo em C/C            1,00      só a conta corrente
+
+    Os 17.138,32 da capa são 1,00 de conta corrente com 17.137,32 aplicados.
+    Usá-los para fechar a cadeia acusa uma diferença de 17.137,32 que não é
+    lançamento nenhum — é o dinheiro que está na aplicação. É a mesma regra que
+    o adaptador determinístico do Itaú já segue.
+
+    Por isso o fecho SÓ é aceito com o rótulo da conta corrente. Sem ele, o
+    bloco fica sem cauda coberta e a conferência recusa — o que é melhor do que
+    fechar com o número errado.
+    """
+    if not declarados or not transacoes:
+        return None, None
+
+    abertura = next(
+        (saldo for rotulo, _, saldo in declarados if _ROTULO_ABERTURA.search(rotulo)),
+        None,
+    )
+    if abertura is None:
+        # Sem rótulo de abertura, vale um saldo datado antes do primeiro
+        # lançamento — na primeira data do extrato a aplicação costuma ser zero,
+        # e é a única ponta disponível.
+        anteriores = sorted(
+            (d for d in declarados if d[1] is not None and d[1] <= transacoes[0].data),
+            key=lambda d: d[1],
+        )
+        abertura = anteriores[-1][2] if anteriores else None
+
+    fecho = next(
+        (
+            saldo
+            for rotulo, _, saldo in declarados
+            if _ROTULO_FECHO_DA_CONTA.search(rotulo)
+        ),
+        None,
+    )
+    return abertura, fecho
+
+
+def _ancorar_saldos_do_dia(
+    transacoes: list[TransacaoOFX], saldos_do_dia: list[tuple[date, Decimal]]
+) -> list[TransacaoOFX]:
+    """Prende o saldo declarado de cada dia ao ÚLTIMO lançamento daquele dia.
+
+    Há layouts — o "lançamentos do período" do Itaú é um — em que o saldo NÃO
+    aparece na linha do lançamento: existe só numa linha `SALDO TOTAL DISPONÍVEL
+    DIA` por dia. Sem aproveitá-la o extrato não tem âncora nenhuma e é recusado
+    por inconferível.
+
+    Encaixar isso é trabalho de código, não de prompt. Quando o modelo tentava,
+    ele grudava o saldo do dia no lançamento vizinho de cima — e como o extrato
+    sai do mais recente para o mais antigo, o saldo de um dia ia parar no dia
+    seguinte. Aqui a lista já está em ordem cronológica, e o saldo do dia é, por
+    definição, o que vale DEPOIS do último lançamento dele.
+
+    Só preenche onde está vazio: saldo impresso na própria linha manda mais.
+    """
+    if not saldos_do_dia:
+        return transacoes
+
+    por_data = dict(saldos_do_dia)
+    ultimo_indice: dict[date, int] = {}
+    for indice, transacao in enumerate(transacoes):
+        ultimo_indice[transacao.data] = indice
+
+    resultado = list(transacoes)
+    for data_do_saldo, saldo in por_data.items():
+        indice = ultimo_indice.get(data_do_saldo)
+        if indice is None or resultado[indice].saldo_apos is not None:
+            continue
+        resultado[indice] = replace(resultado[indice], saldo_apos=saldo)
+    return resultado
 
 
 # ──────────────────────────────────────────────────────────── entrypoint
@@ -934,11 +1143,15 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
                 "— tentando leitura por imagem (camada 3)",
                 total_chars, legibilidade * 100,
             )
-            transacoes, saldo_anterior = _parse_por_ai_vision(conteudo_bytes, budget)
+            transacoes, saldo_anterior, saldo_final = _parse_por_ai_vision(
+                conteudo_bytes, budget
+            )
             if transacoes:
                 cronologicas = ordenar_do_mais_antigo(transacoes)
                 bloco = Bloco(
-                    transacoes=cronologicas, saldo_anterior=saldo_anterior
+                    transacoes=cronologicas,
+                    saldo_anterior=saldo_anterior,
+                    saldo_final=saldo_final,
                 )
                 # A conferência é a MESMA de um adaptador determinístico. Se a
                 # IA pulou uma linha ou trocou um sinal, o saldo não caminha e

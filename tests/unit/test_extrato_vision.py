@@ -66,9 +66,11 @@ class _Settings:
 
 
 class _RespostaFalsa:
-    def __init__(self, conteudo: str):
+    def __init__(self, conteudo: str, finish_reason: str = "stop"):
         mensagem = type("M", (), {"content": conteudo})()
-        self.choices = [type("C", (), {"message": mensagem})()]
+        self.choices = [
+            type("C", (), {"message": mensagem, "finish_reason": finish_reason})()
+        ]
 
 
 class _ClienteFalso:
@@ -79,6 +81,7 @@ class _ClienteFalso:
     """
 
     def __init__(self, respostas: list[str], erro_na_pagina: int | None = None,
+                 truncar_na_pagina: int | None = None,
                  avanco_do_relogio: float = 0.0, relogio: _Relogio | None = None,
                  barreira: threading.Barrier | None = None):
         self.respostas = list(respostas)
@@ -118,6 +121,10 @@ class _ClienteFalso:
                     pagina = _pagina_da_imagem(partes[0]["image_url"]["url"])
                     if pagina == erro_na_pagina:
                         raise RuntimeError("APITimeoutError simulado")
+                    if pagina == truncar_na_pagina:
+                        return _RespostaFalsa(
+                            cliente.respostas[pagina][:60], finish_reason="length"
+                        )
                     return _RespostaFalsa(cliente.respostas[pagina])
                 finally:
                     with cliente._trava:
@@ -417,3 +424,109 @@ def test_pdf_com_texto_legivel_nao_gasta_chamada_de_ia(openai_falso, monkeypatch
 
     # Uma chamada de TEXTO (camada 2) é o esperado; nenhuma de imagem.
     assert cliente.chamadas_com_imagem == 0, "texto legível não pode virar chamada de imagem"
+
+
+def test_resposta_cortada_no_meio_e_recusada_em_vez_de_virar_pagina_vazia(openai_falso):
+    """A falha mais traiçoeira desta camada, encontrada rodando os extratos reais.
+
+    Uma página com muitos lançamentos estoura o teto de tokens da resposta. O
+    JSON fica inválido, `_parse_ai_response_vision` devolve lista vazia com um
+    aviso no log, e o arquivo é recusado por "extração não verificável" —
+    culpando o extrato por um teto nosso.
+    """
+    cliente = openai_falso([_PAGINA_BOA], truncar_na_pagina=0)
+    with pytest.raises(PDFParseError, match="veio incompleta"):
+        parse_pdf(_pdf_sem_texto(1))
+    assert cliente.chamadas_com_imagem == 1
+
+
+def test_saldo_do_dia_ancora_o_ultimo_lancamento_daquele_dia():
+    """Há layouts em que o saldo só existe na linha de saldo do dia.
+
+    O Itaú "lançamentos do período" é um: nenhum lançamento traz saldo, e sem
+    aproveitar as linhas `SALDO TOTAL DISPONÍVEL DIA` o extrato não tem âncora
+    nenhuma. Encaixar isso é trabalho de código — quando o modelo tentava, ele
+    grudava o saldo no lançamento vizinho de cima, e como o extrato sai do mais
+    recente para o mais antigo o saldo de um dia ia parar no dia seguinte.
+    """
+    from datetime import date as _date
+
+    def _t(dia: int, valor: str, ordem: int):
+        return pdf_parser.TransacaoOFX(
+            fitid=f"f{ordem}", data=_date(2026, 5, dia), valor=Decimal(valor),
+            historico=f"LANC {ordem}", tipo_ofx="DEBIT", saldo_apos=None, ordem=ordem,
+        )
+
+    transacoes = [_t(21, "-10.00", 0), _t(22, "-20.00", 1), _t(22, "-30.00", 2)]
+    saldos = [(_date(2026, 5, 21), Decimal("100.00")),
+              (_date(2026, 5, 22), Decimal("50.00"))]
+
+    resultado = pdf_parser._ancorar_saldos_do_dia(transacoes, saldos)
+
+    # Cada saldo prende no ÚLTIMO lançamento do seu dia, e só nele.
+    assert [t.saldo_apos for t in resultado] == [
+        Decimal("100.00"), None, Decimal("50.00")
+    ]
+
+
+def test_saldo_impresso_na_linha_manda_mais_que_o_saldo_do_dia():
+    """Se a própria linha traz saldo, ele é do banco e não pode ser sobrescrito."""
+    from datetime import date as _date
+
+    transacao = pdf_parser.TransacaoOFX(
+        fitid="f0", data=_date(2026, 5, 21), valor=Decimal("-10.00"),
+        historico="LANC", tipo_ofx="DEBIT", saldo_apos=Decimal("7.00"), ordem=0,
+    )
+    (resultado,) = pdf_parser._ancorar_saldos_do_dia(
+        [transacao], [(_date(2026, 5, 21), Decimal("999.00"))]
+    )
+    assert resultado.saldo_apos == Decimal("7.00")
+
+
+def test_fecho_da_conta_corrente_vem_do_rotulo_e_nao_da_capa():
+    """O extrato do Itaú declara TRÊS saldos, e só um fecha a conta corrente.
+
+        capa    saldo em 25/02/26   5.969,14-  ┐ conta corrente MAIS a
+        capa    saldo em 31/03/26  17.138,32   ┘ aplicação automática
+        rodapé  Saldo em C/C            1,00     só a conta corrente
+
+    Os 17.138,32 são 1,00 de conta corrente com 17.137,32 aplicados. Fechar a
+    cadeia com eles acusa uma diferença de 17.137,32 que não é lançamento
+    nenhum — é o dinheiro que está na aplicação. Foi exatamente onde este
+    extrato parou antes de o rótulo passar a decidir.
+    """
+    from datetime import date as _date
+
+    transacoes = [
+        pdf_parser.TransacaoOFX(
+            fitid="f0", data=_date(2026, 3, 2), valor=Decimal("-10.00"),
+            historico="X", tipo_ofx="DEBIT", saldo_apos=None, ordem=0,
+        ),
+        pdf_parser.TransacaoOFX(
+            fitid="f1", data=_date(2026, 3, 31), valor=Decimal("-20.00"),
+            historico="Y", tipo_ofx="DEBIT", saldo_apos=None, ordem=1,
+        ),
+    ]
+    declarados = [
+        ("saldo em 25/02/26", _date(2026, 2, 25), Decimal("-5969.14")),
+        ("saldo em 31/03/26", _date(2026, 3, 31), Decimal("17138.32")),
+        ("Saldo em C/C", None, Decimal("1.00")),
+    ]
+
+    abertura, fecho = pdf_parser._pontas_declaradas(declarados, transacoes)
+    assert abertura == Decimal("-5969.14")
+    assert fecho == Decimal("1.00"), "a capa soma a aplicação e não fecha a conta"
+
+
+def test_sem_rotulo_de_conta_corrente_nao_ha_fecho():
+    """Melhor ficar sem cauda coberta do que fechar com o número errado."""
+    from datetime import date as _date
+
+    transacoes = [pdf_parser.TransacaoOFX(
+        fitid="f0", data=_date(2026, 3, 2), valor=Decimal("-10.00"),
+        historico="X", tipo_ofx="DEBIT", saldo_apos=None, ordem=0,
+    )]
+    _, fecho = pdf_parser._pontas_declaradas(
+        [("saldo em 31/03/26", _date(2026, 3, 31), Decimal("17138.32"))], transacoes
+    )
+    assert fecho is None
