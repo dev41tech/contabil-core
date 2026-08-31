@@ -54,3 +54,12 @@ class MeResponse(BaseModel):
     nome: str
     role: str
     tenant_id: UUID
+    # O token de CSRF só era entregue no corpo do login e do refresh. Uma aba
+    # aberta com a sessão já válida não faz nenhum dos dois — e, com o frontend
+    # em outra origem, ela não consegue ler o cookie. Subia sem token e falhava
+    # na primeira gravação. `/auth/me` é o que toda aba chama no boot, então é
+    # daqui que ela passa a se abastecer.
+    #
+    # `None` quando o cookie não veio: aí a aba precisa renovar a sessão, e a
+    # distinção importa para ela saber qual dos dois caminhos seguir.
+    csrf_token: str | None = None
