@@ -83,6 +83,10 @@ class _ClienteFalso:
                  barreira: threading.Barrier | None = None):
         self.respostas = list(respostas)
         self.chamadas = 0
+        # A camada 2 (texto) e a 3 (imagem) usam o MESMO cliente. Contar só
+        # chamadas não distingue "não gastou IA" de "gastou a IA barata", que é
+        # exatamente a diferença que os testes do portão de legibilidade medem.
+        self.chamadas_com_imagem = 0
         self.timeouts: list[float] = []
         self.simultaneas_maximo = 0
         self._em_voo = 0
@@ -107,6 +111,10 @@ class _ClienteFalso:
                         # em vez de passar por acaso de agendamento.
                         barreira.wait()
                     partes = kwargs["messages"][1]["content"]
+                    if not isinstance(partes, list):
+                        return _RespostaFalsa("[]")      # camada 2: texto puro
+                    with cliente._trava:
+                        cliente.chamadas_com_imagem += 1
                     pagina = _pagina_da_imagem(partes[0]["image_url"]["url"])
                     if pagina == erro_na_pagina:
                         raise RuntimeError("APITimeoutError simulado")
@@ -343,3 +351,69 @@ def test_vision_diz_qual_pagina_falhou_em_vez_da_recusa_generica(openai_falso):
     openai_falso([_PAGINA_BOA, _PAGINA_BOA], erro_na_pagina=1)
     with pytest.raises(PDFParseError, match="falhou na página 2"):
         parse_pdf(_pdf_sem_texto(2))
+
+
+# ─────────────────────────────── camada de texto que não é texto
+
+
+def test_fracao_legivel_separa_glifo_sem_traducao_de_texto_de_verdade():
+    """Fonte sem `ToUnicode` devolve o código do glifo, e ele CONTA como caractere.
+
+    Os números do lado direito são os medidos nos seis extratos da JS Bertoldo
+    que motivaram isto — não são inventados para o teste.
+    """
+    extrato = ["02/02/2026 0000 13128 500 BB GIRO PRONAMPE 300.712 1.350,95 D",
+               "03/02/2026 0000 14397 821 Pix - Recebido 31.806 3.000,00 C"]
+    assert pdf_parser._fracao_legivel(extrato) > 0.95
+
+    glifos = ["(cid:0)(cid:1)(cid:2)(cid:3)(cid:4)(cid:2)(cid:5)(cid:6)",
+              "(cid:26)(cid:27)(cid:28)(cid:29)(cid:30)(cid:31)"]
+    assert pdf_parser._fracao_legivel(glifos) < 0.2
+
+    # Área de uso privado: mesmo problema, outra forma (o caso do Painel do BB).
+    assert pdf_parser._fracao_legivel([chr(0xE940) * 50]) < 0.2
+
+    assert pdf_parser._fracao_legivel([]) == 0.0
+
+    # O limiar cai no meio de um vão enorme — não é número escolhido a dedo.
+    assert 0.2 < pdf_parser._FRACAO_LEGIVEL_MINIMA < 0.9
+
+
+def test_pdf_com_texto_ilegivel_vai_para_a_camada_de_imagem(openai_falso, monkeypatch):
+    """A regressão real: 32.960 caracteres de lixo passavam no teto de 50.
+
+    Dois extratos do Itaú da JS Bertoldo renderizam perfeitamente e são do mesmo
+    layout que o adaptador `itau` já lê — mas a fonte não traz `ToUnicode`, o
+    pdfplumber devolvia `(cid:N)` e a contagem de caracteres ficava ALTA. Com o
+    portão medindo tamanho em vez de legibilidade, eles entravam no caminho de
+    texto, não extraíam nada e eram recusados, sem nunca chegar na Vision.
+    """
+    lixo = [f"(cid:{n})" for n in range(400)]
+    monkeypatch.setattr(
+        pdf_parser, "_extrair_linhas_pdfplumber", lambda *a, **k: (lixo, len("".join(lixo)))
+    )
+
+    cliente = openai_falso([_PAGINA_BOA])
+    transacoes = parse_pdf(_pdf_sem_texto(1))
+
+    assert cliente.chamadas_com_imagem == 1, "o arquivo tinha de chegar na camada de imagem"
+    assert [t.valor for t in transacoes] == [Decimal("-100.00"), Decimal("50.00")]
+
+
+def test_pdf_com_texto_legivel_nao_gasta_chamada_de_ia(openai_falso, monkeypatch):
+    """O contrapeso: texto de verdade não pode ser mandado para a imagem.
+
+    Sem esta asserção, apertar o limiar por engano transformaria todo extrato
+    lido de graça numa chamada paga, e nada falharia.
+    """
+    linhas = ["02/02/2026 0000 13128 500 BB GIRO PRONAMPE 300.712 1.350,95 D"] * 20
+    monkeypatch.setattr(
+        pdf_parser, "_extrair_linhas_pdfplumber", lambda *a, **k: (linhas, len("".join(linhas)))
+    )
+
+    cliente = openai_falso([_PAGINA_BOA])
+    with pytest.raises(PDFParseError):
+        parse_pdf(_pdf_sem_texto(1))
+
+    # Uma chamada de TEXTO (camada 2) é o esperado; nenhuma de imagem.
+    assert cliente.chamadas_com_imagem == 0, "texto legível não pode virar chamada de imagem"

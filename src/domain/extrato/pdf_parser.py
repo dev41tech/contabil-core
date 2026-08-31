@@ -170,6 +170,43 @@ def _extrair_linhas_pdfplumber(
     return all_lines, total_chars
 
 
+_CID_RE = re.compile(r"\(cid:\d+\)")
+_UTEIS = set(" ,.:;/-()R$%*")
+
+
+def _fracao_legivel(linhas: list[str]) -> float:
+    """Quanto do texto extraído é texto de verdade, entre 0 e 1.
+
+    Um PDF pode ter camada de texto e ainda assim não ter texto. Fonte
+    embarcada sem `ToUnicode` faz o pdfplumber devolver o CÓDIGO DO GLIFO em
+    vez do caractere: saem `(cid:71)(cid:82)` ou caracteres de uso privado, e a
+    contagem de caracteres fica ALTA — foi assim que dois extratos do Itaú da JS
+    Bertoldo, que renderizam perfeitamente e cujo layout o adaptador já lê,
+    nunca chegaram na camada de imagem: 32.960 caracteres de lixo passavam
+    folgados no teto de 50.
+
+    Medido nos seis arquivos que motivaram isto, a separação não é sutil:
+
+        legíveis (BB, Caixa, Itaú, Painel)   96,8% a 97,8%
+        quebrados (os dois do Itaú)          11,4%  (84% em `(cid:N)`)
+    """
+    texto = "\n".join(linhas)
+    if not texto:
+        return 0.0
+    sem_cid = _CID_RE.sub("", texto)
+    uteis = sum(
+        1 for c in sem_cid
+        if (c.isalnum() and not (0xE000 <= ord(c) <= 0xF8FF)) or c in _UTEIS
+    )
+    return uteis / len(texto)
+
+
+# Abaixo disto, o que veio não é texto — é o glifo sem tradução. O limiar fica
+# no meio de um vão de 85 pontos percentuais, então não é número escolhido a
+# dedo: qualquer valor entre 0,2 e 0,9 classificaria os seis do mesmo jeito.
+_FRACAO_LEGIVEL_MINIMA = 0.5
+
+
 def _extrair_paginas_palavras(
     conteudo_bytes: bytes, budget: _PDFBudget
 ) -> list[list[dict]]:
@@ -784,7 +821,8 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
             logger.warning("pdfplumber: falha na extração de texto: %s", e)
             linhas, total_chars = [], 0
 
-        if total_chars >= 50:
+        legibilidade = _fracao_legivel(linhas)
+        if total_chars >= 50 and legibilidade >= _FRACAO_LEGIVEL_MINIMA:
             logger.info("pdfplumber: %d chars extraídos", total_chars)
 
             referencia_ano = datetime.now(UTC).year
@@ -850,9 +888,9 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
             # foi desenhado, não escrito. Todos trazem saldo, e é isso que
             # permite conferir a saída da IA como se fosse a de um adaptador.
             logger.info(
-                "pdfplumber: PDF sem camada de texto (%d chars) — tentando "
-                "leitura por imagem (camada 3)",
-                total_chars,
+                "pdfplumber: sem texto aproveitável (%d chars, %.0f%% legível) "
+                "— tentando leitura por imagem (camada 3)",
+                total_chars, legibilidade * 100,
             )
             transacoes, saldo_anterior = _parse_por_ai_vision(conteudo_bytes, budget)
             if transacoes:
