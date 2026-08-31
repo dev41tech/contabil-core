@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -65,16 +66,30 @@ class _PDFBudget:
         if time.monotonic() > self.deadline:
             raise PDFParseError("Processamento do PDF excedeu o tempo limite.")
 
-    def consumir_chamada_ai(self) -> None:
+    def consumir_chamada_ai(self, quantas: int = 1) -> None:
         self.verificar_tempo()
-        if self.ai_calls_restantes <= 0:
+        if self.ai_calls_restantes < quantas:
             raise PDFParseError("PDF excedeu o limite de chamadas ao serviço de IA.")
-        self.ai_calls_restantes -= 1
+        self.ai_calls_restantes -= quantas
+
+    def estender_deadline(self, segundos: float) -> None:
+        """Dá a uma camada o prazo que o perfil dela exige.
+
+        A camada 3 gasta uma chamada por página; as outras, no máximo uma no
+        arquivo inteiro. Enquanto as duas dividiam o mesmo relógio, o teto que
+        sobrava para o caminho de imagem era o de um caminho que não é o dele.
+        Só estende para frente: nunca encurta um prazo já concedido.
+        """
+        self.deadline = max(self.deadline, time.monotonic() + segundos)
+
+    def timeout_chamada(self, maximo: float = 30.0) -> float:
+        """Teto de UMA chamada, sem nunca ultrapassar o prazo do arquivo."""
+        self.verificar_tempo()
+        return max(1.0, min(maximo, self.deadline - time.monotonic()))
 
     @property
     def timeout_restante(self) -> float:
-        self.verificar_tempo()
-        return max(1.0, min(30.0, self.deadline - time.monotonic()))
+        return self.timeout_chamada()
 
 
 # ──────────────────────────────────────────────────────────── helpers gerais
@@ -619,45 +634,71 @@ def _parse_por_ai_vision(
             "com texto selecionável."
         )
 
+    # Uma chamada por página, todas debitadas de uma vez: com as páginas em voo
+    # simultâneo não existe mais uma ordem em que debitar uma a uma.
+    budget.consumir_chamada_ai(total_paginas)
+    # O relógio desta camada é outro. Ver `pdf_vision_timeout_seconds`: enquanto
+    # ela dividia o prazo com o caminho determinístico, estourava na terceira
+    # página e o extrato de 12 que motivou `pdf_max_ai_calls: 30` nunca chegava
+    # ao fim.
+    budget.estender_deadline(settings.pdf_vision_timeout_seconds)
+
     from openai import OpenAI
     client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
+
+    def ler_pagina(numero: int) -> dict:
+        png = _render_page_to_png(conteudo_bytes, numero, dpi=_DPI_VISION)
+        img_b64 = base64.b64encode(png).decode()
+        response = client.chat.completions.create(
+            model=_MODELO_VISION,
+            timeout=budget.timeout_chamada(settings.pdf_vision_call_timeout_seconds),
+            max_tokens=4096,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": _AI_SYSTEM},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/png;base64,{img_b64}",
+                        "detail": "high",
+                    }},
+                    {"type": "text", "text": _AI_PROMPT_VISION},
+                ]},
+            ],
+        )
+        return _parse_ai_response_vision(response.choices[0].message.content or "")
+
+    # Páginas são independentes — a ordem de leitura não importa porque ela é
+    # restaurada pelo número da página logo abaixo, e é a ordem restaurada que
+    # a cadeia de saldos confere.
+    trabalhadores = max(1, min(settings.pdf_vision_concurrency, total_paginas))
+    paginas: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=trabalhadores) as pool:
+        futuros = {pool.submit(ler_pagina, n): n for n in range(total_paginas)}
+        for futuro in as_completed(futuros):
+            numero = futuros[futuro]
+            try:
+                paginas[numero] = futuro.result()
+            except Exception as e:
+                for pendente in futuros:
+                    pendente.cancel()
+                # Página perdida quebra a cadeia de saldos de qualquer jeito, e
+                # a recusa que vinha depois falava de "extração não
+                # verificável" — mandava o contador procurar problema no
+                # extrato quando o problema tinha sido a chamada. Falhar aqui,
+                # dizendo o que falhou.
+                if isinstance(e, PDFParseError):
+                    raise
+                raise PDFParseError(
+                    f"A leitura por imagem falhou na página {numero + 1} "
+                    f"({type(e).__name__}). Nenhum lançamento foi importado."
+                ) from e
 
     transacoes: list[TransacaoOFX] = []
     saldo_anterior: Decimal | None = None
     idx = 0
 
     for numero in range(total_paginas):
-        budget.consumir_chamada_ai()
-        try:
-            png = _render_page_to_png(conteudo_bytes, numero, dpi=_DPI_VISION)
-        except Exception as e:
-            logger.warning("Vision: falha ao renderizar página %d: %s", numero + 1, e)
-            continue
-
-        img_b64 = base64.b64encode(png).decode()
-        try:
-            response = client.chat.completions.create(
-                model=_MODELO_VISION,
-                timeout=budget.timeout_restante,
-                max_tokens=4096,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": _AI_SYSTEM},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
-                            "detail": "high",
-                        }},
-                        {"type": "text", "text": _AI_PROMPT_VISION},
-                    ]},
-                ],
-            )
-        except Exception as e:
-            logger.warning("Vision: falha na chamada OpenAI (página %d): %s", numero + 1, e)
-            return [], None
-
-        bruto = response.choices[0].message.content or ""
-        conteudo = _parse_ai_response_vision(bruto)
+        conteudo = paginas[numero]
         if saldo_anterior is None and conteudo.get("saldo_anterior") is not None:
             saldo_anterior = _parse_valor(str(conteudo["saldo_anterior"]))
 

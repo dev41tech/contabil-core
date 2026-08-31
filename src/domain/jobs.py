@@ -209,7 +209,16 @@ async def _importar_extrato(db: AsyncSession, empresa_id: UUID, agencia_id: UUID
         # sigla preenchida cai na detecção por conteúdo, dentro do parser.
         agencia = await svc._get_agencia_or_400(agencia_id)
         try:
-            timeout = get_settings().pdf_parse_timeout_seconds + 5
+            # Rede de segurança do lado de fora: quem impõe o teto de cada
+            # camada é o orçamento dentro do parser, e o caminho por imagem tem
+            # o seu próprio (`pdf_vision_timeout_seconds`). Como aqui ainda não
+            # se sabe qual camada o arquivo vai exigir, este teto é o maior dos
+            # dois — abaixo disso, ele cortaria a leitura por imagem antes de o
+            # parser conseguir recusá-la com uma frase que explica o motivo.
+            _cfg = get_settings()
+            timeout = max(
+                _cfg.pdf_parse_timeout_seconds, _cfg.pdf_vision_timeout_seconds
+            ) + 5
             transacoes = await asyncio.wait_for(
                 run_in_threadpool(parse_pdf, conteudo_bytes, agencia.banco_sigla),
                 timeout=timeout,

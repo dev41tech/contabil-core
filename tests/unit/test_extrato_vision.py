@@ -15,6 +15,9 @@ o que está sendo verificado é a conferência — não a IA.
 
 from __future__ import annotations
 
+import base64
+import struct
+import threading
 from decimal import Decimal
 
 import pytest
@@ -22,16 +25,31 @@ import pytest
 from src.domain.extrato import pdf_parser
 from src.domain.extrato.pdf_parser import PDFParseError, parse_pdf
 
+_LARGURA_BASE = 595
+
 
 def _pdf_sem_texto(paginas: int = 1) -> bytes:
-    """PDF com páginas em branco: nenhuma camada de texto, como os reais."""
+    """PDF com páginas em branco: nenhuma camada de texto, como os reais.
+
+    Cada página nasce um ponto mais larga que a anterior. Isso não muda nada no
+    que está sendo testado e resolve um problema do teste: como as páginas são
+    lidas em paralelo, a ordem das chamadas não diz mais de qual página cada uma
+    veio — a largura do PNG diz.
+    """
     fitz = pytest.importorskip("fitz")
     doc = fitz.open()
-    for _ in range(paginas):
-        doc.new_page(width=595, height=842)
+    for numero in range(paginas):
+        doc.new_page(width=_LARGURA_BASE + numero, height=842)
     dados = doc.tobytes()
     doc.close()
     return dados
+
+
+def _pagina_da_imagem(url: str, dpi: int = 150) -> int:
+    """Devolve o número da página lendo a largura no cabeçalho IHDR do PNG."""
+    png = base64.b64decode(url.split(",", 1)[1])
+    largura_px = struct.unpack(">I", png[16:20])[0]
+    return round(largura_px * 72 / dpi) - _LARGURA_BASE
 
 
 class _Settings:
@@ -41,6 +59,9 @@ class _Settings:
         self.pdf_parse_timeout_seconds = 60
         self.pdf_max_pages = 120
         self.pdf_max_ai_calls = 10
+        self.pdf_vision_timeout_seconds = 300
+        self.pdf_vision_call_timeout_seconds = 120
+        self.pdf_vision_concurrency = 6
         self.openai_api_key = type("K", (), {"get_secret_value": lambda self: "sk-teste"})()
 
 
@@ -51,19 +72,68 @@ class _RespostaFalsa:
 
 
 class _ClienteFalso:
-    """Devolve uma resposta por página, na ordem, e conta as chamadas."""
+    """Devolve a resposta da página que a imagem identifica.
 
-    def __init__(self, respostas: list[str]):
+    Endereçar por página, e não pela ordem de chegada, é o que mantém estes
+    testes determinísticos agora que as páginas são lidas em paralelo.
+    """
+
+    def __init__(self, respostas: list[str], erro_na_pagina: int | None = None,
+                 avanco_do_relogio: float = 0.0, relogio: _Relogio | None = None,
+                 barreira: threading.Barrier | None = None):
         self.respostas = list(respostas)
         self.chamadas = 0
+        self.timeouts: list[float] = []
+        self.simultaneas_maximo = 0
+        self._em_voo = 0
+        self._trava = threading.Lock()
         cliente = self
 
         class _Completions:
             def create(self, **kwargs):
-                cliente.chamadas += 1
-                return _RespostaFalsa(cliente.respostas.pop(0))
+                with cliente._trava:
+                    cliente.chamadas += 1
+                    cliente._em_voo += 1
+                    cliente.simultaneas_maximo = max(
+                        cliente.simultaneas_maximo, cliente._em_voo
+                    )
+                    cliente.timeouts.append(kwargs.get("timeout"))
+                    if relogio is not None:
+                        relogio.avancar(avanco_do_relogio)
+                try:
+                    if barreira is not None:
+                        # Só passa quando TODAS as páginas chegarem aqui: numa
+                        # leitura em fila a barreira estoura e o teste falha,
+                        # em vez de passar por acaso de agendamento.
+                        barreira.wait()
+                    partes = kwargs["messages"][1]["content"]
+                    pagina = _pagina_da_imagem(partes[0]["image_url"]["url"])
+                    if pagina == erro_na_pagina:
+                        raise RuntimeError("APITimeoutError simulado")
+                    return _RespostaFalsa(cliente.respostas[pagina])
+                finally:
+                    with cliente._trava:
+                        cliente._em_voo -= 1
 
         self.chat = type("Chat", (), {"completions": _Completions()})()
+
+
+class _Relogio:
+    """Relógio de mentira: o tempo só passa quando uma chamada acontece.
+
+    Deixa o teste de orçamento medir minutos sem gastar um segundo real.
+    """
+
+    def __init__(self) -> None:
+        self.agora = 0.0
+        self._trava = threading.Lock()
+
+    def monotonic(self) -> float:
+        return self.agora
+
+    def avancar(self, segundos: float) -> None:
+        with self._trava:
+            self.agora += segundos
 
 
 @pytest.fixture
@@ -71,8 +141,8 @@ def openai_falso(monkeypatch):
     """Instala o cliente falso e devolve uma função para programar as respostas."""
     caixa: dict = {}
 
-    def programar(respostas: list[str], liberado: bool = True):
-        cliente = _ClienteFalso(respostas)
+    def programar(respostas: list[str], liberado: bool = True, **kwargs):
+        cliente = _ClienteFalso(respostas, **kwargs)
         caixa["cliente"] = cliente
         monkeypatch.setattr(pdf_parser, "get_settings", lambda: _Settings(liberado))
         import openai
@@ -178,3 +248,98 @@ def test_vision_recusa_pdf_longo_demais_antes_de_gastar_chamada(openai_falso):
     with pytest.raises(PDFParseError, match="período menor"):
         parse_pdf(_pdf_sem_texto(12))
     assert cliente.chamadas == 0
+
+
+def _paginas_encadeadas(quantidade: int) -> list[str]:
+    """Uma página por lançamento, com a cadeia 1000 → 900 → 800 → … fechando."""
+    return [
+        f"""
+        {{"saldo_anterior": {'"1000.00"' if n == 0 else "null"},
+          "transacoes": [
+            {{"data": "0{n + 1}/01/2026", "historico": "PIX {n}",
+             "valor": -100.00, "saldo": {1000 - 100 * (n + 1)}.00}}
+          ]}}
+        """
+        for n in range(quantidade)
+    ]
+
+
+
+# ────────────────────────────────────────────── o relógio da leitura por imagem
+
+
+def test_vision_nao_morre_no_relogio_do_caminho_de_texto(monkeypatch):
+    """A regressão que apareceu no primeiro uso real: timeout no meio da leitura.
+
+    `pdf_parse_timeout_seconds` foi dimensionado para o caminho determinístico
+    (8,4s no pior extrato medido) e para a camada 2, que faz UMA chamada. A
+    camada 3 faz uma por página, cada uma custando dezenas de segundos: dividindo
+    o mesmo relógio, ela estourava antes da terceira página — e `pdf_max_ai_calls:
+    30` prometia trinta páginas que o relógio jamais deixaria terminar.
+
+    O relógio aqui é de mentira e só anda quando uma chamada acontece: quatro
+    páginas a 40s somam 160s, muito além dos 60s do caminho de texto.
+    """
+    relogio = _Relogio()
+    monkeypatch.setattr(pdf_parser, "time", relogio)
+
+    ajustes = _Settings()
+    ajustes.pdf_vision_concurrency = 1          # sequencial: o tempo soma
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: ajustes)
+
+    cliente = _ClienteFalso(
+        _paginas_encadeadas(4), avanco_do_relogio=40.0, relogio=relogio
+    )
+    import openai
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: cliente)
+
+    transacoes = parse_pdf(_pdf_sem_texto(4))
+
+    assert cliente.chamadas == 4
+    assert relogio.agora > ajustes.pdf_parse_timeout_seconds
+    assert len(transacoes) == 4
+
+
+def test_vision_da_a_cada_chamada_o_teto_da_camada_3(openai_falso):
+    """30s era o teto herdado do caminho de texto e derrubava página cheia."""
+    cliente = openai_falso([_PAGINA_BOA])
+    parse_pdf(_pdf_sem_texto(1))
+
+    assert cliente.timeouts == [120.0]
+
+
+def test_budget_estende_o_prazo_so_para_frente():
+    orcamento = pdf_parser._PDFBudget(
+        deadline=pdf_parser.time.monotonic() + 300, max_pages=120, ai_calls_restantes=30
+    )
+    antes = orcamento.deadline
+    orcamento.estender_deadline(10)
+    assert orcamento.deadline == antes
+
+
+def test_vision_le_as_paginas_em_paralelo_e_devolve_na_ordem_do_arquivo(openai_falso):
+    """Doze páginas em fila não cabem em teto de tempo nenhum.
+
+    Ler em paralelo é o que torna o extrato de 12 páginas viável; a ordem que a
+    cadeia de saldos confere é restaurada pelo número da página, não pela ordem
+    de chegada das respostas.
+    """
+    cliente = openai_falso(
+        _paginas_encadeadas(6), barreira=threading.Barrier(6, timeout=10)
+    )
+    transacoes = parse_pdf(_pdf_sem_texto(6))
+
+    assert cliente.simultaneas_maximo == 6
+    assert [t.historico for t in transacoes] == [f"PIX {n}" for n in range(6)]
+    assert [t.ordem for t in transacoes] == list(range(6))
+
+
+def test_vision_diz_qual_pagina_falhou_em_vez_da_recusa_generica(openai_falso):
+    """Falha de chamada virava "extração não verificável" — culpa no extrato errado.
+
+    A frase antiga mandava o contador procurar problema no arquivo quando o que
+    tinha acontecido era a chamada não ter voltado.
+    """
+    openai_falso([_PAGINA_BOA, _PAGINA_BOA], erro_na_pagina=1)
+    with pytest.raises(PDFParseError, match="falhou na página 2"):
+        parse_pdf(_pdf_sem_texto(2))

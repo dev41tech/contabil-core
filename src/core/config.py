@@ -112,6 +112,27 @@ class Settings(BaseSettings):
     # reais do escritório e mantém o custo de um único arquivo na casa de
     # centavos — a camada 2, que lê texto, gasta uma chamada só.
     pdf_max_ai_calls: int = 30
+
+    # A camada 3 (leitura por imagem) tem orçamento de tempo PRÓPRIO porque o
+    # perfil dela não se parece com o do resto: uma chamada por página, em
+    # `detail: high`, custa dezenas de segundos, enquanto o caminho
+    # determinístico inteiro cabe em 8,4s e a camada 2 faz uma chamada só.
+    #
+    # Enquanto a camada 3 dividia os 60s com as outras, ela estourava antes da
+    # terceira página — e `pdf_max_ai_calls: 30` prometia um extrato de 30
+    # páginas que o relógio jamais deixaria terminar. Os dois tetos precisam
+    # conversar: com `pdf_vision_concurrency` páginas em voo, 30 páginas a ~40s
+    # cada cabem nos 300s abaixo com folga.
+    #
+    # Isto NÃO é o limite de custo — quem contém custo é `pdf_max_ai_calls`.
+    pdf_vision_timeout_seconds: int = 300
+    # Teto de UMA chamada. Os 30s herdados do caminho de texto derrubavam
+    # páginas cheias que respondem legitimamente em mais que isso.
+    pdf_vision_call_timeout_seconds: int = 120
+    # Páginas são independentes: cada uma é uma chamada isolada e a ordem é
+    # restaurada pelo número da página. Sem isto, 12 páginas viram 12 esperas
+    # em fila e nenhum teto de tempo razoável é suficiente.
+    pdf_vision_concurrency: int = 6
     allow_financial_data_to_openai: bool = False
 
     @property
