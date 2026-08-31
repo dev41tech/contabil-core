@@ -773,6 +773,36 @@ def _parse_ai_response_vision(raw: str) -> dict:
 
 # ──────────────────────────────────────────────────────────── entrypoint
 
+def _recusa_de_adaptador_vazio(adaptador, linhas: list[str]) -> str:
+    """Diz que o leitor do banco foi acionado e não achou a tabela.
+
+    São dois casos com conselhos OPOSTOS, e `reconhece` os separa:
+
+    - a assinatura do layout casou → é mesmo este banco, e a tabela é que mudou.
+      Não há nada que o contador possa fazer no arquivo; o conserto é aqui.
+    - não casou → o leitor veio da sigla da agência cadastrada, e o arquivo não
+      se parece com esse banco. Aí a pergunta certa é se o extrato foi baixado
+      da conta certa, ou se a agência está com o banco errado no cadastro.
+
+    Sem essa frase, os dois saíam como "não foi possível obter uma extração com
+    saldos verificáveis" — que manda procurar defeito no extrato nos dois casos.
+    """
+    nome = adaptador.__name__.rsplit(".", 1)[-1].upper()
+    if adaptador.reconhece(linhas):
+        return (
+            f"O leitor do {nome} reconheceu o extrato, mas não encontrou a "
+            "tabela de lançamentos — provavelmente é um layout novo deste "
+            "banco. Nenhum lançamento foi importado; envie este arquivo ao "
+            "suporte para que o leitor seja ajustado."
+        )
+    return (
+        f"O leitor do {nome} foi usado porque é o banco cadastrado na agência, "
+        "mas o arquivo não tem o layout dele e nenhum lançamento foi "
+        "importado. Confira se o extrato é desta conta e se a agência está com "
+        "o banco correto no cadastro."
+    )
+
+
 def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[TransacaoOFX]:
     """Extrai transações de um PDF de extrato bancário.
 
@@ -810,6 +840,11 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
         max_pages=settings.pdf_max_pages,
         ai_calls_restantes=settings.pdf_max_ai_calls,
     )
+
+    # Adaptador que reconheceu o banco e não extraiu nada. Guardado aqui porque
+    # quem sabe disso é a camada 0, e quem precisa contar é a recusa no fim.
+    adaptador_vazio = None
+    linhas: list[str] = []
 
     # ── Camadas 1 e 2: requerem pdfplumber ───────────────────────────────────
     if _PDFPLUMBER_AVAILABLE:
@@ -852,6 +887,13 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
                         len(transacoes), adaptador.__name__.rsplit(".", 1)[-1],
                     )
                     return transacoes
+                # Guardado para a recusa lá embaixo. Adaptador certo produzindo
+                # ZERO lançamentos é a pior falha que este módulo tem: nada
+                # aponta para a causa, e a mensagem final falava de "extração
+                # não verificável" — que manda procurar problema no extrato
+                # quando o problema é a tabela que o leitor não achou. Três dos
+                # cinco defeitos dos extratos da JS BERTOLDO tinham essa cara.
+                adaptador_vazio = adaptador
                 logger.info(
                     "adaptador %s reconheceu o layout mas não extraiu lançamentos "
                     "— seguindo para o parser genérico",
@@ -914,6 +956,9 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
                     "PDF parser: %d transações via Vision (camada 3)", len(transacoes)
                 )
                 return transacoes
+
+    if adaptador_vazio is not None:
+        raise PDFParseError(_recusa_de_adaptador_vazio(adaptador_vazio, linhas))
 
     raise PDFParseError(
         "Não foi possível obter uma extração com saldos/totais verificáveis; "

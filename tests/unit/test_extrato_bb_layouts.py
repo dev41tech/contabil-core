@@ -18,7 +18,7 @@ from decimal import Decimal
 import pytest
 
 from src.domain.extrato.bancos import bb
-from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos
+from src.domain.extrato.pdf_parser import PDFParseError, _validar_blocos, parse_pdf
 
 TOLERANCIA = Decimal("0.05")
 
@@ -251,3 +251,48 @@ def test_letra_solta_na_descricao_nao_e_marcador_de_sinal():
     # Se o D tivesse sido consumido, o fecho não seria detectado e a linha
     # entraria como complemento do lançamento.
     assert "S A L" not in bloco.transacoes[0].historico
+
+
+# ── a recusa quando o leitor certo não acha a tabela ─────────────────────────
+
+
+def _pdf_com_linhas(linhas: list[str]) -> bytes:
+    """PDF de uma página com as linhas dadas, para exercitar `parse_pdf`."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    pagina = doc.new_page(width=595, height=842)
+    for i, texto in enumerate(linhas):
+        pagina.insert_text((40, 80 + i * 16), texto, fontsize=9)
+    dados = doc.tobytes()
+    doc.close()
+    return dados
+
+
+def test_recusa_diz_que_o_leitor_do_banco_nao_achou_a_tabela():
+    """Layout reconhecido e tabela não encontrada: o conserto é do nosso lado.
+
+    Era a pior falha do módulo — o adaptador certo produzindo zero lançamentos,
+    com a recusa genérica mandando o contador procurar defeito no extrato.
+    """
+    # Assinatura do BB presente, mas sem nenhuma linha de lançamento.
+    dados = _pdf_com_linhas([
+        "Ag. origem Lote Histórico Documento Valor R$ Saldo",
+        "balancete movimento",
+        "Nenhum lançamento no período.",
+    ])
+    with pytest.raises(PDFParseError, match="layout novo deste banco"):
+        parse_pdf(dados)
+
+
+def test_recusa_aponta_o_cadastro_quando_o_arquivo_nao_e_do_banco_da_agencia():
+    """Conselho OPOSTO: aqui o leitor veio da sigla, e o arquivo não é do banco.
+
+    Mandar "envie ao suporte" neste caso esconderia o que provavelmente é um
+    extrato da conta errada, ou uma agência cadastrada com o banco errado.
+    """
+    dados = _pdf_com_linhas([
+        "Extrato de outro banco qualquer",
+        "01/02/2026 algum texto sem colunas reconhecíveis",
+    ])
+    with pytest.raises(PDFParseError, match="banco correto no cadastro"):
+        parse_pdf(dados, "BB")
