@@ -481,3 +481,52 @@ def test_saldo_impresso_na_linha_manda_mais_que_o_saldo_do_dia():
         [transacao], [(_date(2026, 5, 21), Decimal("999.00"))]
     )
     assert resultado.saldo_apos == Decimal("7.00")
+
+
+def test_fecho_da_conta_corrente_vem_do_rotulo_e_nao_da_capa():
+    """O extrato do Itaú declara TRÊS saldos, e só um fecha a conta corrente.
+
+        capa    saldo em 25/02/26   5.969,14-  ┐ conta corrente MAIS a
+        capa    saldo em 31/03/26  17.138,32   ┘ aplicação automática
+        rodapé  Saldo em C/C            1,00     só a conta corrente
+
+    Os 17.138,32 são 1,00 de conta corrente com 17.137,32 aplicados. Fechar a
+    cadeia com eles acusa uma diferença de 17.137,32 que não é lançamento
+    nenhum — é o dinheiro que está na aplicação. Foi exatamente onde este
+    extrato parou antes de o rótulo passar a decidir.
+    """
+    from datetime import date as _date
+
+    transacoes = [
+        pdf_parser.TransacaoOFX(
+            fitid="f0", data=_date(2026, 3, 2), valor=Decimal("-10.00"),
+            historico="X", tipo_ofx="DEBIT", saldo_apos=None, ordem=0,
+        ),
+        pdf_parser.TransacaoOFX(
+            fitid="f1", data=_date(2026, 3, 31), valor=Decimal("-20.00"),
+            historico="Y", tipo_ofx="DEBIT", saldo_apos=None, ordem=1,
+        ),
+    ]
+    declarados = [
+        ("saldo em 25/02/26", _date(2026, 2, 25), Decimal("-5969.14")),
+        ("saldo em 31/03/26", _date(2026, 3, 31), Decimal("17138.32")),
+        ("Saldo em C/C", None, Decimal("1.00")),
+    ]
+
+    abertura, fecho = pdf_parser._pontas_declaradas(declarados, transacoes)
+    assert abertura == Decimal("-5969.14")
+    assert fecho == Decimal("1.00"), "a capa soma a aplicação e não fecha a conta"
+
+
+def test_sem_rotulo_de_conta_corrente_nao_ha_fecho():
+    """Melhor ficar sem cauda coberta do que fechar com o número errado."""
+    from datetime import date as _date
+
+    transacoes = [pdf_parser.TransacaoOFX(
+        fitid="f0", data=_date(2026, 3, 2), valor=Decimal("-10.00"),
+        historico="X", tipo_ofx="DEBIT", saldo_apos=None, ordem=0,
+    )]
+    _, fecho = pdf_parser._pontas_declaradas(
+        [("saldo em 31/03/26", _date(2026, 3, 31), Decimal("17138.32"))], transacoes
+    )
+    assert fecho is None
