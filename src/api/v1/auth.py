@@ -30,8 +30,13 @@ from src.schemas.auth import (
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> str:
-    """Define os cookies de autenticação e retorna o CSRF token."""
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str,
+                      csrf_atual: str | None = None) -> str:
+    """Define os cookies da sessão e devolve o token CSRF em vigor.
+
+    `csrf_atual` é o token que o navegador JÁ tem. Quando ele vem, é preservado:
+    ver o comentário no `set_cookie` do csrf abaixo.
+    """
     settings = get_settings()
     kwargs = make_cookie_kwargs()
 
@@ -49,23 +54,46 @@ def _set_auth_cookies(response: Response, access_token: str, refresh_token: str)
         **kwargs,
     )
 
-    csrf = generate_csrf_token()
-    # CSRF token em cookie NÃO HttpOnly — precisa ser lido pelo frontend
+    # O cookie de CSRF é um só para o navegador inteiro; o token que o frontend
+    # guarda é um por aba. Enquanto o refresh emitia um token novo, toda aba que
+    # não tinha feito aquele refresh continuava mandando o valor anterior no
+    # header e levava "CSRF token inválido" na primeira mutação — a cada 15
+    # minutos, com o sistema aberto em duas partes.
+    #
+    # Rotacionar aqui não protegia nada: o valor é um número aleatório de
+    # dupla submissão, não uma credencial, e o que ele prova é que quem mandou o
+    # header conseguiu ler o cookie. Quem precisa de token novo é o LOGIN — aí
+    # sim, um cookie plantado antes da autenticação não pode sobreviver a ela.
+    csrf = csrf_atual or generate_csrf_token()
+    # CSRF token em cookie NÃO HttpOnly — precisa ser lido pelo frontend.
+    #
+    # A validade acompanha o REFRESH, não o access token: com os 15 minutos do
+    # access, uma aba parada perdia o cookie e a próxima mutação virava 403
+    # "CSRF token inválido" em vez do 401 que dispararia a renovação. O logout
+    # apaga o cookie, então durar mais não estende sessão nenhuma.
     response.set_cookie(
         key="csrf_token",
         value=csrf,
-        max_age=settings.access_token_ttl_minutes * 60,
+        max_age=settings.refresh_token_ttl_days * 86400,
         httponly=False,
         secure=settings.cookie_secure,
         samesite=settings.cookie_samesite,
+        domain=settings.cookie_domain,
     )
     return csrf
 
 
 def _clear_auth_cookies(response: Response) -> None:
-    response.delete_cookie(COOKIE_ACCESS)
-    response.delete_cookie(COOKIE_REFRESH, path="/api/v1/auth/refresh")
-    response.delete_cookie("csrf_token")
+    # `domain` precisa repetir o que foi usado para GRAVAR: o navegador só
+    # apaga o cookie quando escopo e caminho batem. Enquanto o delete omitia o
+    # domínio, bastaria alguém preencher `COOKIE_DOMAIN` para o logout deixar a
+    # sessão de pé — hoje ele é None em produção, e é justamente por isso que
+    # essa assimetria passava despercebida.
+    settings = get_settings()
+    response.delete_cookie(COOKIE_ACCESS, domain=settings.cookie_domain)
+    response.delete_cookie(COOKIE_REFRESH, path="/api/v1/auth/refresh",
+                           domain=settings.cookie_domain)
+    response.delete_cookie("csrf_token", domain=settings.cookie_domain)
 
 
 @router.post("/login", response_model=LoginResponse, status_code=200)
@@ -96,15 +124,19 @@ async def login(
 async def refresh(
     response: Response,
     refresh_token: str | None = Cookie(default=None, alias=COOKIE_REFRESH),
+    csrf_atual: str | None = Cookie(default=None, alias="csrf_token"),
     db: AsyncSession = Depends(get_db),
 ) -> RefreshResponse:
-    """Renova access + refresh tokens usando o refresh token do cookie."""
+    """Renova access + refresh tokens usando o refresh token do cookie.
+
+    O CSRF em vigor atravessa a renovação: ele é do navegador, não desta aba.
+    """
     if not refresh_token:
         raise AuthError(message="Refresh token ausente.")
 
     service = AuthService(db)
     new_access, new_refresh = await service.refresh(refresh_token)
-    csrf = _set_auth_cookies(response, new_access, new_refresh)
+    csrf = _set_auth_cookies(response, new_access, new_refresh, csrf_atual=csrf_atual)
     return RefreshResponse(csrf_token=csrf)
 
 
