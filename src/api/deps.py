@@ -25,6 +25,8 @@ from src.core.security import COOKIE_ACCESS, decode_access_token
 from src.db.models import Empresa, Permissao, Tenant, Usuario
 from src.db.session import get_db
 
+logger = structlog.get_logger(__name__)
+
 @dataclass(frozen=True)
 class AuthContext:
     user_id: UUID
@@ -110,9 +112,26 @@ async def require_csrf(
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return
 
+    # As duas falhas abaixo têm causas OPOSTAS e vinham com a mesma frase, o que
+    # já custou um ciclo de diagnóstico: "CSRF token inválido" não dizia se o
+    # navegador tinha perdido o cookie ou se a aba estava com um valor velho.
     csrf_cookie = request.cookies.get("csrf_token")
-    if not csrf_cookie or csrf_cookie != x_csrf_token:
-        raise ForbiddenError(message="CSRF token inválido.")
+    if not csrf_cookie:
+        # Sem cookie: sessão encerrada, cookie expirado ou logout em outra aba.
+        logger.warning("csrf.cookie_ausente", path=request.url.path,
+                       tem_header=bool(x_csrf_token))
+        raise ForbiddenError(
+            message="Sessão sem token de segurança — recarregue a página para continuar."
+        )
+    if csrf_cookie != x_csrf_token:
+        # Com cookie e header diferentes: a aba guardou um valor que outra aba
+        # substituiu (login em outra aba é o caso que sobra depois de o refresh
+        # ter passado a preservar o token).
+        logger.warning("csrf.header_divergente", path=request.url.path,
+                       tem_header=bool(x_csrf_token))
+        raise ForbiddenError(
+            message="Token de segurança desatualizado — recarregue a página para continuar."
+        )
 
 
 async def get_company_context(
