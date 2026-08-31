@@ -46,6 +46,7 @@ de 5.110,00 que não existe.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
@@ -120,8 +121,20 @@ def _ler_cabecalho(linhas: list[list[dict]]) -> _Colunas | None:
     return None
 
 
+# O "Gerenciador CAIXA" não tem `Data/Hora`: as duas datas viram colunas
+# próprias e o cabeçalho quebra em alturas. O que sobra numa linha só são as
+# quatro colunas do meio — e `Valor(R$)`/`Saldo(R$)` sem espaço é marca dele.
+_ASSINATURA_GERENCIADOR = re.compile(
+    r"\bdocumento\b.*\bhist[óo]rico\b.*\bvalor\(r\$\).*\bsaldo\(r\$\)",
+    re.IGNORECASE,
+)
+
+
 def reconhece(linhas: list[str]) -> bool:
-    return any(_ASSINATURA.search(linha) for linha in linhas)
+    return any(
+        _ASSINATURA.search(linha) or _ASSINATURA_GERENCIADOR.search(linha)
+        for linha in linhas
+    )
 
 
 def _sinal_a_direita(x1: float, letras: list[tuple[float, str]]) -> str | None:
@@ -134,7 +147,187 @@ def _sinal_a_direita(x1: float, letras: list[tuple[float, str]]) -> str | None:
     return min(candidatas)[1]
 
 
+# ──────────────────────────────────────────── layout "Gerenciador CAIXA"
+#
+# Exportação tabular, sem a letra D/C que o outro layout usa:
+#
+#     Data de      Data de                                    Valor(R$)   Saldo(R$)
+#     lançamento   movimento   Documento  Histórico
+#     02/02/2026   02/02/2026  0          DEBITO DE IOF        - 197,96   R$ 63.725,71
+#     02/02/2026   02/02/2026  0          COBRANCA DE JUROS  - 9.710,68   R$ 73.436,39
+#     02/02/2026   02/02/2026  0          SALDO DIA                0,00   R$ 73.436,39
+#
+# Três coisas mudam em relação ao layout com D/C:
+#
+#   - o sinal é um `-` SOLTO na coluna de valor, e não uma letra à direita;
+#   - a célula quebra: `MENSALIDADE CESTA` / `SERVICO` em duas alturas, e um
+#     valor cujo `-` ficou numa altura e o `11.178,16` na de baixo;
+#   - **o saldo não traz sinal nenhum.** Ver `_orientar_saldos`.
+
+_ALTURA_DO_GERENCIADOR = 14.0
+_TOLERANCIA_CADEIA = Decimal("0.05")
+_MENOS = re.compile(r"^[-–—]$")
+
+
+def _ler_cabecalho_gerenciador(linhas: list[list[dict]]) -> _Colunas | None:
+    for palavras in linhas:
+        textos = [p["text"].lower() for p in palavras]
+        if "documento" not in textos or not any(t.startswith("hist") for t in textos):
+            continue
+        if "data" not in textos:
+            continue
+        valor = borda_direita(textos, palavras, "valor")
+        saldo = borda_direita(textos, palavras, "saldo")
+        if valor is None or saldo is None:
+            continue
+        return _Colunas(
+            # Duas colunas de data, lançamento e movimento. A primeira é a de
+            # lançamento, que é a que o razão usa.
+            x_data=float(palavras[textos.index("data")]["x0"]),
+            x_descricao=float(
+                palavras[next(i for i, t in enumerate(textos) if t.startswith("hist"))]["x0"]
+            ),
+            valor=valor,
+            saldo=saldo,
+        )
+    return None
+
+
+def _cadeia_fecha(transacoes: list[TransacaoOFX]) -> bool:
+    """Os saldos impressos caminham com os valores, de âncora a âncora?"""
+    anterior: Decimal | None = None
+    acumulado = Decimal("0")
+    viu_par = False
+    for transacao in transacoes:
+        acumulado += transacao.valor
+        if transacao.saldo_apos is None:
+            continue
+        if anterior is not None:
+            viu_par = True
+            if abs((transacao.saldo_apos - anterior) - acumulado) > _TOLERANCIA_CADEIA:
+                return False
+        anterior = transacao.saldo_apos
+        acumulado = Decimal("0")
+    return viu_par
+
+
+def _orientar_saldos(transacoes: list[TransacaoOFX]) -> list[TransacaoOFX]:
+    """Descobre o SINAL do saldo, que este extrato não imprime.
+
+    A conta está no vermelho e a CAIXA imprime o saldo devedor em módulo, sem
+    `D` e sem menos:
+
+        DEBITO DE IOF        - 197,96   R$ 63.725,71
+        COBRANCA DE JUROS  - 9.710,68   R$ 73.436,39
+
+    Um débito de 9.710,68 fez o número CRESCER. Isso é impossível num saldo
+    credor — e é exatamente o que se espera de um devedor impresso sem sinal.
+
+    Importar como está poria +R$ 84.951,75 no razão de uma conta que deve esse
+    tanto: erro de sinal em saldo, que é a família do defeito que já pôs saldo no
+    lugar de valor neste módulo.
+
+    A decisão não é por heurística de descrição nem por chute: as duas leituras
+    são TESTADAS contra a cadeia, e vale a que caminha. Se as duas caminham ou
+    nenhuma caminha, nada é invertido e a conferência lá na frente recusa — não
+    se escolhe sinal no empate.
+    """
+    if _cadeia_fecha(transacoes):
+        return transacoes
+    invertidas = [
+        replace(t, saldo_apos=-t.saldo_apos if t.saldo_apos is not None else None)
+        for t in transacoes
+    ]
+    return invertidas if _cadeia_fecha(invertidas) else transacoes
+
+
+def _extrair_gerenciador(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
+    transacoes: list[TransacaoOFX] = []
+    idx = 0
+    colunas: _Colunas | None = None
+
+    for palavras in paginas:
+        linhas = agrupar_linhas(palavras, altura=_ALTURA_DO_GERENCIADOR)
+        colunas = _ler_cabecalho_gerenciador(linhas) or colunas
+        if colunas is None:
+            continue
+
+        for linha in linhas:
+            if _ler_cabecalho_gerenciador([linha]) is not None:
+                continue
+
+            data_lida: date | None = None
+            # (altura, x0, texto): a célula de histórico quebra em duas alturas
+            # — `MENSALIDADE CESTA` em cima, `SERVICO` embaixo. Ordenar só pelo
+            # x0 embaralha as duas metades e sai "MENSALIDADE SERVICO CESTA".
+            descricao: list[tuple[float, float, str]] = []
+            valor: Decimal | None = None
+            saldo: Decimal | None = None
+            negativo = False
+
+            for palavra in linha:
+                texto = palavra["text"]
+                x0, x1 = float(palavra["x0"]), float(palavra["x1"])
+
+                if _DATA.match(texto):
+                    # Só a PRIMEIRA coluna de data; a de movimento é ignorada.
+                    if abs(x0 - colunas.x_data) <= 8 and data_lida is None:
+                        data_lida = parse_data(texto, referencia_ano)
+                    continue
+                if _MENOS.match(texto) and x1 >= colunas.valor - 60:
+                    # O `-` mora na coluna de valor, à esquerda do número ou —
+                    # quando a célula quebra — numa altura acima dele.
+                    negativo = True
+                    continue
+                if _VALOR.match(texto):
+                    convertido = parse_valor(texto)
+                    if convertido is None:
+                        continue
+                    if abs(x1 - colunas.valor) <= _TOLERANCIA_COLUNA:
+                        valor = abs(convertido)
+                    elif abs(x1 - colunas.saldo) <= _TOLERANCIA_COLUNA:
+                        saldo = convertido
+                    continue
+                if x0 >= colunas.x_descricao - 3 and x0 < colunas.valor - 40:
+                    descricao.append((float(palavra["top"]), x0, texto))
+
+            texto_descricao = re.sub(
+                r"\s+", " ", " ".join(t for _, _, t in sorted(descricao))
+            ).strip()
+            if data_lida is None or valor is None:
+                continue
+            # `SALDO DIA` fecha o dia com valor 0,00: não é lançamento, e o
+            # saldo dele só repete o da última linha do dia.
+            if valor == 0 or texto_descricao.upper().startswith("SALDO DIA"):
+                continue
+
+            movimento = -valor if negativo else valor
+            historico = texto_descricao[:200] or "SEM DESCRIÇÃO"
+            transacoes.append(
+                TransacaoOFX(
+                    fitid=gerar_fitid(data_lida, historico, movimento, idx),
+                    data=data_lida,
+                    valor=movimento,
+                    historico=historico,
+                    tipo_ofx="CREDIT" if movimento > 0 else "DEBIT",
+                    saldo_apos=saldo,
+                    ordem=idx,
+                )
+            )
+            idx += 1
+
+    if not transacoes:
+        return []
+    return [Bloco(transacoes=_orientar_saldos(transacoes))]
+
+
 def extrair_de_palavras(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
+    for palavras in paginas:
+        if _ler_cabecalho_gerenciador(
+            agrupar_linhas(palavras, altura=_ALTURA_DO_GERENCIADOR)
+        ) is not None:
+            return _extrair_gerenciador(paginas, referencia_ano)
+
     transacoes: list[TransacaoOFX] = []
     idx = 0
     colunas: _Colunas | None = None

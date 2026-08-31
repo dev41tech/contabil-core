@@ -76,10 +76,32 @@ _ASSINATURA_DIA_LOTE = re.compile(
 )
 
 
+# Quando o cabeçalho vem empilhado, `Dt. balancete` se parte em duas alturas e
+# nenhuma linha contém a assinatura inteira. O que sobra é a linha só com os dois
+# rótulos de baixo — que, sozinha, poderia ser de qualquer documento contábil.
+# Por isso ela vale como assinatura apenas ACOMPANHADA da linha de colunas.
+_ASSINATURA_EMPILHADA = re.compile(r"^\s*balancete\s+movimento\s*$", re.IGNORECASE)
+# Painel PJ: os dois rótulos viram colunas próprias, na ordem inversa, e o
+# `No.DOCUMENTO` sem espaço é marca da tela do BB.
+_ASSINATURA_PAINEL = re.compile(
+    r"\bmovimento\b.*\bbalancete\b.*\bhist[óo]rico\b.*\bvalor\b.*\bsaldo\b",
+    re.IGNORECASE,
+)
+_COLUNAS_DO_EXTRATO = re.compile(
+    r"\bhist[óo]rico\b.*\bvalor\b.*\bsaldo\b", re.IGNORECASE
+)
+
+
 def reconhece(linhas: list[str]) -> bool:
-    return any(
-        _ASSINATURA_BALANCETE.search(linha) or _ASSINATURA_DIA_LOTE.match(linha.strip())
+    if any(
+        _ASSINATURA_BALANCETE.search(linha)
+        or _ASSINATURA_DIA_LOTE.match(linha.strip())
+        or _ASSINATURA_PAINEL.search(linha)
         for linha in linhas
+    ):
+        return True
+    return any(_ASSINATURA_EMPILHADA.match(linha) for linha in linhas) and any(
+        _COLUNAS_DO_EXTRATO.search(linha) for linha in linhas
     )
 
 
@@ -123,10 +145,23 @@ def _separar_letra_colada(palavras: list[dict]) -> list[dict]:
 # ─────────────────────────────────────────────────────── layout A: balancete
 
 
+# O cabeçalho do balancete nem sempre cabe numa altura só. Na exportação
+# "Consultas - Extrato de conta corrente" ele vem empilhado em TRÊS:
+#
+#     Dt.                                                        ← 199,1
+#     Ag. origem  Lote  Histórico  Documento  Valor R$  Saldo    ← 203,6
+#     balancete   movimento                                      ← 207,6
+#
+# `balancete` fica numa linha e `Valor`/`Saldo` em outra, a 4 pontos. Exigir os
+# quatro na MESMA linha fazia o adaptador ser escolhido pela sigla da agência,
+# reconhecer o banco e extrair zero lançamentos — recusa sem explicação.
+_ALTURA_DO_CABECALHO = 10.0
+
+
 def _colunas_balancete(linhas: list[list[dict]]) -> dict | None:
-    for palavras in linhas:
+    for indice, palavras in enumerate(linhas):
         textos = [p["text"].lower() for p in palavras]
-        if "balancete" not in textos or "valor" not in textos or "saldo" not in textos:
+        if "valor" not in textos or "saldo" not in textos:
             continue
         if not any(t.startswith("hist") for t in textos):
             continue
@@ -134,14 +169,49 @@ def _colunas_balancete(linhas: list[list[dict]]) -> dict | None:
         saldo = borda_direita(textos, palavras, "saldo")
         if valor is None or saldo is None:
             continue
+
+        # `balancete` ancora a coluna de data. Ele pode estar nesta linha ou na
+        # de cima/de baixo, quando o cabeçalho vem empilhado.
+        balancete = _palavra_vizinha(linhas, indice, "balancete")
+        if balancete is None:
+            continue
+
         return {
-            "x_data": float(palavras[textos.index("balancete")]["x0"]) - 15,
+            "x_data": float(balancete["x0"]) - 15,
             "x_historico": float(
                 palavras[next(i for i, t in enumerate(textos) if t.startswith("hist"))]["x0"]
             ),
             "valor": valor,
             "saldo": saldo,
         }
+    return None
+
+
+# O BB numera o histórico, e o número cai DENTRO da coluna de descrição:
+#
+#     0000  13128  500  BB GIRO PRONAMPE  300.712.236.000.795  1.350,95 D
+#     0000  00000  000  Saldo Anterior                         1.031,50 D
+#                  ↑ código do histórico, não descrição
+#
+# Além de sujar o histórico, ele quebrava a abertura da cadeia: a descrição
+# saía "000 Saldo Anterior" e o teste de `SALDO ANTERIOR` no início do texto
+# não casava, deixando o extrato sem saldo de abertura.
+_CODIGO_DO_HISTORICO = re.compile(r"^\d{1,4}\s+(?=\D)")
+
+
+def _limpar_codigo_do_historico(texto: str) -> str:
+    return _CODIGO_DO_HISTORICO.sub("", texto, count=1)
+
+
+def _palavra_vizinha(linhas: list[list[dict]], indice: int, alvo: str) -> dict | None:
+    """Procura uma palavra na linha dada e nas que estão à altura do cabeçalho."""
+    referencia = float(linhas[indice][0]["top"])
+    for outras in linhas:
+        if abs(float(outras[0]["top"]) - referencia) > _ALTURA_DO_CABECALHO:
+            continue
+        for palavra in outras:
+            if palavra["text"].lower() == alvo:
+                return palavra
     return None
 
 
@@ -190,7 +260,9 @@ def _extrair_balancete(paginas: list[list[dict]], referencia_ano: int) -> list[B
                 if x0 >= colunas["x_historico"] - 3:
                     descricao.append(texto)
 
-            texto_descricao = re.sub(r"\s+", " ", " ".join(descricao)).strip()
+            texto_descricao = _limpar_codigo_do_historico(
+                re.sub(r"\s+", " ", " ".join(descricao)).strip()
+            )
 
             valor = saldo = None
             for x1, nome, bruto in numeros:
@@ -359,10 +431,171 @@ def _extrair_dia_lote(paginas: list[list[dict]], referencia_ano: int) -> list[Bl
     return [Bloco(transacoes=transacoes, saldo_anterior=saldo_anterior)]
 
 
+# ──────────────────────────────────────────────────────── layout C: painel PJ
+#
+# Impressão da tela do Painel PJ, não do extrato. Vem com o menu do site ao
+# redor da tabela, mas a tabela em si é a mais limpa dos três layouts:
+#
+#     MOVIMENTO   BALANCETE  HISTÓRICO           No.DOCUMENTO  VALOR      SALDO
+#     31/12/2025             Saldo Anterior                              -R$ 245,30
+#     02/01/2026             Cobrança de I.O.F.  391100702     -R$ 4,87  -R$ 250,17
+#     07/01/2026             Pix - Recebido      71514122485021 R$ 3.000,00
+#
+# O que muda para os outros dois: o sinal é o `-` colado no `R$` ANTES do
+# número, não uma letra depois dele; e o saldo sai só na última linha do dia,
+# o que a conferência por segmentos já sabe tratar.
+
+_MARCA_REAIS = re.compile(r"^(-?)R\$$")
+# Distância entre o `R$` e o número que ele qualifica: medido, fica em 2 e 3
+# pontos. 12 dá folga sem alcançar a coluna vizinha, que está a dezenas.
+_DISTANCIA_DO_CIFRAO = 12.0
+
+
+def _colunas_painel(linhas: list[list[dict]]) -> dict | None:
+    for palavras in linhas:
+        textos = [p["text"].lower() for p in palavras]
+        if not {"movimento", "balancete", "valor", "saldo"} <= set(textos):
+            continue
+        if not any(t.startswith("hist") for t in textos):
+            continue
+        # O cabeçalho do balancete, quando cabe numa linha só, também tem os
+        # dois rótulos — e casaria aqui, ancorando a data na coluna errada.
+        # Duas marcas separam os layouts, e as duas vêm do mesmo fato: no
+        # balancete os rótulos são `Dt. balancete` e `Dt. movimento`, nessa
+        # ordem; no Painel são colunas próprias, sem `Dt.` e na ordem inversa.
+        if "dt." in textos:
+            continue
+        if textos.index("movimento") > textos.index("balancete"):
+            continue
+        valor = borda_direita(textos, palavras, "valor")
+        saldo = borda_direita(textos, palavras, "saldo")
+        if valor is None or saldo is None:
+            continue
+        return {
+            "x_data": float(palavras[textos.index("movimento")]["x0"]),
+            "x_historico": float(
+                palavras[next(i for i, t in enumerate(textos) if t.startswith("hist"))]["x0"]
+            ),
+            "valor": valor,
+            "saldo": saldo,
+        }
+    return None
+
+
+def _sinal_a_esquerda(x0: float, marcas: list[tuple[float, int]]) -> int | None:
+    """O `R$` mais próximo à esquerda do número."""
+    candidatas = [
+        (x0 - x1, sinal) for x1, sinal in marcas if 0 <= x0 - x1 <= _DISTANCIA_DO_CIFRAO
+    ]
+    return min(candidatas)[1] if candidatas else None
+
+
+def _extrair_painel(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
+    transacoes: list[TransacaoOFX] = []
+    saldo_anterior: Decimal | None = None
+    idx = 0
+    colunas: dict | None = None
+
+    for palavras in paginas:
+        linhas = agrupar_linhas(palavras)
+        colunas = _colunas_painel(linhas) or colunas
+        if colunas is None:
+            continue
+
+        for linha in linhas:
+            if _colunas_painel([linha]) is not None:
+                continue
+
+            data_lida: date | None = None
+            descricao: list[str] = []
+            numeros: list[tuple[float, str, Decimal]] = []
+            marcas: list[tuple[float, int]] = []
+
+            for palavra in linha:
+                texto = palavra["text"]
+                x0, x1 = float(palavra["x0"]), float(palavra["x1"])
+
+                if _DATA.match(texto) and abs(x0 - colunas["x_data"]) <= 14:
+                    data_lida = parse_data(texto, referencia_ano)
+                    continue
+                marca = _MARCA_REAIS.match(texto)
+                if marca:
+                    marcas.append((x1, -1 if marca.group(1) else 1))
+                    continue
+                if _VALOR.match(texto):
+                    for nome in ("valor", "saldo"):
+                        if abs(x1 - colunas[nome]) <= _TOLERANCIA_COLUNA:
+                            convertido = parse_valor(texto)
+                            if convertido is not None:
+                                numeros.append((x0, nome, convertido))
+                            break
+                    else:
+                        if x0 >= colunas["x_historico"] - 3:
+                            descricao.append(texto)
+                    continue
+                if x0 >= colunas["x_historico"] - 3:
+                    descricao.append(texto)
+
+            texto_descricao = re.sub(r"\s+", " ", " ".join(descricao)).strip()
+
+            valor = saldo = None
+            for x0, nome, bruto in numeros:
+                sinal = _sinal_a_esquerda(x0, marcas)
+                if sinal is None:
+                    continue
+                if nome == "valor":
+                    valor = abs(bruto) * sinal
+                else:
+                    saldo = abs(bruto) * sinal
+
+            if texto_descricao.upper().startswith("SALDO ANTERIOR"):
+                if saldo_anterior is None:
+                    saldo_anterior = saldo if saldo is not None else valor
+                continue
+
+            if valor is None or valor == 0:
+                if texto_descricao and transacoes:
+                    alvo = transacoes[-1]
+                    transacoes[-1] = replace(
+                        alvo,
+                        historico=f"{alvo.historico} {texto_descricao}".strip()[:200],
+                    )
+                continue
+            if data_lida is None:
+                continue
+
+            historico = texto_descricao[:200] or "SEM DESCRIÇÃO"
+            transacoes.append(
+                TransacaoOFX(
+                    fitid=gerar_fitid(data_lida, historico, valor, idx),
+                    data=data_lida,
+                    valor=valor,
+                    historico=historico,
+                    tipo_ofx="CREDIT" if valor > 0 else "DEBIT",
+                    saldo_apos=saldo,
+                    ordem=idx,
+                )
+            )
+            idx += 1
+
+    if not transacoes:
+        return []
+    return [Bloco(transacoes=transacoes, saldo_anterior=saldo_anterior)]
+
+
 def extrair_de_palavras(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
-    """Escolhe o layout pelo cabeçalho da tabela."""
+    """Escolhe o layout pelo cabeçalho da tabela.
+
+    O Painel é testado ANTES do balancete e a ordem não é estilo: o cabeçalho
+    dele — `MOVIMENTO BALANCETE HISTÓRICO No.DOCUMENTO VALOR SALDO` — satisfaz
+    as condições do balancete, que então ancorava a data em `BALANCETE` (x=269)
+    quando ela mora sob `MOVIMENTO` (x=183). Nenhuma data casava com a coluna,
+    e o layout extraía zero lançamentos sem errar em nada visível.
+    """
     for palavras in paginas:
         estreitas = agrupar_linhas(palavras)
+        if _colunas_painel(estreitas) is not None:
+            return _extrair_painel(paginas, referencia_ano)
         if _colunas_balancete(estreitas) is not None:
             return _extrair_balancete(paginas, referencia_ano)
         if _colunas_dia_lote(estreitas) is not None:
