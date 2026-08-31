@@ -184,10 +184,16 @@ async def trocar_senha(
 
 @router.get("/me", response_model=MeResponse)
 async def me(
+    request: Request,
     ctx: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
-    """Retorna dados do usuário autenticado."""
+    """Retorna dados do usuário autenticado, e o token de CSRF em vigor.
+
+    O token vai junto porque esta é a única rota que uma aba recém-aberta com
+    sessão válida chama — ela não passa por login nem por refresh, e não pode
+    ler o cookie de outra origem.
+    """
     result = await db.execute(select(Usuario).where(Usuario.id == ctx.user_id))
     user = result.scalar_one()
     return MeResponse(
@@ -196,6 +202,7 @@ async def me(
         nome=user.nome,
         role=user.role,
         tenant_id=ctx.tenant_id,
+        csrf_token=request.cookies.get("csrf_token"),
     )
 
 

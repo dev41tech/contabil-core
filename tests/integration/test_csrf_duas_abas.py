@@ -89,3 +89,49 @@ async def test_a_sessao_continua_viva_para_a_aba_que_perdeu(client: AsyncClient,
         headers={"X-CSRF-Token": csrf},
     )
     assert gravacao.status_code != 403, gravacao.text
+
+
+@pytest.mark.asyncio
+async def test_aba_nova_consegue_um_csrf_sem_passar_por_login(client: AsyncClient,
+                                                              usuario: Usuario,
+                                                              tenant: Tenant):
+    """A aba que abre com sessão válida não faz login nem refresh.
+
+    Era o caso sem saída: o token só vinha no corpo dessas duas rotas, e o
+    cookie é de outra origem para o frontend. A aba subia sem token e a primeira
+    gravação dela batia em "Token de segurança desatualizado" — cookie presente,
+    header vazio.
+
+    `/auth/me` é a rota que toda aba chama no boot. Agora ela devolve o token em
+    vigor, e o que sai dali grava.
+    """
+    csrf_da_primeira_aba = await _login(client, tenant)
+
+    # A segunda aba: sessão válida nos cookies, nada em memória.
+    eu = await client.get("/api/v1/auth/me")
+    assert eu.status_code == 200
+    csrf_da_segunda_aba = eu.json()["csrf_token"]
+
+    # É o MESMO token — o cookie é do navegador, as duas abas convergem nele.
+    assert csrf_da_segunda_aba == csrf_da_primeira_aba
+
+    gravacao = await client.post(
+        "/api/v1/auth/senha",
+        json={"senha_atual": "senha_segura_123", "senha_nova": "outra_senha_123"},
+        headers={"X-CSRF-Token": csrf_da_segunda_aba},
+    )
+    assert gravacao.status_code != 403, gravacao.text
+
+
+@pytest.mark.asyncio
+async def test_gravacao_sem_header_nenhum_e_recusada(client: AsyncClient, usuario: Usuario,
+                                                     tenant: Tenant):
+    """O sintoma exato relatado: cookie presente, header ausente."""
+    await _login(client, tenant)
+
+    resposta = await client.post(
+        "/api/v1/auth/senha",
+        json={"senha_atual": "senha_segura_123", "senha_nova": "outra_senha_123"},
+    )
+    assert resposta.status_code == 403
+    assert "desatualizado" in resposta.json()["message"]
