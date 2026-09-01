@@ -396,3 +396,65 @@ async def test_filtrar_por_agencia_mostra_tambem_as_globais(
     assert r.status_code == 200
     historicos = [i["historico"] for i in r.json()["items"]]
     assert "TARIFA GLOBAL" in historicos
+
+
+# ── O índice, e não o serviço
+
+
+@pytest.mark.asyncio
+async def test_indice_barra_duas_regras_globais_iguais(db, empresa):
+    """A prova de que o índice irmão morde — inserindo DIRETO, sem o serviço.
+
+    O teste de 409 acima passa pela checagem do `RegraService`, que responde
+    antes de o banco ser tocado: ele nunca exercita o índice. Se alguém removesse
+    `uq_regra_empresa_historico_normalizado_global` amanhã, aquele teste
+    continuaria verde e o banco ficaria sem a proteção — que é justamente a que
+    impede duas regras "todos os bancos" de disputarem a mesma transação.
+
+    Este roda contra Postgres no job `testes-postgres` da CI, que é onde o
+    comportamento de NULL em índice único importa de verdade.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from src.db.models import Regra
+
+    conta = await _criar_conta(db, empresa)
+    comuns = dict(
+        empresa_id=empresa.id, conta_id=conta.id, agencia_id=None,
+        descricao="Tarifas", historico="TARIFA PACOTE",
+        historico_normalizado="tarifa pacote", dc="D", tipo="automatica",
+    )
+    db.add(Regra(**comuns))
+    await db.flush()
+
+    db.add(Regra(**comuns))
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_indice_permite_global_e_de_agencia_com_o_mesmo_historico(
+    db, empresa, client, tenant, usuario
+):
+    """O outro lado do índice: "geral mais exceção" não pode ser barrado.
+
+    É o motivo de existirem dois índices parciais em vez de um sobre
+    `COALESCE(agencia_id, ...)`, que barraria este par.
+    """
+    from src.db.models import AgenciaBancaria, Regra
+
+    conta = await _criar_conta(db, empresa)
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="BB",
+                              agencia="0002", numero="22222")
+    db.add(agencia)
+    await db.flush()
+
+    comuns = dict(
+        empresa_id=empresa.id, conta_id=conta.id, descricao="Tarifas",
+        historico="TARIFA PACOTE", historico_normalizado="tarifa pacote",
+        dc="D", tipo="automatica",
+    )
+    db.add(Regra(**comuns, agencia_id=None))
+    db.add(Regra(**comuns, agencia_id=agencia.id))
+    await db.flush()  # não pode levantar
