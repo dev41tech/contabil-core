@@ -136,6 +136,14 @@ def create_app() -> FastAPI:
         allow_credentials=True,  # necessário para cookies cross-origin
         allow_methods=["*"],
         allow_headers=["*"],
+        # Sem isto o navegador NÃO entrega estes cabeçalhos ao JS em requisição
+        # cross-origin — e o frontend está em outra origem. Os dois primeiros já
+        # eram enviados pela exportação e nunca chegaram a ser lidos.
+        expose_headers=[
+            "X-Total-Registros",
+            "X-Job-Id",
+            "X-Contas-Sem-Codigo-Abreviado",
+        ],
     )
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(LimiteUploadMiddleware, max_bytes=settings.max_upload_bytes)

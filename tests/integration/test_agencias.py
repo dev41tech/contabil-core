@@ -515,3 +515,118 @@ async def test_agencia_nao_visivel_em_outra_empresa(
     r = await client.get(_url(empresa2.id))
     assert r.status_code == 200
     assert r.json()["items"] == []
+
+
+# ── Reapontar a conta bancária sintética
+
+
+@pytest.mark.asyncio
+async def test_reapontar_move_o_razao_da_sintetica_para_a_conta_vinculada(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario,
+    empresa: Empresa,
+):
+    """O motor cria `1.1.B.<uuid>` sem `conta_numero`, e a exportação quebra.
+
+    A conta sintética nasce quando a agência não tem conta contábil vinculada.
+    Ela não tem número abreviado, e o layout de importação do sistema contábil
+    externo usa justamente o abreviado — então o lado bancário de todo
+    lançamento saía como `1.1.B.949a6741df4e4031`.
+
+    Vincular a conta conserta o FUTURO; o razão já gravado é o que esta rotina
+    move.
+    """
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from src.db.models import AgenciaBancaria, RegistroContabil
+
+    csrf = await _login(client, tenant, usuario)
+    real = PlanoConta(empresa_id=empresa.id, conta_numero=8, codigo="1.1.1.001",
+                      descricao="BANCO - DO BRASIL", tipo="ativo", tipo_sa="A")
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="BB",
+                              agencia="1622", numero="19530")
+    db.add_all([real, agencia])
+    await db.flush()
+
+    sintetica = PlanoConta(
+        empresa_id=empresa.id, codigo=f"1.1.B.{agencia.id.hex[:16]}",
+        descricao="Conta bancária BANCO DO BRASIL", tipo="ativo", tipo_sa="A",
+    )
+    db.add(sintetica)
+    await db.flush()
+
+    registro = RegistroContabil(
+        empresa_id=empresa.id, conta_id=sintetica.id, agencia_id=agencia.id,
+        lancamento_id=__import__("uuid").uuid4(), dc="C",
+        valor=Decimal("100.00"), data_lancamento=datetime(2026, 3, 1, tzinfo=UTC),
+        descricao="PGTO IOF", historico="PGTO IOF",
+        historico_extrato="PGTO IOF", tipo_regra="automatica",
+    )
+    db.add(registro)
+    agencia.conta_contabil_id = real.id
+    await db.flush()
+
+    r = await client.post(
+        f"{_url(empresa.id)}/reapontar-contas-sinteticas",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    (relato,) = r.json()
+    assert relato["registros_movidos"] == 1
+    assert relato["sintetica_desativada"] is True
+
+    await db.refresh(registro)
+    assert registro.conta_id == real.id
+
+    apagada = (
+        await db.execute(select(PlanoConta).where(PlanoConta.id == sintetica.id))
+    ).scalar_one()
+    assert apagada.deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reapontar_nao_apaga_a_sintetica_com_referencia_inesperada(
+    client: AsyncClient, db: AsyncSession, tenant: Tenant, usuario: Usuario,
+    empresa: Empresa,
+):
+    """Regra apontando para a conta bancária não é situação esperada.
+
+    E é por não ser esperada que não pode ser reescrita em silêncio: apagar a
+    sintética às cegas trocaria um problema visível na exportação por uma
+    referência órfã no banco. A rotina move o que conhece, deixa a conta de pé
+    e diz o que sobrou.
+    """
+    from src.db.models import AgenciaBancaria, Regra
+
+    csrf = await _login(client, tenant, usuario)
+    real = PlanoConta(empresa_id=empresa.id, conta_numero=8, codigo="1.1.1.002",
+                      descricao="BANCO", tipo="ativo", tipo_sa="A")
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="BB",
+                              agencia="1623", numero="19531")
+    db.add_all([real, agencia])
+    await db.flush()
+
+    sintetica = PlanoConta(
+        empresa_id=empresa.id, codigo=f"1.1.B.{agencia.id.hex[:16]}",
+        descricao="Conta bancária BB", tipo="ativo", tipo_sa="A",
+    )
+    db.add(sintetica)
+    await db.flush()
+    db.add(Regra(
+        empresa_id=empresa.id, conta_id=sintetica.id, agencia_id=agencia.id,
+        descricao="Tarifa", historico="TARIFA", historico_normalizado="tarifa",
+        dc="D", tipo="automatica",
+    ))
+    agencia.conta_contabil_id = real.id
+    await db.flush()
+
+    r = await client.post(
+        f"{_url(empresa.id)}/reapontar-contas-sinteticas",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    (relato,) = r.json()
+    assert relato["sintetica_desativada"] is False
+    assert relato["referencias_restantes"] == {"regras": 1}
