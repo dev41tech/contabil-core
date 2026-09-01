@@ -39,19 +39,36 @@ from src.domain.extrato.ofx_parser import TransacaoOFX
 SIGLAS = frozenset({"SICOOB", "756"})
 
 # 11.194,89D  /  2,50C
-_VALOR_DC = r"\d{1,3}(?:\.\d{3})*,\d{2}[DC]"
+# O `R$` entra no grupo do VALOR, e não na descrição, porque o Internet
+# Banking novo do Sicoob (SISBR) imprime `R$ 600,00D` onde o layout antigo
+# imprimia `600,00D`. Fora do grupo, o cifrão era engolido pelo `.*?` da
+# descrição — e a linha de `SALDO DO DIA`, que casa o valor logo depois do
+# rótulo, deixava de casar: o extrato perdia TODAS as âncoras de saldo.
+_VALOR_DC = r"(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2}[DC]"
 
 _LINHA = re.compile(rf"^(\d{{2}}/\d{{2}})\s+(.*?)\s+({_VALOR_DC})\s*$")
 _SALDO_DIA = re.compile(rf"^(\d{{2}}/\d{{2}})\s+SALDO DO DIA\s+({_VALOR_DC})\s*$", re.I)
-_PERIODO = re.compile(r"PER[ÍI]ODO:\s*\d{2}/\d{2}/(\d{4})", re.IGNORECASE)
+_SALDO_ANTERIOR = re.compile(
+    rf"^(\d{{2}}/\d{{2}})\s+SALDO ANTERIOR\s+({_VALOR_DC})\s*$", re.I
+)
+# Captura as DUAS pontas: a de fim decide o ano de uma data que cai fora do
+# período. `31/12` num extrato de janeiro/2026 é de 2025, e sem isso o saldo
+# anterior era datado quase um ano no futuro.
+_PERIODO = re.compile(
+    r"PER[ÍI]ODO:\s*(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})",
+    re.IGNORECASE,
+)
 
+# `Documento` é coluna do export novo e não existe no antigo — daí o opcional.
 _ASSINATURA = re.compile(
-    r"^\s*DATA\s+HIST[ÓO]RICO\s+VALOR\s*$", re.IGNORECASE | re.MULTILINE
+    r"^\s*DATA\s+(?:DOCUMENTO\s+)?HIST[ÓO]RICO\s+VALOR\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 _IGNORAR = re.compile(
     r"^(SICOOB|SISTEMA DE COOPERATIVAS|PLATAFORMA DE|COOP\.|CONTA:|PER[ÍI]ODO:|"
-    r"HIST[ÓO]RICO DE MOVIMENTA|DATA\s+HIST)",
+    r"COOPERATIVA:|EXTRATO DE CONTA|SALDO BLOQUEADO|SALDO EM CONTA|RESUMO|"
+    r"HIST[ÓO]RICO DE MOVIMENTA|DATA\s+(?:DOCUMENTO\s+)?HIST)",
     re.IGNORECASE,
 )
 
@@ -61,7 +78,8 @@ def reconhece(linhas: list[str]) -> bool:
 
 
 def _valor_com_letra(texto: str) -> Decimal | None:
-    """`330,00D` → −330,00; `330,00C` → +330,00."""
+    """`330,00D` → −330,00; `330,00C` → +330,00. Aceita `R$ 330,00D`."""
+    texto = re.sub(r"^R\$\s*", "", texto.strip())
     letra = texto[-1].upper()
     numero = parse_valor(texto[:-1])
     if numero is None:
@@ -71,20 +89,41 @@ def _valor_com_letra(texto: str) -> Decimal | None:
 
 def extrair(linhas: list[str], referencia_ano: int) -> list[Bloco]:
     ano = referencia_ano
+    fim_periodo: date | None = None
     for linha in linhas:
         achado = _PERIODO.search(linha)
         if achado:
-            ano = int(achado.group(1))
+            d, m, a = achado.group(2).split("/")
+            fim_periodo = date(int(a), int(m), int(d))
+            ano = fim_periodo.year
             break
 
     def data_de(texto: str) -> date | None:
         dia, mes = texto.split("/")
         try:
-            return date(ano, int(mes), int(dia))
+            lida = date(ano, int(mes), int(dia))
         except ValueError:
             return None
+        # Data depois do fim do período só pode ser do ano anterior: é o
+        # `31/12` que abre um extrato de janeiro.
+        if fim_periodo is not None and lida > fim_periodo:
+            try:
+                return lida.replace(year=ano - 1)
+            except ValueError:
+                return None
+        return lida
 
-    dias: list[tuple[date, Decimal | None, list[TransacaoOFX]]] = []
+    # A LINHA DE SALDO TRAZ A PRÓPRIA DATA, e é isso que decide a qual dia ela
+    # pertence — não a posição dela no arquivo.
+    #
+    # O layout antigo imprime `SALDO DO DIA` no TOPO do bloco do dia; o Internet
+    # Banking novo (SISBR) imprime no FIM. Amarrado à posição, o adaptador jogava
+    # os lançamentos de 02/01 no balde do dia 05/01 e a cadeia acusava um buraco
+    # do tamanho de um dia inteiro. Agrupar por data lê os dois layouts sem
+    # precisar distingui-los.
+    lancamentos: list[TransacaoOFX] = []
+    saldos: dict[date, Decimal] = {}
+    saldo_anterior: Decimal | None = None
     idx = 0
 
     for bruta in linhas:
@@ -92,15 +131,25 @@ def extrair(linhas: list[str], referencia_ano: int) -> list[Bloco]:
         if not linha or _IGNORAR.match(linha):
             continue
 
+        # ANTES de `_LINHA`, que também casaria — e casava: a abertura entrava
+        # como um lançamento de R$ 7.879,98. A cadeia de saldos NÃO pegava isso,
+        # porque o valor falso é exatamente o saldo de abertura e está na
+        # primeira posição, então a soma fechava. Quem pegou foi o OFX do mesmo
+        # período, que trazia um lançamento a menos.
+        abertura = _SALDO_ANTERIOR.match(linha)
+        if abertura:
+            if saldo_anterior is None:
+                saldo_anterior = _valor_com_letra(abertura.group(2))
+            continue
+
         fechamento = _SALDO_DIA.match(linha)
         if fechamento:
             do_dia = data_de(fechamento.group(1))
-            if do_dia is None:
-                continue
-            # Dia partido por quebra de página repete o cabeçalho.
-            if dias and dias[-1][0] == do_dia:
-                continue
-            dias.append((do_dia, _valor_com_letra(fechamento.group(2)), []))
+            saldo = _valor_com_letra(fechamento.group(2))
+            if do_dia is not None and saldo is not None:
+                # Dia partido por quebra de página repete a linha; o primeiro
+                # valor lido é o do dia e os repetidos são idênticos.
+                saldos.setdefault(do_dia, saldo)
             continue
 
         casada = _LINHA.match(linha)
@@ -110,10 +159,8 @@ def extrair(linhas: list[str], referencia_ano: int) -> list[Bloco]:
             valor = _valor_com_letra(valor_str)
             if data_lida is None or valor is None or valor == 0:
                 continue
-            if not dias:
-                dias.append((data_lida, None, []))
             historico = re.sub(r"\s+", " ", descricao).strip() or "SEM DESCRIÇÃO"
-            dias[-1][2].append(
+            lancamentos.append(
                 TransacaoOFX(
                     fitid=gerar_fitid(data_lida, historico, valor, idx),
                     data=data_lida,
@@ -128,20 +175,24 @@ def extrair(linhas: list[str], referencia_ano: int) -> list[Bloco]:
             continue
 
         # Linha de detalhe: pertence ao lançamento imediatamente acima.
-        if dias and dias[-1][2]:
-            alvo = dias[-1][2][-1]
+        if lancamentos:
+            alvo = lancamentos[-1]
             juntado = f"{alvo.historico} {linha}".strip()[:200]
-            dias[-1][2][-1] = replace(alvo, historico=juntado)
+            lancamentos[-1] = replace(alvo, historico=juntado)
 
-    transacoes: list[TransacaoOFX] = []
-    for _do_dia, saldo, lancamentos in reversed(dias):
-        if not lancamentos:
-            continue
-        cronologicos = list(reversed(lancamentos))
-        if saldo is not None:
-            cronologicos[-1] = replace(cronologicos[-1], saldo_apos=saldo)
-        transacoes.extend(cronologicos)
+    # O extrato sai do mais recente para o mais antigo, e dentro do dia também.
+    transacoes = list(reversed(lancamentos))
+
+    # O saldo do dia é o que vale DEPOIS do último lançamento dele — e "último"
+    # só existe depois de ordenar.
+    ultimo_do_dia: dict[date, int] = {}
+    for posicao, transacao in enumerate(transacoes):
+        ultimo_do_dia[transacao.data] = posicao
+    for do_dia, saldo in saldos.items():
+        posicao = ultimo_do_dia.get(do_dia)
+        if posicao is not None:
+            transacoes[posicao] = replace(transacoes[posicao], saldo_apos=saldo)
 
     if not transacoes:
         return []
-    return [Bloco(transacoes=transacoes)]
+    return [Bloco(transacoes=transacoes, saldo_anterior=saldo_anterior)]
