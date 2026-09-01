@@ -123,3 +123,54 @@ def test_configuracao_de_assinatura_aceita_o_par_que_a_nfe_obriga():
     padrao = SignatureConfiguration()
     assert padrao.signature_methods <= config.signature_methods
     assert padrao.digest_algorithms <= config.digest_algorithms
+
+
+def test_assinatura_que_nao_confere_relata_em_vez_de_recusar():
+    """A decisão de 01/09/2026: nota entra, marcada, em vez de ser recusada.
+
+    Os XML que o downloader de DF-e do escritório entrega vêm reempacotados e
+    ALTERADOS depois de assinados — num exemplo real o e-mail do destinatário
+    chega mascarado (`j*m@g*l*.com`). A assinatura deles nunca vai conferir, e
+    recusá-los deixava o escritório sem importar nota nenhuma.
+    """
+    import xml.etree.ElementTree as ET
+
+    from src.domain.notas.xml_parser import _validar_assinatura
+
+    sem_assinatura = ET.fromstring("<NFe><infNFe Id='NFe1'/></NFe>")
+    motivo = _validar_assinatura(b"<NFe/>", sem_assinatura, "NFe1")
+    assert motivo == "documento sem assinatura XML"
+
+    referencia_errada = ET.fromstring(
+        '<NFe><Signature xmlns="http://www.w3.org/2000/09/xmldsig#">'
+        '<SignedInfo><Reference URI="#OUTRA"/></SignedInfo></Signature></NFe>'
+    )
+    motivo = _validar_assinatura(b"<NFe/>", referencia_errada, "NFe1")
+    assert motivo is not None
+    assert "não referencia" in motivo
+
+
+def test_nfe_sem_protocolo_continua_recusada_mesmo_com_a_decisao_nova():
+    """O contrapeso, e é ele que impede isto de virar "aceita qualquer XML".
+
+    Aceitar assinatura não verificável só é defensável porque o protocolo de
+    autorização da SEFAZ continua obrigatório: o que sustenta o documento passou
+    a ser ele. Se este teste cair, o afrouxamento perdeu a âncora.
+    """
+    import pytest
+
+    from src.domain.notas.xml_parser import parse_nota_xml
+
+    sem_protocolo = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<NFe xmlns="http://www.portalfiscal.inf.br/nfe">'
+        b'<infNFe Id="NFe35260756287725000590550010000840861383950941" versao="4.00">'
+        b"<ide><nNF>1</nNF><serie>1</serie>"
+        b"<dhEmi>2026-07-16T15:14:01-03:00</dhEmi></ide>"
+        b"<emit><CNPJ>56287725000590</CNPJ></emit>"
+        b"<total><ICMSTot><vNF>10.00</vNF></ICMSTot></total>"
+        b"</infNFe></NFe>"
+    )
+
+    with pytest.raises(ValueError):
+        parse_nota_xml(sem_protocolo)
