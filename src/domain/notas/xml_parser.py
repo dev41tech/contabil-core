@@ -31,6 +31,12 @@ class NotaParseada:
     data_emissao: datetime
     chave_acesso: Optional[str]
     observacao: Optional[str]
+    # `None` = a assinatura conferiu. Preenchido = a nota entra assim mesmo, com
+    # o motivo registrado — decisão do escritório em 01/09/2026, porque os XML
+    # que o downloader de DF-e entrega vêm alterados depois de assinados (um
+    # deles com o e-mail do destinatário mascarado) e a assinatura não tem como
+    # fechar. Quem dá fé do documento passa a ser o protocolo da SEFAZ.
+    assinatura_nao_verificada: Optional[str] = None
 
 
 def _safe_text(element: Optional[ET.Element]) -> Optional[str]:
@@ -160,20 +166,40 @@ def _configuracao_de_assinatura():
     )
 
 
-def _validar_assinatura(conteudo: bytes, root: ET.Element, referencia: str) -> None:
-    """Valida matematicamente a assinatura XML usando o certificado embutido."""
+def _validar_assinatura(
+    conteudo: bytes, root: ET.Element, referencia: str
+) -> Optional[str]:
+    """Confere a assinatura XML e DEVOLVE o motivo quando ela não fecha.
+
+    Antes isto recusava o arquivo. Passou a apenas relatar porque o escritório
+    decidiu, em 01/09/2026, importar nota cuja assinatura não pode ser
+    verificada — e a razão é concreta: o downloader de DF-e usado ali entrega os
+    XML reempacotados e ALTERADOS depois de assinados (num dos exemplos, o
+    e-mail do destinatário vem mascarado como `j*m@g*l*.com`). A assinatura
+    desses arquivos nunca vai conferir, e recusá-los deixava o escritório sem
+    conseguir importar nota nenhuma.
+
+    **O que sustenta o documento no lugar da assinatura é o protocolo de
+    autorização da SEFAZ**, que continua obrigatório: NF-e sem `protNFe` segue
+    recusada, e é isso que impede este afrouxamento de virar "aceita qualquer
+    XML".
+
+    Devolver o motivo em vez de engoli-lo é o que mantém a decisão auditável: a
+    nota é gravada com `origem="xml_nao_verificado"` e o contador vê quais
+    documentos têm procedência mais fraca.
+    """
     signature = _find_by_local_tag(root, "Signature")
     if signature is None:
-        raise ValueError("Documento fiscal sem assinatura XML.")
+        return "documento sem assinatura XML"
 
     reference = _find_by_local_tag(signature, "Reference")
     if reference is None or reference.get("URI") != f"#{referencia}":
-        raise ValueError("Assinatura XML não referencia a identificação do documento fiscal.")
+        return "a assinatura não referencia a identificação deste documento"
 
     cert_elem = _find_by_local_tag(signature, "X509Certificate")
     cert_text = _safe_text(cert_elem)
     if not cert_text:
-        raise ValueError("Assinatura XML sem certificado X.509.")
+        return "assinatura sem certificado X.509"
 
     try:
         # O certificado explícito impede que o verificador confie em uma chave
@@ -200,12 +226,11 @@ def _validar_assinatura(conteudo: bytes, root: ET.Element, referencia: str) -> N
             x509_cert=cert_pem,
             expect_config=_configuracao_de_assinatura(),
         )
-    except ValueError:
-        raise
-    except ImportError as exc:
-        raise ValueError("Validação criptográfica de assinatura indisponível no servidor.") from exc
+    except ImportError:
+        return "validação criptográfica indisponível no servidor"
     except Exception as exc:
-        raise ValueError("Assinatura XML inválida.") from exc
+        return f"assinatura não confere ({type(exc).__name__})"
+    return None
 
 
 def _detect_namespace(root: ET.Element) -> Optional[str]:
@@ -514,7 +539,9 @@ def parse_nota_xml(conteudo: bytes) -> NotaParseada:
 
     if _is_nfe(root):
         nota = _parse_nfe(root)
-        _validar_assinatura(conteudo, root, f"NFe{nota.chave_acesso}")
+        nota.assinatura_nao_verificada = _validar_assinatura(
+            conteudo, root, f"NFe{nota.chave_acesso}"
+        )
         return nota
 
     if _is_nfse(root):
@@ -523,7 +550,9 @@ def parse_nota_xml(conteudo: bytes) -> NotaParseada:
         referencia = inf_nfse.get("Id", "") if inf_nfse is not None else ""
         if not referencia:
             raise ValueError("NFS-e sem identificador assinado.")
-        _validar_assinatura(conteudo, root, referencia)
+        nota.assinatura_nao_verificada = _validar_assinatura(
+            conteudo, root, referencia
+        )
         return nota
 
     raise ValueError("Formato XML não reconhecido. Esperado NF-e 4.0 ou NFS-e ABRASF.")

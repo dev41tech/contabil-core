@@ -705,10 +705,22 @@ class NotaFiscal(Base, TimestampMixin):
         ForeignKey("transacoes.id"), nullable=True
     )
     chave_acesso: Mapped[str | None] = mapped_column(String(44), nullable=True)
+    # Por que a assinatura não conferiu. Guardado junto da nota para a decisão
+    # de importar mesmo assim ficar auditável — sem isto, `xml_nao_verificado`
+    # diria que algo falhou sem dizer o quê.
+    assinatura_motivo: Mapped[str | None] = mapped_column(String(200), nullable=True)
     dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Procedência, em ordem decrescente de confiança:
+    #   xml_assinado       XML com assinatura digital conferida
+    #   xml_nao_verificado XML válido e AUTORIZADO pela SEFAZ, mas cuja
+    #                      assinatura não fecha — o caso dos arquivos que o
+    #                      downloader de DF-e entrega reempacotados e alterados
+    #                      depois de assinados. O motivo fica em
+    #                      `assinatura_motivo`.
+    #   ocr                lido de PDF/imagem, sem assinatura nenhuma
     origem: Mapped[str] = mapped_column(
-        Enum("xml_assinado", "ocr", name="origem_nota_enum"),
+        Enum("xml_assinado", "xml_nao_verificado", "ocr", name="origem_nota_enum"),
         default="xml_assinado",
         nullable=False,
     )

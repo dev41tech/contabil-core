@@ -24,8 +24,15 @@ class NotaFiscalCreate(BaseModel):
     observacao: str | None = Field(default=None, max_length=500)
     origem: str = Field(
         default="xml_assinado",
-        description="xml_assinado (verificado por assinatura digital) ou ocr (extraído de PDF/imagem, sem verificação)",
+        description=(
+            "Procedência, da mais forte para a mais fraca: xml_assinado "
+            "(assinatura digital conferida), xml_nao_verificado (XML autorizado "
+            "pela SEFAZ cuja assinatura não fecha) ou ocr (lido de PDF/imagem)"
+        ),
     )
+    # Por que a assinatura não conferiu, quando não conferiu. Vai junto para a
+    # decisão de importar mesmo assim ficar auditável na tela e na exportação.
+    assinatura_motivo: str | None = Field(default=None, max_length=200)
 
     @field_validator("tipo")
     @classmethod
@@ -49,8 +56,10 @@ class NotaFiscalCreate(BaseModel):
     @classmethod
     def valida_origem(cls, v: str) -> str:
         v = v.strip().lower()
-        if v not in ("xml_assinado", "ocr"):
-            raise ValueError("origem deve ser 'xml_assinado' ou 'ocr'.")
+        if v not in ("xml_assinado", "xml_nao_verificado", "ocr"):
+            raise ValueError(
+                "origem deve ser 'xml_assinado', 'xml_nao_verificado' ou 'ocr'."
+            )
         return v
 
 
@@ -76,6 +85,7 @@ class NotaFiscalResponse(BaseModel):
     chave_acesso: str | None
     observacao: str | None
     origem: str
+    assinatura_motivo: str | None = None
 
     model_config = {"from_attributes": True}
 

@@ -246,7 +246,14 @@ class NotaService:
             resultado.erros.append(f"{nome_arquivo}: {exc}")
             return resultado
 
-        return await self._importar_parseada(nota_parseada, nome_arquivo, origem="xml_assinado")
+        # A procedência sai do que a verificação encontrou, não do caminho de
+        # importação: XML cuja assinatura não fecha entra, mas entra marcado.
+        origem = (
+            "xml_nao_verificado"
+            if nota_parseada.assinatura_nao_verificada
+            else "xml_assinado"
+        )
+        return await self._importar_parseada(nota_parseada, nome_arquivo, origem=origem)
 
     async def importar_visual(
         self, conteudo: bytes, nome_arquivo: str, extensao: str
@@ -309,6 +316,7 @@ class NotaService:
                     chave_acesso=nota_parseada.chave_acesso,
                     observacao=nota_parseada.observacao,
                     origem=origem,
+                    assinatura_motivo=nota_parseada.assinatura_nao_verificada,
                 )
             )
             resultado.importadas += 1
