@@ -3894,3 +3894,103 @@ async def test_decisoes_saem_na_ordem_de_leitura_do_extrato(
         "LANCAMENTO SEGUNDA",
         "LANCAMENTO TERCEIRA",
     ]
+
+
+@pytest.mark.asyncio
+async def test_regra_global_classifica_todas_as_agencias(
+    client, db, tenant, usuario, empresa
+):
+    """Uma regra sem agência vale para os lançamentos de qualquer banco.
+
+    É o motivo de a opção existir: cadastrar "TARIFA PACOTE" uma vez em vez de
+    uma por banco, e não ter de refazer todas quando a conta contábil muda.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencias = [
+        AgenciaBancaria(empresa_id=empresa.id, banco_sigla=sigla,
+                        agencia=f"88{i}", numero=f"8800{i}")
+        for i, sigla in enumerate(("ITAU", "BB"))
+    ]
+    conta = PlanoConta(empresa_id=empresa.id, codigo="4.1.88",
+                       descricao="Tarifas", tipo="despesa")
+    db.add_all([*agencias, conta])
+    await db.flush()
+    transacoes = [
+        Transacao(
+            empresa_id=empresa.id, agencia_id=agencia.id,
+            data=datetime(2024, 3, 10, tzinfo=UTC), valor=Decimal("10.00"),
+            historico="TARIFA GLOBAL", dc="D", hash_dedup=f"neo-global-{i}",
+        )
+        for i, agencia in enumerate(agencias)
+    ]
+    db.add_all(transacoes)
+    await db.flush()
+
+    resposta = await client.post(
+        _pendencias_url(empresa.id, "criar-regra-e-aplicar"),
+        json={
+            "conta_id": str(conta.id),
+            "descricao": "Tarifa de qualquer banco",
+            "historico": "TARIFA GLOBAL",
+            "dc": "D",
+            "tipo": "automatica",
+            "manter_historico": False,
+            "mes": "2024-03",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert resposta.status_code == 201, resposta.text
+    assert resposta.json()["regra"]["agencia_id"] is None
+    for transacao in transacoes:
+        await db.refresh(transacao)
+    r = resposta.json()["resultado"]
+    assert (r["total_pendentes"], r["associadas"], r["sem_regra"]) == (2, 2, 0)
+    assert [t.status for t in transacoes] == ["processada", "processada"]
+
+
+@pytest.mark.asyncio
+async def test_regra_de_agencia_vence_a_global(client, db, tenant, usuario, empresa):
+    """A decisão de produto deste recurso, travada em teste.
+
+    Quem restringe o escopo a um banco está escrevendo uma EXCEÇÃO à regra
+    geral. Exceção que perde para o padrão não serve para nada — e como a
+    exceção costuma ter histórico mais CURTO que a regra que ela corrige,
+    ordenar por comprimento primeiro a faria perder sempre.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="ITAU",
+                              agencia="991", numero="99100")
+    conta_geral = PlanoConta(empresa_id=empresa.id, codigo="4.1.99",
+                             descricao="Tarifas gerais", tipo="despesa")
+    conta_excecao = PlanoConta(empresa_id=empresa.id, codigo="4.1.98",
+                               descricao="Tarifas do Itaú", tipo="despesa")
+    db.add_all([agencia, conta_geral, conta_excecao])
+    await db.flush()
+
+    # A geral tem histórico MAIS LONGO: se o comprimento mandasse, ela venceria.
+    for corpo in (
+        {"conta_id": str(conta_geral.id), "descricao": "Geral",
+         "historico": "TARIFA PACOTE DE SERVICOS", "dc": "D"},
+        {"conta_id": str(conta_excecao.id), "descricao": "Exceção Itaú",
+         "agencia_id": str(agencia.id), "historico": "TARIFA PACOTE", "dc": "D"},
+    ):
+        r = await client.post(f"/api/v1/empresas/{empresa.id}/regras", json=corpo,
+                              headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 201, r.text
+
+    transacao = Transacao(
+        empresa_id=empresa.id, agencia_id=agencia.id,
+        data=datetime(2024, 3, 10, tzinfo=UTC), valor=Decimal("10.00"),
+        historico="TARIFA PACOTE DE SERVICOS", dc="D", hash_dedup="neo-precedencia",
+    )
+    db.add(transacao)
+    await db.flush()
+
+    from src.domain.neo.engine import NeoEngine
+
+    engine = NeoEngine(db=db, empresa_id=empresa.id)
+    regras = await engine._carregar_regras(agencia.id)
+
+    assert regras[0].agencia_id == agencia.id, "a exceção de agência vem primeiro"
+    assert regras[0].conta_id == conta_excecao.id

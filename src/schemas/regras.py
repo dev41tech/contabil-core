@@ -15,7 +15,10 @@ class RegraCreate(BaseModel):
     """
 
     conta_id: UUID
-    agencia_id: UUID
+    # `None` = a regra vale para TODOS os bancos da empresa. É o padrão pedido
+    # pelo escritório: quase toda regra ("TARIFA PACOTE DE SERVICOS") independe
+    # do banco, e restringir a agência é a exceção, não o caso comum.
+    agencia_id: UUID | None = None
     descricao: str = Field(..., min_length=2, max_length=500)
     historico: str = Field(
         ...,
@@ -81,7 +84,7 @@ class RegraResponse(BaseModel):
     id: UUID
     empresa_id: UUID
     conta_id: UUID
-    agencia_id: UUID
+    agencia_id: UUID | None = None
     descricao: str
     historico: str
     dc: str
