@@ -387,7 +387,14 @@ class Regra(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("empresas.id"), nullable=False)
     conta_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("plano_contas.id"), nullable=False)
-    agencia_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agencias_bancarias.id"), nullable=False)
+    # NULL = vale para QUALQUER agência da empresa. A maior parte das regras do
+    # escritório não depende de banco ("TARIFA PACOTE DE SERVICOS" vai para a
+    # mesma conta venha do BB, da Caixa ou do Itaú), e exigir agência obrigava a
+    # cadastrar a mesma regra uma vez por banco — e a refazer todas quando a
+    # conta contábil mudava.
+    agencia_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agencias_bancarias.id"), nullable=True
+    )
     descricao: Mapped[str] = mapped_column(String(500), nullable=False)
     historico: Mapped[str] = mapped_column(String(500), nullable=False)
     historico_normalizado: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -400,7 +407,9 @@ class Regra(Base, TimestampMixin):
 
     empresa: Mapped[Empresa] = relationship("Empresa", back_populates="regras")
     conta: Mapped[PlanoConta] = relationship("PlanoConta", back_populates="regras")
-    agencia: Mapped[AgenciaBancaria] = relationship("AgenciaBancaria", back_populates="regras")
+    agencia: Mapped[AgenciaBancaria | None] = relationship(
+        "AgenciaBancaria", back_populates="regras"
+    )
 
     __table_args__ = (
         Index(
@@ -411,6 +420,23 @@ class Regra(Base, TimestampMixin):
             unique=True,
             postgresql_where=text("ativa = true AND deleted_at IS NULL"),
             sqlite_where=text("ativa = 1 AND deleted_at IS NULL"),
+        ),
+        # Irmão do índice acima, para o escopo global. Dois NULL são DISTINTOS
+        # num índice único do Postgres, então o índice de cima não alcança as
+        # regras "todos os bancos": sem este, nada impediria duas delas com o
+        # mesmo histórico e contas contábeis diferentes disputando a mesma
+        # transação, com a vencedora decidida pela ordem de leitura.
+        Index(
+            "uq_regra_empresa_historico_normalizado_global",
+            "empresa_id",
+            "historico_normalizado",
+            unique=True,
+            postgresql_where=text(
+                "agencia_id IS NULL AND ativa = true AND deleted_at IS NULL"
+            ),
+            sqlite_where=text(
+                "agencia_id IS NULL AND ativa = 1 AND deleted_at IS NULL"
+            ),
         ),
     )
 

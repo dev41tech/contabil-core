@@ -10,7 +10,10 @@ Regras de negócio:
   afrouxar a unicidade invalidaria regras que já existem no banco, enquanto
   afrouxar o matching é justamente o que o escritório pediu.
 - Desativar é preferível a deletar — regra inativa não é aplicada pelo NEO.
-- Conta e agência precisam existir e pertencer à empresa.
+- Conta precisa existir e pertencer à empresa. A agência é OPCIONAL: sem ela a
+  regra vale para todos os bancos, e quando informada precisa ser da empresa.
+- Regra de agência vence regra global quando as duas casam — ver
+  `NeoEngine._carregar_regras`.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -65,8 +68,14 @@ class RegraService:
             q = q.where(Regra.ativa == True)
             count_q = count_q.where(Regra.ativa == True)
         if agencia_id:
-            q = q.where(Regra.agencia_id == agencia_id)
-            count_q = count_q.where(Regra.agencia_id == agencia_id)
+            # As globais entram no filtro porque elas VALEM para esta agência.
+            # Sem isso o contador filtra por um banco, não vê a regra que está
+            # classificando os lançamentos dele, e conclui que ela sumiu.
+            do_escopo = or_(
+                Regra.agencia_id == agencia_id, Regra.agencia_id.is_(None)
+            )
+            q = q.where(do_escopo)
+            count_q = count_q.where(do_escopo)
 
         total = (await self._db.execute(count_q)).scalar_one()
 
@@ -180,7 +189,10 @@ class RegraService:
             raise ValidationError(message="Conta contábil não encontrada nesta empresa.")
         return conta
 
-    async def _validar_agencia(self, agencia_id: UUID) -> AgenciaBancaria:
+    async def _validar_agencia(self, agencia_id: UUID | None) -> AgenciaBancaria | None:
+        """Sem agência a regra vale para todas — não há o que validar."""
+        if agencia_id is None:
+            return None
         result = await self._db.execute(
             select(AgenciaBancaria).where(
                 AgenciaBancaria.id == agencia_id,
@@ -194,11 +206,20 @@ class RegraService:
         return agencia
 
     async def _assert_historico_livre(
-        self, agencia_id: UUID, historico: str, excluir_id: UUID | None = None
+        self, agencia_id: UUID | None, historico: str, excluir_id: UUID | None = None
     ) -> None:
+        """Unicidade DENTRO do escopo — o global tem o seu, separado.
+
+        Uma regra global e uma de agência com o mesmo histórico convivem de
+        propósito: é o padrão "regra geral mais exceção", e é a agência que
+        vence no motor. O que não pode existir são duas no MESMO escopo, que
+        disputariam a transação sem critério.
+        """
         q = select(Regra.id).where(
             Regra.empresa_id == self._empresa_id,
-            Regra.agencia_id == agencia_id,
+            Regra.agencia_id.is_(None)
+            if agencia_id is None
+            else Regra.agencia_id == agencia_id,
             Regra.historico_normalizado == self._normalizar_historico(historico),
             Regra.ativa == True,
             Regra.deleted_at.is_(None),
@@ -207,10 +228,13 @@ class RegraService:
             q = q.where(Regra.id != excluir_id)
         result = await self._db.execute(q)
         if result.scalar_one_or_none():
+            onde = (
+                "para todos os bancos" if agencia_id is None else "para esta agência"
+            )
             raise ConflictError(
                 message=(
                     f"Já existe uma regra ativa com o histórico '{historico}' "
-                    "para esta agência."
+                    f"{onde}."
                 )
             )
 

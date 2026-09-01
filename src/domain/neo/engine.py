@@ -72,7 +72,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import structlog
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.dates import bounds_do_mes_data
@@ -399,10 +399,17 @@ class NeoEngine:
         LIQUIDACAO" e "TARIFA/LIQUIDAÇÃO" sem precisar de uma regra por
         variação.
         """
-        # Filtra regras compatíveis com a agência e D/C da transação
+        # Filtra regras compatíveis com a agência e D/C da transação.
+        #
+        # `agencia_id is None` é a regra que vale para TODOS os bancos. Este
+        # filtro é por transação e é o segundo lugar onde o escopo aparece — o
+        # primeiro é a query de `_carregar_regras`. Sem os dois, uma regra global
+        # é carregada do banco e descartada aqui, silenciosamente: a transação
+        # sai como "sem regra" e nada indica que existia uma que a cobria.
         candidatas = [
             r for r in regras
-            if r.agencia_id == transacao.agencia_id and r.dc == transacao.dc
+            if (r.agencia_id is None or r.agencia_id == transacao.agencia_id)
+            and r.dc == transacao.dc
         ]
 
         # Estratégia vence antes da ordem das regras: primeiro todas as exatas,
@@ -1280,6 +1287,17 @@ class NeoEngine:
         devolveu — e a mesma transação pode cair em contas diferentes entre
         execuções. Ordenamos pela regra mais específica (histórico mais longo) e
         desempatamos por `id` para o resultado ser sempre o mesmo.
+
+        **Regra de agência ganha de regra global.** Uma regra com `agencia_id`
+        nulo vale para qualquer agência da empresa, e é o jeito de cadastrar uma
+        vez o que não depende de banco. Quando as duas casam, vence a que tem
+        agência — o contador que se deu ao trabalho de restringir o escopo está
+        escrevendo uma EXCEÇÃO à regra geral, e exceção que perde para o padrão
+        não serve para nada.
+
+        Isso vem ANTES do comprimento do histórico na ordenação, de propósito:
+        uma exceção de agência costuma ser mais curta que a regra geral que ela
+        corrige, e ordenar por comprimento primeiro a faria perder sempre.
         """
         q = (
             select(Regra)
@@ -1288,10 +1306,17 @@ class NeoEngine:
                 Regra.ativa == True,
                 Regra.tipo == "automatica",
             )
-            .order_by(func.length(Regra.historico).desc(), Regra.id.asc())
+            .order_by(
+                Regra.agencia_id.is_(None).asc(),
+                func.length(Regra.historico).desc(),
+                Regra.id.asc(),
+            )
         )
         if agencia_id:
-            q = q.where(Regra.agencia_id == agencia_id)
+            # A regra global entra junto: ela vale para esta agência também.
+            q = q.where(
+                or_(Regra.agencia_id == agencia_id, Regra.agencia_id.is_(None))
+            )
         return (await self._db.execute(q)).scalars().all()
 
     async def _carregar_pendentes(
