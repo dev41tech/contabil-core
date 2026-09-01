@@ -982,6 +982,43 @@ def _ancorar_saldos_do_dia(
 
 # ──────────────────────────────────────────────────────────── entrypoint
 
+# Documentos que o contador sobe por engano na tela de extrato. Reconhecê-los
+# custa uma linha e evita a recusa mais confusa que este módulo produz: dizer
+# que a extração não é verificável quando o arquivo está perfeito — ele só não é
+# do tipo que este módulo lê.
+#
+# Cada marcador é ANCORADO no título ou no cabeçalho de colunas, nunca numa
+# palavra solta: extrato de conta corrente fala de "rendimento" o tempo todo
+# ("Rend Pago Aplic Aut Mais", no Itaú), e confundir os dois seria trocar uma
+# recusa confusa por uma recusa errada.
+_OUTROS_DOCUMENTOS: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(r"^\s*extrato\s+de\s+rendimentos\s*$", re.IGNORECASE),
+        "Este arquivo é um extrato de RENDIMENTOS de aplicação financeira, "
+        "não um extrato de conta corrente. O sistema ainda não importa "
+        "aplicações — envie o extrato da conta bancária.",
+    ),
+    (
+        re.compile(
+            r"\brendimento\b.*\bvalor\s+bruto\b.*\bIR\b.*\bIOF\b", re.IGNORECASE
+        ),
+        "Este arquivo é um extrato de RENDIMENTOS de aplicação financeira, "
+        "não um extrato de conta corrente. O sistema ainda não importa "
+        "aplicações — envie o extrato da conta bancária.",
+    ),
+)
+
+
+def _documento_de_outro_tipo(linhas: list[str]) -> str | None:
+    """Devolve a recusa própria quando o arquivo não é extrato de conta."""
+    for linha in linhas[:60]:  # o tipo se declara no cabeçalho, não no meio
+        texto = linha.strip()
+        for marcador, mensagem in _OUTROS_DOCUMENTOS:
+            if marcador.search(texto):
+                return mensagem
+    return None
+
+
 def _recusa_de_adaptador_vazio(adaptador, linhas: list[str]) -> str:
     """Diz que o leitor do banco foi acionado e não achou a tabela.
 
@@ -1064,6 +1101,14 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
         except Exception as e:
             logger.warning("pdfplumber: falha na extração de texto: %s", e)
             linhas, total_chars = [], 0
+
+        # Antes de tentar ler: este documento é mesmo um extrato de conta?
+        # Recusar um extrato de rendimentos com "não foi possível obter uma
+        # extração verificável" manda o contador procurar defeito num arquivo
+        # que está perfeito — ele só não é do tipo que este módulo lê.
+        nao_e_extrato = _documento_de_outro_tipo(linhas)
+        if nao_e_extrato:
+            raise PDFParseError(nao_e_extrato)
 
         legibilidade = _fracao_legivel(linhas)
         if total_chars >= 50 and legibilidade >= _FRACAO_LEGIVEL_MINIMA:

@@ -759,3 +759,80 @@ def test_bb_balancete_le_a_abertura_da_coluna_de_saldo():
 def test_bb_balancete_a_cadeia_fecha():
     blocos = bb.extrair_de_palavras([_BB_BALANCETE], 2026)
     assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+# ── Sicoob: o export novo do Internet Banking (SISBR) ────────────────────────
+#
+# Difere do layout de cima em quatro pontos, todos medidos nos extratos reais
+# de jan/2026 e fev/2026 da PAULO EDSON DE OLIVEIRA JUNIOR TRANSPORTES:
+#
+#   - `Periodo:` sem acento, e o cabeçalho ganha a coluna `Documento`;
+#   - o valor vem com `R$` na frente: `R$ 600,00D`;
+#   - `SALDO DO DIA` fecha o dia por BAIXO, não por cima;
+#   - `SALDO ANTERIOR` aparece no rodapé, com data do ano anterior (`31/12`).
+
+_SICOOB_SISBR = [
+    "Periodo: 01/01/2026 - 31/01/2026",
+    "Data Documento Histórico Valor",
+    "30/01 Pix PIX EMITIDO OUTRA IF R$ 600,00D",
+    "Pagamento Pix ***.674.379-**",
+    "30/01 SALDO DO DIA R$ 400,00C",
+    "02/01 Pix PIX RECEBIDO - OUTRA IF R$ 1.000,00C",
+    "Recebimento Pix FULANO 11.111.111 0001-11",
+    "02/01 SALDO DO DIA R$ 1.000,00C",
+    "31/12 SALDO ANTERIOR R$ 0,00C",
+    "RESUMO",
+    "Saldo em conta: 400,00C",
+]
+
+
+def test_sisbr_le_o_valor_com_cifrao_e_a_coluna_documento():
+    """O `R$` entra no grupo do VALOR; fora dele o saldo do dia não casava."""
+    (bloco,) = sicoob.extrair(_SICOOB_SISBR, 2026)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("1000.00"), Decimal("-600.00")
+    ]
+    assert sicoob.reconhece(_SICOOB_SISBR) is True
+
+
+def test_sisbr_amarra_o_saldo_do_dia_pela_data_e_nao_pela_posicao():
+    """Aqui o `SALDO DO DIA` fecha o dia por baixo; no layout antigo, por cima.
+
+    Amarrado à posição, o adaptador jogava os lançamentos de 02/01 no balde do
+    dia 30/01 e a cadeia acusava um buraco do tamanho de um dia inteiro. A
+    linha de saldo traz a própria data — é ela que decide.
+    """
+    (bloco,) = sicoob.extrair(_SICOOB_SISBR, 2026)
+    por_data = {t.data.isoformat(): t.saldo_apos for t in bloco.transacoes}
+    assert por_data == {"2026-01-02": Decimal("1000.00"),
+                        "2026-01-30": Decimal("400.00")}
+
+
+def test_sisbr_saldo_anterior_nao_vira_lancamento():
+    """O defeito que a CADEIA DE SALDOS NÃO PEGA.
+
+    `SALDO ANTERIOR` casava com o padrão de lançamento e entrava como um
+    crédito. A conferência fechava mesmo assim, porque o valor falso é
+    exatamente o saldo de abertura e está na primeira posição — a soma dava
+    certo. Quem pegou foi o OFX do mesmo período, com um lançamento a menos.
+    """
+    (bloco,) = sicoob.extrair(_SICOOB_SISBR, 2026)
+    assert len(bloco.transacoes) == 2
+    assert all("SALDO ANTERIOR" not in t.historico for t in bloco.transacoes)
+    assert bloco.saldo_anterior == Decimal("0.00")
+
+
+def test_sisbr_data_fora_do_periodo_e_do_ano_anterior():
+    """`31/12` num extrato de janeiro/2026 é de 2025, não de 2026."""
+    from datetime import date
+
+    from src.domain.extrato.bancos.sicoob import extrair
+
+    linhas = [*_SICOOB_SISBR[:2], "31/12 Pix PIX EMITIDO OUTRA IF R$ 10,00D",
+              "31/12 SALDO DO DIA R$ 0,00C"]
+    (bloco,) = extrair(linhas, 2026)
+    assert bloco.transacoes[0].data == date(2025, 12, 31)
+
+
+def test_sisbr_a_cadeia_fecha():
+    assert _validar_blocos(sicoob.extrair(_SICOOB_SISBR, 2026), TOLERANCIA) is True

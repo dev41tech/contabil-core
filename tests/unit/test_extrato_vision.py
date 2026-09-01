@@ -530,3 +530,47 @@ def test_sem_rotulo_de_conta_corrente_nao_ha_fecho():
         [("saldo em 31/03/26", _date(2026, 3, 31), Decimal("17138.32"))], transacoes
     )
     assert fecho is None
+
+
+# ─────────────────────── documento que não é extrato de conta
+
+
+def test_extrato_de_rendimentos_e_recusado_dizendo_o_que_e():
+    """Recusar com "extração não verificável" manda procurar defeito onde não há.
+
+    O escritório subiu, junto dos extratos, dois "Extrato de Rendimentos —
+    Caixinhas PJ" da Nu Financeira: relatório de aplicação financeira, sem
+    lançamento bancário nenhum. O arquivo está perfeito; ele só não é do tipo
+    que este módulo lê, e a mensagem precisa dizer isso.
+    """
+    from src.domain.extrato.pdf_parser import _documento_de_outro_tipo
+
+    rendimentos = [
+        "Extrato de Rendimentos",
+        "Período: 01 JAN 2026 a 31 JAN 2026",
+        "Caixinhas PJ",
+        "Data Movimentação Rendimento Valor bruto IR IOF Saldo Líquido",
+    ]
+    recusa = _documento_de_outro_tipo(rendimentos)
+    assert recusa is not None
+    assert "RENDIMENTOS" in recusa
+    assert "conta bancária" in recusa
+
+
+def test_extrato_de_conta_que_fala_de_rendimento_nao_e_confundido():
+    """O contrapeso — e ele é necessário, não decorativo.
+
+    Extrato de conta corrente fala de rendimento o tempo todo: o Itaú imprime
+    `Rend Pago Aplic Aut Mais` em quase todo dia. Marcador ancorado em palavra
+    solta trocaria uma recusa confusa por uma recusa ERRADA, que é pior.
+    """
+    from src.domain.extrato.pdf_parser import _documento_de_outro_tipo
+
+    extrato_itau = [
+        "extrato mensal ag 3706 cc 40100-1 mar 2026",
+        "data descrição entradas R$ saídas R$ saldo R$",
+        "25/02 Saldo anterior 5.969,14-",
+        "16/03 Rend Pago Aplic Aut Mais 0,01",
+        "16/03 Res Aplic Aut Mais 2.890,95",
+    ]
+    assert _documento_de_outro_tipo(extrato_itau) is None
