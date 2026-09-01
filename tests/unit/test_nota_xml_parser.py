@@ -61,3 +61,65 @@ def test_evento_de_nfe_sem_tipo_reconhecido_ainda_da_mensagem_generica_de_evento
     """
     with pytest.raises(ValueError, match="evento da NF-e \\(evento\\)"):
         parse_nota_xml(xml)
+
+
+def test_arquivo_com_nota_e_eventos_juntos_nao_e_tratado_como_evento():
+    """Empacotamento `NFeLog`: a nota vem JUNTO dos eventos dela.
+
+    Alguns downloaders de DF-e entregam o `procNFe` autorizado no mesmo arquivo
+    que a ciência da operação, o CT-e autorizado e o MDF-e. Como a busca por
+    `infEvento` varre qualquer nível, esses arquivos eram recusados com "este
+    arquivo é um evento, envie o XML da própria NF-e" — sendo que a NF-e estava
+    lá dentro. O contador não tinha o que fazer com a mensagem: o arquivo que
+    ele tinha ERA o certo.
+    """
+    import xml.etree.ElementTree as ET
+
+    from src.domain.notas.xml_parser import _is_evento_nfe
+
+    empacotado = ET.fromstring(
+        '<NFeLog versao="1.00">'
+        '  <procNFe><NFe><infNFe Id="NFe123" versao="4.00"/></NFe></procNFe>'
+        '  <eveNFe><evento><infEvento><tpEvento>210210</tpEvento></infEvento>'
+        "  </evento></eveNFe>"
+        "</NFeLog>"
+    )
+    assert _is_evento_nfe(empacotado) is False
+
+
+def test_arquivo_so_de_evento_continua_sendo_recusado():
+    """O contrapeso: sem `infNFe`, é evento mesmo, e a mensagem dele importa."""
+    import xml.etree.ElementTree as ET
+
+    from src.domain.notas.xml_parser import _is_evento_nfe
+
+    so_evento = ET.fromstring(
+        "<procEventoNFe><evento><infEvento>"
+        "<tpEvento>210210</tpEvento></infEvento></evento></procEventoNFe>"
+    )
+    assert _is_evento_nfe(so_evento) is True
+
+
+def test_configuracao_de_assinatura_aceita_o_par_que_a_nfe_obriga():
+    """A NF-e é assinada em RSA-SHA1 com digest SHA-1, por norma da SEFAZ.
+
+    O `signxml` 5.x tirou os dois do conjunto padrão. O efeito aqui não foi
+    "aceitar só o que é forte" — foi recusar 100% das notas fiscais, com a
+    mensagem "Signature method RSA_SHA1 forbidden by configuration".
+
+    Nenhum teste exercitava uma assinatura de verdade, então a quebra veio de um
+    upgrade de dependência e ninguém viu. Este trava o par exigido pela norma.
+    """
+    from signxml import DigestAlgorithm, SignatureConfiguration, SignatureMethod
+
+    from src.domain.notas.xml_parser import _configuracao_de_assinatura
+
+    config = _configuracao_de_assinatura()
+    assert SignatureMethod.RSA_SHA1 in config.signature_methods
+    assert DigestAlgorithm.SHA1 in config.digest_algorithms
+    assert config.require_x509 is True
+
+    # A permissão é ADITIVA: nada do que já era aceito pode ter saído.
+    padrao = SignatureConfiguration()
+    assert padrao.signature_methods <= config.signature_methods
+    assert padrao.digest_algorithms <= config.digest_algorithms

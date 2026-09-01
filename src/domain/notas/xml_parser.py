@@ -123,6 +123,43 @@ def _parse_decimal(valor: Optional[str], campo: str) -> Decimal:
     return parsed
 
 
+def _configuracao_de_assinatura():
+    """Aceita SHA-1 — porque a NF-e obriga SHA-1, e não porque é bom.
+
+    O Manual de Orientação do Contribuinte especifica `rsa-sha1` como método de
+    assinatura e `sha1` como digest. TODA NF-e autorizada no Brasil é assinada
+    assim; não é desleixo do emitente, é a norma.
+
+    O `signxml` 5.x tirou os dois do conjunto padrão, por serem fracos. O
+    resultado, aqui, não foi "aceitar só o que é forte" — foi **recusar 100% das
+    notas fiscais**, com a mensagem "Signature method RSA_SHA1 forbidden by
+    configuration", que não diz nada ao contador. Este projeto não tem lock file
+    (ver a nota sobre `pdfplumber` no mesmo assunto), então isso quebrou sozinho
+    num build que resolveu uma versão nova.
+
+    O que se perde aceitando SHA-1 é menor do que parece: a assinatura é UMA das
+    verificações. Quem dá fé do documento é o protocolo de autorização da SEFAZ
+    (`protNFe`, `cStat` 100), e forjar uma nota exigiria uma colisão SHA-1 que
+    ainda resultasse num XML válido, com chave de acesso coerente e número de
+    protocolo aceito. Recusar tudo, por outro lado, é dano certo e diário.
+
+    A permissão é ADITIVA: tudo que o `signxml` já aceita continua aceito, e só
+    o par que a norma brasileira exige é acrescentado.
+    """
+    from signxml import DigestAlgorithm, SignatureConfiguration, SignatureMethod
+
+    padrao = SignatureConfiguration()
+    return SignatureConfiguration(
+        require_x509=True,
+        signature_methods=frozenset(
+            padrao.signature_methods | {SignatureMethod.RSA_SHA1}
+        ),
+        digest_algorithms=frozenset(
+            padrao.digest_algorithms | {DigestAlgorithm.SHA1}
+        ),
+    )
+
+
 def _validar_assinatura(conteudo: bytes, root: ET.Element, referencia: str) -> None:
     """Valida matematicamente a assinatura XML usando o certificado embutido."""
     signature = _find_by_local_tag(root, "Signature")
@@ -161,7 +198,7 @@ def _validar_assinatura(conteudo: bytes, root: ET.Element, referencia: str) -> N
         XMLVerifier().verify(
             conteudo,
             x509_cert=cert_pem,
-            expect_config=SignatureConfiguration(require_x509=True),
+            expect_config=_configuracao_de_assinatura(),
         )
     except ValueError:
         raise
@@ -226,7 +263,22 @@ def _is_evento_nfe(root: ET.Element) -> bool:
     então essa checagem precisa rodar antes — senão o evento cai em
     `_parse_nfe` e falha com "infNFe não encontrado", sem dizer ao usuário
     que o arquivo certo (o XML da nota, não do evento) precisa ser enviado.
+
+    **Ter evento dentro não faz do arquivo um evento.** Alguns downloaders de
+    DF-e entregam um empacotamento — visto em produção como `<NFeLog>` — que traz
+    o `procNFe` autorizado JUNTO com todos os eventos registrados contra a nota:
+    ciência da operação, CT-e autorizado, MDF-e, registro de passagem.
+
+    Como a busca por `infEvento` varre qualquer nível, esses arquivos eram
+    recusados com "este arquivo é um evento, envie o XML da própria NF-e" —
+    sendo que a NF-e estava lá dentro. O contador não tinha o que fazer com a
+    mensagem: o arquivo que ele tinha ERA o certo.
+
+    Quem decide é o `infNFe`: se ele existe, o documento carrega a nota.
     """
+    if _find_by_local_tag(root, "infNFe") is not None:
+        return False
+
     root_tag = _strip_ns(root.tag)
     if root_tag in ("procEventoNFe", "envEvento", "evento"):
         return True
