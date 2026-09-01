@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import AuthContext, get_company_context, require_csrf
 from src.api.autorizacao import requer
 from src.db.session import get_db
-from src.domain.agencias.service import AgenciaService
+from src.domain.agencias.service import AgenciaService, ReapontamentoService
 from src.schemas.agencias import (
     AgenciaCreate,
     AgenciaListResponse,
@@ -99,3 +99,26 @@ async def desativar_agencia(
 ) -> None:
     """Desativa a conta bancária. O histórico de transações é preservado."""
     await _svc(empresa_id, ctx, db).desativar(agencia_id)
+
+
+@router.post(
+    "/reapontar-contas-sinteticas",
+    status_code=200,
+    dependencies=[requer("agencias.write"), Depends(require_csrf)],
+)
+async def reapontar_contas_sinteticas(
+    empresa_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Move o razão da conta bancária sintética para a conta vinculada.
+
+    Vincular a conta contábil na agência conserta os lançamentos FUTUROS; os
+    que já estão gravados continuam apontando para a conta `1.1.B.<uuid>` que o
+    motor criou, e é ela que sai na exportação sem código abreviado.
+
+    **Reescreve registros contábeis**, por isso é uma ação explícita e não um
+    efeito colateral de salvar a agência: quem dispara precisa saber que está
+    mexendo no razão. Devolve o que foi movido, por agência.
+    """
+    return await ReapontamentoService(db=db, empresa_id=empresa_id).reapontar()

@@ -9,16 +9,25 @@ Regras de negócio:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from src.core.errors import ConflictError, NotFoundError
-from src.db.models import AgenciaBancaria, PlanoConta
+from src.db.models import (
+    AgenciaBancaria,
+    Contraparte,
+    LancamentoCartao,
+    NeoDecisao,
+    PlanoConta,
+    RegistroContabil,
+    Regra,
+)
 from src.schemas.agencias import (
     AgenciaCreate,
     AgenciaListResponse,
@@ -214,3 +223,121 @@ class AgenciaService:
                     "cadastrada para esta empresa."
                 )
             )
+
+
+# Código da conta que o motor NEO cria quando a agência não tem conta contábil
+# vinculada — ver `NeoEngine._obter_conta_bancaria`.
+def _codigo_sintetico(agencia: AgenciaBancaria) -> str:
+    return f"1.1.B.{agencia.id.hex[:16]}"
+
+
+class ReapontamentoService:
+    """Move o razão da conta bancária SINTÉTICA para a conta vinculada.
+
+    Quando a agência não tem conta contábil, o motor NEO cria uma sintética com
+    código `1.1.B.<uuid>` e SEM `conta_numero`. A exportação para o sistema
+    contábil externo usa o `conta_numero` (o "abreviado") e cai no código
+    hierárquico quando ele falta — então o lado bancário de todo lançamento saía
+    como `1.1.B.949a6741df4e4031`, que o sistema externo não importa.
+
+    Vincular a conta na agência conserta os lançamentos FUTUROS: o motor relê
+    `agencia.conta_contabil_id` a cada execução. O que já está gravado continua
+    apontando para a sintética, e é isso que esta rotina resolve.
+
+    **Ela reescreve registros contábeis, então não roda sozinha.** É acionada
+    explicitamente, devolve o que moveu e recusa apagar a sintética se algo que
+    ela não conhece ainda apontar para lá — apagar às cegas trocaria um problema
+    visível na exportação por uma referência órfã no banco.
+    """
+
+    def __init__(self, db: AsyncSession, empresa_id: UUID) -> None:
+        self._db = db
+        self._empresa_id = empresa_id
+
+    async def reapontar(self) -> list[dict]:
+        agencias = (
+            await self._db.execute(
+                select(AgenciaBancaria).where(
+                    AgenciaBancaria.empresa_id == self._empresa_id,
+                    AgenciaBancaria.conta_contabil_id.isnot(None),
+                    AgenciaBancaria.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+
+        relatorio: list[dict] = []
+        for agencia in agencias:
+            sintetica = (
+                await self._db.execute(
+                    select(PlanoConta).where(
+                        PlanoConta.empresa_id == self._empresa_id,
+                        PlanoConta.codigo == _codigo_sintetico(agencia),
+                        PlanoConta.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if sintetica is None:
+                continue
+
+            movidos = await self._mover(sintetica.id, agencia.conta_contabil_id)
+            pendentes = await self._referencias_restantes(sintetica.id)
+            if not pendentes:
+                sintetica.deleted_at = datetime.now(UTC)
+
+            relatorio.append({
+                "agencia": agencia.descricao,
+                "conta_sintetica": sintetica.codigo,
+                "registros_movidos": movidos["registros"],
+                "decisoes_movidas": movidos["decisoes"],
+                "sintetica_desativada": not pendentes,
+                "referencias_restantes": pendentes,
+            })
+            logger.info(
+                "agencias.reapontamento", agencia=str(agencia.id),
+                de=sintetica.codigo, para=str(agencia.conta_contabil_id), **movidos,
+            )
+        return relatorio
+
+    async def _mover(self, de: UUID, para: UUID) -> dict[str, int]:
+        registros = await self._db.execute(
+            update(RegistroContabil)
+            .where(RegistroContabil.conta_id == de)
+            .values(conta_id=para)
+        )
+        decisoes = await self._db.execute(
+            update(NeoDecisao)
+            .where(NeoDecisao.conta_id == de)
+            .values(conta_id=para)
+        )
+        contrapartes = await self._db.execute(
+            update(NeoDecisao)
+            .where(NeoDecisao.conta_contraparte_id == de)
+            .values(conta_contraparte_id=para)
+        )
+        return {
+            "registros": registros.rowcount or 0,
+            "decisoes": (decisoes.rowcount or 0) + (contrapartes.rowcount or 0),
+        }
+
+    async def _referencias_restantes(self, conta_id: UUID) -> dict[str, int]:
+        """O que AINDA aponta para a sintética depois da mudança.
+
+        Regra de categorização, contraparte e lançamento de cartão apontando
+        para uma conta bancária sintética não é situação esperada — e é
+        exatamente por não ser esperada que não pode ser reescrita em silêncio.
+        Aparecendo qualquer uma, a sintética fica de pé e o relatório diz o quê.
+        """
+        restantes: dict[str, int] = {}
+        for rotulo, modelo, coluna in (
+            ("regras", Regra, Regra.conta_id),
+            ("contrapartes", Contraparte, Contraparte.conta_contabil_id),
+            ("lancamentos_cartao", LancamentoCartao, LancamentoCartao.conta_id),
+        ):
+            total = (
+                await self._db.execute(
+                    select(func.count(modelo.id)).where(coluna == conta_id)
+                )
+            ).scalar_one()
+            if total:
+                restantes[rotulo] = total
+        return restantes

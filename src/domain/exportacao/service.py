@@ -244,6 +244,12 @@ class ExportacaoService:
 
     # ── lançamentos contábeis (layout de importação) ─────────────────────────
 
+    # Preenchido por `_exportar_lancamentos_importacao` e lido pela rota, que o
+    # devolve num cabeçalho. Mora na instância porque `exportar` é uma chamada
+    # só, e passar o aviso pela cadeia de retornos obrigaria a mexer em cinco
+    # exportadores que não têm nada a ver com isso.
+    _contas_sem_codigo_abreviado: list[str] = []
+
     async def _exportar_lancamentos_importacao(
         self, data: ExportJobCreate, fmt: str
     ) -> tuple[list, bytes]:
@@ -284,6 +290,15 @@ class ExportacaoService:
                 c.id: str(c.conta_numero) if c.conta_numero is not None else c.codigo
                 for c in conta_rows
             }
+            # Conta sem `conta_numero` sai com o código hierárquico, e o sistema
+            # contábil externo não importa isso. Acontece com a conta sintética
+            # que o motor NEO cria para agência sem conta contábil vinculada
+            # (`1.1.B.<uuid>`), e o contador só descobria abrindo o arquivo.
+            self._contas_sem_codigo_abreviado = sorted(
+                f"{c.codigo} ({c.descricao})"
+                for c in conta_rows
+                if c.conta_numero is None
+            )
 
         # Agrupa por lancamento_id preservando a ordem de chegada (por data).
         grupos: dict = {}

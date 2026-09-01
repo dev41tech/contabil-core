@@ -58,5 +58,12 @@ async def gerar_exportacao(
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Total-Registros": str(job_response.total_registros or 0),
             "X-Job-Id": str(job_response.job_id),
+            # Contas que saíram com o código hierárquico por não terem número
+            # abreviado — o sistema contábil externo não importa esse formato.
+            # Vai em cabeçalho porque o corpo é o arquivo; a tela avisa a partir
+            # daqui, antes que alguém tente importar um arquivo imprestável.
+            "X-Contas-Sem-Codigo-Abreviado": "; ".join(
+                svc._contas_sem_codigo_abreviado
+            )[:900],
         },
     )
