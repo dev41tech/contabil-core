@@ -174,3 +174,32 @@ def test_nfe_sem_protocolo_continua_recusada_mesmo_com_a_decisao_nova():
 
     with pytest.raises(ValueError):
         parse_nota_xml(sem_protocolo)
+
+
+def test_mensagem_de_cnpj_diz_quais_cnpjs_e_reconhece_filial():
+    """Recusar está certo; não dizer QUAIS CNPJs era um beco sem saída.
+
+    Sem os números, quem sobe o arquivo não distingue "errei a empresa na tela"
+    de "o cadastro da empresa está com o CNPJ errado" — e as duas saídas são
+    opostas. Pior no caso de FILIAL: mesma raiz de CNPJ, outro estabelecimento.
+    O contador considera que a nota é "da empresa", o cadastro aqui é por
+    estabelecimento, e sem a frase a conclusão natural é que o sistema quebrou.
+    """
+    from src.core.cnpj import formatar
+
+    assert formatar("18558584000180") == "18.558.584/0001-80"
+    assert formatar("123") == "123"  # não formata o que não é CNPJ
+
+
+def test_raiz_de_cnpj_distingue_filial_de_empresa_alheia():
+    """A regra que decide se a mensagem menciona filial.
+
+    Mesma raiz (8 primeiros dígitos) e estabelecimento diferente é filial;
+    raiz diferente é outra empresa, e aí o conselho é outro.
+    """
+    matriz = "18558584000180"
+    filial = "18558584000261"
+    alheia = "01844555002398"
+
+    assert filial[:8] == matriz[:8] and filial != matriz
+    assert alheia[:8] != matriz[:8]

@@ -297,8 +297,33 @@ class NotaService:
             _somente_digitos(nota_parseada.cnpj_destinatario),
         }
         if cnpj_empresa not in envolvidos:
+            # A recusa está certa; a mensagem antiga é que era um beco sem saída.
+            # Ela não dizia QUAIS CNPJs, então quem subia o arquivo não tinha
+            # como saber se errou a empresa na tela ou se o cadastro da empresa
+            # está com o CNPJ errado — e as duas saídas são opostas.
+            #
+            # Um caso vale atenção especial e por isso é apontado: nota emitida
+            # para outra FILIAL da mesma empresa. A raiz do CNPJ é a mesma e o
+            # contador costuma considerar que a nota é "da empresa", mas o
+            # cadastro aqui é por estabelecimento — reconhecer a situação em voz
+            # alta evita a conclusão de que o sistema está quebrado.
+            mesma_raiz = any(
+                cnpj and cnpj[:8] == cnpj_empresa[:8] and cnpj != cnpj_empresa
+                for cnpj in envolvidos
+            )
+            detalhe = (
+                f"a empresa selecionada é {formatar_cnpj(cnpj_empresa) or '—'}, e a nota "
+                f"vai de {nota_parseada.cnpj_emitente or '—'} para "
+                f"{nota_parseada.cnpj_destinatario or '—'}"
+            )
+            if mesma_raiz:
+                detalhe += (
+                    " — mesma raiz de CNPJ, outro estabelecimento. Importe pela "
+                    "empresa daquela filial"
+                )
             resultado.erros.append(
-                f"{nome_arquivo}: CNPJ da empresa não consta como emitente nem destinatário."
+                f"{nome_arquivo}: CNPJ da empresa não consta como emitente nem "
+                f"destinatário: {detalhe}."
             )
             return resultado
 
@@ -436,6 +461,7 @@ def _validar_zip(infos: list[zipfile.ZipInfo]) -> str | None:
 
 def _somente_digitos(valor: str | None) -> str:
     return re.sub(r"\D", "", valor or "")
+
 
 
 def _normalizar_chave_acesso(chave: str | None) -> str | None:
