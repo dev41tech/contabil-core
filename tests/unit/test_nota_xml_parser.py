@@ -185,11 +185,10 @@ def test_mensagem_de_cnpj_diz_quais_cnpjs_e_reconhece_filial():
     O contador considera que a nota é "da empresa", o cadastro aqui é por
     estabelecimento, e sem a frase a conclusão natural é que o sistema quebrou.
     """
-    from src.domain.notas.service import _formatar_cnpj
+    from src.core.cnpj import formatar
 
-    assert _formatar_cnpj("18558584000180") == "18.558.584/0001-80"
-    assert _formatar_cnpj("") == "—"
-    assert _formatar_cnpj("123") == "123"
+    assert formatar("18558584000180") == "18.558.584/0001-80"
+    assert formatar("123") == "123"  # não formata o que não é CNPJ
 
 
 def test_raiz_de_cnpj_distingue_filial_de_empresa_alheia():

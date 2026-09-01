@@ -312,7 +312,7 @@ class NotaService:
                 for cnpj in envolvidos
             )
             detalhe = (
-                f"a empresa selecionada é {_formatar_cnpj(cnpj_empresa)}, e a nota "
+                f"a empresa selecionada é {formatar_cnpj(cnpj_empresa) or '—'}, e a nota "
                 f"vai de {nota_parseada.cnpj_emitente or '—'} para "
                 f"{nota_parseada.cnpj_destinatario or '—'}"
             )
@@ -462,15 +462,6 @@ def _validar_zip(infos: list[zipfile.ZipInfo]) -> str | None:
 def _somente_digitos(valor: str | None) -> str:
     return re.sub(r"\D", "", valor or "")
 
-
-def _formatar_cnpj(digitos: str) -> str:
-    """Máscara para mensagem de erro — CNPJ solto em 14 dígitos não se lê."""
-    if len(digitos) != 14:
-        return digitos or "—"
-    return (
-        f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/"
-        f"{digitos[8:12]}-{digitos[12:]}"
-    )
 
 
 def _normalizar_chave_acesso(chave: str | None) -> str | None:
