@@ -313,6 +313,11 @@ async def test_classificar_lote_processa_pendentes_e_ignora_retrato_velho(
         "ids_ignorados": [str(velha.id)],
         "bloqueadas": 0,
         "bloqueios": [],
+        # Lote sem `regra` não cadastra nada. Os dois campos vêm nulos, e a
+        # asserção continua sendo do dicionário INTEIRO de propósito: é ela que
+        # avisa quando a resposta ganha um campo sem ninguém decidir.
+        "regra_criada": None,
+        "semelhantes_classificados": None,
     }
     await db.refresh(atual)
     assert atual.status == "processada"
@@ -3994,3 +3999,234 @@ async def test_regra_de_agencia_vence_a_global(client, db, tenant, usuario, empr
 
     assert regras[0].agencia_id == agencia.id, "a exceção de agência vem primeiro"
     assert regras[0].conta_id == conta_excecao.id
+
+
+# ─────────────── Selecionar várias pendências e cadastrar a regra que as cobre
+
+def _sugerir_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/pendencias/sugerir-regra"
+
+
+def _lote_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/neo/pendencias/classificar-lote"
+
+
+async def _tres_pendencias_parecidas(db, empresa, agencia_id, dc="D"):
+    """Três linhas que o contador enxerga como iguais, e o texto que as une."""
+    historicos = [
+        "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES TRANSPORTES",
+        "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES TRANSPORTES LTDA",
+        "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES TRANSPORTES ME",
+    ]
+    return [
+        await _pendencia(db, empresa, agencia_id, historico=h, valor="120.00", dc=dc)
+        for h in historicos
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sugerir_regra_devolve_o_texto_que_cobre_toda_a_selecao(
+    client, db, tenant, usuario, empresa
+):
+    """O contador marca as linhas; o sistema é que diz qual texto as une.
+
+    Deixar a dedução para a tela obrigaria reimplementar a normalização do
+    motor em TypeScript, e prévia com régua própria mente sobre o que a regra
+    vai fazer depois.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    pendencias = await _tres_pendencias_parecidas(db, empresa, agencia_id)
+
+    r = await client.post(
+        _sugerir_url(empresa.id),
+        json={"transacao_ids": [str(p.id) for p in pendencias]},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    assert corpo["historico_sugerido"] == (
+        "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES TRANSPORTES"
+    )
+    assert corpo["dc"] == "D"
+    assert corpo["dc_misturado"] is False
+    assert corpo["transacoes_consideradas"] == 3
+
+
+@pytest.mark.asyncio
+async def test_sugerir_regra_avisa_quando_a_selecao_mistura_debito_e_credito(
+    client, db, tenant, usuario, empresa
+):
+    """Uma regra vale para UM lado.
+
+    Devolver um palpite deixaria metade dos lançamentos escolhidos de fora da
+    regra que os criou.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, _ = await _setup_base(client, db, empresa, csrf)
+    debito = await _pendencia(db, empresa, agencia_id, historico="TARIFA PACOTE", dc="D")
+    credito = await _pendencia(db, empresa, agencia_id, historico="TARIFA PACOTE", dc="C")
+
+    r = await client.post(
+        _sugerir_url(empresa.id),
+        json={"transacao_ids": [str(debito.id), str(credito.id)]},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.json()["dc"] is None
+    assert r.json()["dc_misturado"] is True
+
+
+@pytest.mark.asyncio
+async def test_lote_classifica_os_selecionados_e_cadastra_a_regra(
+    client, db, tenant, usuario, empresa
+):
+    """A ação inteira do escritório: marcar N, escolher a conta, criar a regra."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    pendencias = await _tres_pendencias_parecidas(db, empresa, agencia_id)
+
+    r = await client.post(
+        _lote_url(empresa.id),
+        json={
+            "transacao_ids": [str(p.id) for p in pendencias],
+            "conta_id": conta_id,
+            "descricao": "FRETES E CARRETOS",
+            "regra": {
+                "historico": "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES",
+                "agencia_id": None,
+                "aplicar_nos_semelhantes": True,
+            },
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    assert corpo["classificadas"] == 3
+    assert corpo["regra_criada"] is not None
+    # O lado sai da própria seleção, não do cliente: regra criada do lado oposto
+    # não alcançaria os lançamentos que acabou de gerar.
+    assert corpo["regra_criada"]["dc"] == "D"
+    # agencia_id nulo = vale para todos os bancos, que é o padrão pedido.
+    assert corpo["regra_criada"]["agencia_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_regra_criada_no_lote_alcanca_os_semelhantes_nao_selecionados(
+    client, db, tenant, usuario, empresa
+):
+    """É o motivo de cadastrar a regra: os parecidos que ficaram de fora."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    selecionadas = await _tres_pendencias_parecidas(db, empresa, agencia_id)
+    de_fora = await _pendencia(
+        db,
+        empresa,
+        agencia_id,
+        historico="PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES TRANSPORTES SA",
+        valor="99.00",
+        dc="D",
+    )
+
+    r = await client.post(
+        _lote_url(empresa.id),
+        json={
+            "transacao_ids": [str(p.id) for p in selecionadas],
+            "conta_id": conta_id,
+            "descricao": "FRETES E CARRETOS",
+            "regra": {
+                "historico": "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES",
+                "aplicar_nos_semelhantes": True,
+            },
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["semelhantes_classificados"] >= 1
+    await db.refresh(de_fora)
+    assert de_fora.status == "processada"
+
+
+@pytest.mark.asyncio
+async def test_selecao_com_debito_e_credito_recusa_criar_regra(
+    client, db, tenant, usuario, empresa
+):
+    """E recusa ANTES de qualquer coisa ficar pela metade: o lote cai junto."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    debito = await _pendencia(db, empresa, agencia_id, historico="TARIFA PACOTE", dc="D")
+    credito = await _pendencia(db, empresa, agencia_id, historico="TARIFA PACOTE", dc="C")
+
+    r = await client.post(
+        _lote_url(empresa.id),
+        json={
+            "transacao_ids": [str(debito.id), str(credito.id)],
+            "conta_id": conta_id,
+            "descricao": "TARIFAS BANCARIAS",
+            "regra": {"historico": "TARIFA PACOTE"},
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 422
+    assert "crédito" in r.json()["message"]
+    # A prova de que nada ficou pela metade: a classificação roda ANTES do
+    # cadastro da regra, e é o rollback da request que a desfaz. Sem esta
+    # asserção o teste passaria mesmo se os dois lançamentos tivessem sido
+    # contabilizados e só a regra tivesse falhado.
+    await db.refresh(debito)
+    await db.refresh(credito)
+    assert debito.status == "pendente"
+    assert credito.status == "pendente"
+
+
+@pytest.mark.asyncio
+async def test_lote_sem_regra_continua_so_classificando(
+    client, db, tenant, usuario, empresa
+):
+    """O comportamento de sempre não muda quando `regra` não vem."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    pendencias = await _tres_pendencias_parecidas(db, empresa, agencia_id)
+
+    r = await client.post(
+        _lote_url(empresa.id),
+        json={
+            "transacao_ids": [str(p.id) for p in pendencias],
+            "conta_id": conta_id,
+            "descricao": "FRETES E CARRETOS",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.json()["classificadas"] == 3
+    assert r.json()["regra_criada"] is None
+    assert r.json()["semelhantes_classificados"] is None
+
+
+@pytest.mark.asyncio
+async def test_simular_regra_aceita_regra_para_todos_os_bancos(
+    client, db, tenant, usuario, empresa
+):
+    """Regra global é o padrão desde a 0034, e era o único caso que não dava
+    para simular antes de salvar — regra criada sem prévia é regra no escuro."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id, conta_id = await _setup_base(client, db, empresa, csrf)
+    await _tres_pendencias_parecidas(db, empresa, agencia_id)
+
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/pendencias/simular-regra",
+        json={
+            "historico": "PIX EMITIDO OUTRA IF Pagamento Pix COSTA RODRIGUES",
+            "dc": "D",
+            "agencia_id": None,
+            "conta_id": conta_id,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["pendencias_atingidas"]["quantidade"] == 3

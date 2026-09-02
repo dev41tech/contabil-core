@@ -23,6 +23,7 @@ from src.domain.neo.consultas import (
     consultar_divergencias as _consultar_divergencias,
     listar_decisoes as _listar_decisoes,
     simular_regra as _simular_regra,
+    sugerir_regra_da_selecao as _sugerir_regra_da_selecao,
 )
 from src.domain.neo.engine import NeoEngine
 from src.domain.jobs import JobRuntime, executar_neo
@@ -31,6 +32,9 @@ from src.domain.neo.cancelamento import cancelar_lancamento, liberar_para_automa
 from src.schemas.neo import (
     NeoAssociarManualRequest,
     NeoClassificarLoteRequest,
+    NeoRegraDaSelecao,
+    NeoSugerirRegraRequest,
+    NeoSugerirRegraResponse,
     NeoClassificarLoteBloqueio,
     NeoClassificarLoteResponse,
     NeoCriarRegraEAplicarRequest,
@@ -311,6 +315,22 @@ async def classificar_lote(
     ordenadas = [por_id[id_] for id_ in body.transacao_ids if id_ in por_id]
     ids_ignorados = [id_ for id_ in body.transacao_ids if id_ not in por_id]
 
+    # A recusa por seleção mista vem ANTES de classificar, e não junto do
+    # cadastro da regra. Depender do rollback da request para desfazer trabalho
+    # já feito funciona em produção (`get_db` reverte ao levantar), mas é um
+    # contrato invisível: quem lê o endpoint não sabe dizer se o 422 deixou
+    # lançamento para trás. Validar antes torna a resposta verdadeira sozinha.
+    if body.regra is not None:
+        lados = {transacao.dc for transacao in ordenadas}
+        if len(lados) > 1:
+            raise ValidationError(
+                message=(
+                    "A seleção mistura débito e crédito, e uma regra vale para "
+                    "um lado só. Separe em duas seleções — ou classifique sem "
+                    "criar regra."
+                )
+            )
+
     engine = NeoEngine(db=db, empresa_id=empresa_id)
     classificacao = await engine.classificar_manualmente_lote(
         ordenadas, conta.id, body.descricao
@@ -341,6 +361,18 @@ async def classificar_lote(
             },
         )
 
+    regra_criada = None
+    semelhantes = None
+    if body.regra is not None:
+        regra_criada, semelhantes = await _cadastrar_regra_da_selecao(
+            db,
+            empresa_id=empresa_id,
+            pedido=body.regra,
+            conta_id=conta.id,
+            descricao=body.descricao,
+            classificadas=classificacao.classificadas,
+        )
+
     return NeoClassificarLoteResponse(
         classificadas=len(classificacao.classificadas),
         ignoradas=len(ids_ignorados),
@@ -352,6 +384,85 @@ async def classificar_lote(
             )
             for bloqueio in classificacao.bloqueadas
         ],
+        regra_criada=regra_criada,
+        semelhantes_classificados=semelhantes,
+    )
+
+
+async def _cadastrar_regra_da_selecao(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    pedido: NeoRegraDaSelecao,
+    conta_id: UUID,
+    descricao: str,
+    classificadas: list,
+):
+    """Cria a regra que cobre a seleção e, se pedido, aplica nos semelhantes.
+
+    Roda DEPOIS da classificação e na MESMA transação: se o cadastro falhar
+    (histórico já usado por outra regra, por exemplo), a exceção derruba o lote
+    inteiro e nada fica pela metade. Classificar e engolir o erro do cadastro
+    deixaria o contador achando que a regra existe.
+    """
+    if not classificadas:
+        raise ValidationError(
+            message=(
+                "Nenhuma das transações selecionadas pôde ser classificada, "
+                "então não há seleção para a regra descrever."
+            )
+        )
+
+    # A seleção mista já foi recusada antes de classificar; aqui o conjunto é
+    # necessariamente de um lado só. O `next(iter(...))` abaixo depende disso.
+    lados = {transacao.dc for transacao in classificadas}
+
+    dados = RegraCreate(
+        conta_id=conta_id,
+        agencia_id=pedido.agencia_id,
+        descricao=descricao,
+        historico=pedido.historico,
+        dc=next(iter(lados)),
+        # Sempre automática. Regra `manual` não é carregada pelo motor, então
+        # cadastrá-la aqui prometeria "os próximos caem sozinhos" e não
+        # cumpriria — a mesma armadilha que `criar-regra-e-aplicar` recusa.
+        tipo="automatica",
+        manter_historico=pedido.manter_historico,
+    )
+    regra = await RegraService(db=db, empresa_id=empresa_id).criar(dados)
+
+    if not pedido.aplicar_nos_semelhantes:
+        return regra, None
+
+    # As selecionadas já saíram da fila de pendentes na etapa anterior, então o
+    # que o motor alcança aqui é exatamente o "além dos selecionados" que a
+    # tela promete na prévia.
+    resultado = await NeoEngine(db=db, empresa_id=empresa_id).processar(
+        agencia_id=pedido.agencia_id
+    )
+    return regra, resultado.associadas
+
+
+@router.post(
+    "/pendencias/sugerir-regra",
+    response_model=NeoSugerirRegraResponse,
+    dependencies=[requer("neo.read")],
+)
+async def sugerir_regra(
+    empresa_id: UUID,
+    body: NeoSugerirRegraRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> NeoSugerirRegraResponse:
+    """Deduz, das transações marcadas na tela, o texto de regra que cobre todas.
+
+    Somente leitura: nada é cadastrado. O contador edita a sugestão antes de
+    confirmar, e é a `simular-regra` que diz quanto ela alcança.
+    """
+    return NeoSugerirRegraResponse(
+        **await _sugerir_regra_da_selecao(
+            db, empresa_id, transacao_ids=body.transacao_ids
+        )
     )
 
 

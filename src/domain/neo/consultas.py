@@ -733,7 +733,7 @@ async def simular_regra(
     *,
     historico: str,
     dc: str,
-    agencia_id: UUID,
+    agencia_id: UUID | None,
     conta_id: UUID,
 ) -> NeoSimularRegraResponse:
     """Mede o impacto de uma regra sem persistir qualquer alteração.
@@ -743,15 +743,25 @@ async def simular_regra(
     barato, mas criaria diferenças entre SQLite/Postgres e, principalmente,
     uma segunda implementação da normalização que poderia mentir na prévia.
     """
-    agencia_existe = (
-        await db.execute(
-            select(AgenciaBancaria.id).where(
-                AgenciaBancaria.id == agencia_id,
-                AgenciaBancaria.empresa_id == empresa_id,
-                AgenciaBancaria.deleted_at.is_(None),
+    # `agencia_id` nulo é a regra que vale para TODOS os bancos (migration
+    # 0034), e desde ela é o padrão pedido pelo escritório. Enquanto a prévia
+    # exigia uma agência, o caso mais comum era justamente o que não dava para
+    # simular — e regra criada sem prévia é regra criada no escuro.
+    agencia_existe = None
+    if agencia_id is not None:
+        agencia_existe = (
+            await db.execute(
+                select(AgenciaBancaria.id).where(
+                    AgenciaBancaria.id == agencia_id,
+                    AgenciaBancaria.empresa_id == empresa_id,
+                    AgenciaBancaria.deleted_at.is_(None),
+                )
             )
-        )
-    ).scalar_one_or_none()
+        ).scalar_one_or_none()
+        if agencia_existe is None:
+            raise ValidationError(
+                message="Agência bancária não encontrada nesta empresa."
+            )
     conta_existe = (
         await db.execute(
             select(PlanoConta.id).where(
@@ -761,8 +771,6 @@ async def simular_regra(
             )
         )
     ).scalar_one_or_none()
-    if agencia_existe is None:
-        raise ValidationError(message="Agência bancária não encontrada nesta empresa.")
     if conta_existe is None:
         raise ValidationError(message="Conta contábil não encontrada nesta empresa.")
 
@@ -782,7 +790,9 @@ async def simular_regra(
         .outerjoin(RegistroContabil, lancamento_classificacao)
         .where(
             Transacao.empresa_id == empresa_id,
-            Transacao.agencia_id == agencia_id,
+            # Regra global alcança a empresa inteira, e a prévia precisa contar
+            # o mesmo conjunto que o motor vai varrer.
+            *([Transacao.agencia_id == agencia_id] if agencia_id is not None else []),
             Transacao.dc == dc,
             Transacao.status.in_(("pendente", "processada")),
         )
@@ -962,3 +972,83 @@ async def listar_desfeitas(
             }
         )
     return itens, total
+
+
+async def sugerir_regra_da_selecao(
+    db: AsyncSession,
+    empresa_id: UUID,
+    *,
+    transacao_ids: list[UUID],
+) -> dict:
+    """Deduz o texto de regra que cobre TODAS as transações selecionadas.
+
+    O contador marca as linhas que enxerga como iguais; o sistema é que precisa
+    dizer qual texto as une. Deixar isso para a tela obrigaria a reimplementar
+    a normalização do motor em TypeScript — e prévia com régua própria mente
+    sobre o que a regra vai fazer depois.
+
+    O texto sai do maior PREFIXO de palavras da primeira linha que ainda está
+    contido em todas as outras, na forma canônica. Prefixo, e não interseção de
+    palavras soltas, porque a estratégia `substring` do motor exige o trecho
+    contíguo: um conjunto de palavras comuns fora de ordem casaria por
+    `todas_palavras`, que é a estratégia mais permissiva da fila e alcançaria
+    lançamentos que o contador não viu ao selecionar.
+
+    Devolve o texto CRU da transação, não o normalizado: é ele que o contador
+    lê e edita antes de confirmar, e `Regra.historico` guarda o que foi digitado.
+    """
+    transacoes = (
+        (
+            await db.execute(
+                select(Transacao).where(
+                    Transacao.id.in_(transacao_ids),
+                    Transacao.empresa_id == empresa_id,
+                    Transacao.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    por_id = {t.id: t for t in transacoes}
+    # Preserva a ordem em que a tela mandou: o prefixo sai da PRIMEIRA linha
+    # marcada, que é a que o contador tinha na frente ao decidir.
+    ordenadas = [por_id[i] for i in transacao_ids if i in por_id]
+    if not ordenadas:
+        raise ValidationError(
+            message="Nenhuma das transações selecionadas foi encontrada nesta empresa."
+        )
+
+    historicos = [t.historico or "" for t in ordenadas]
+    sugerido = _prefixo_comum_de_palavras(historicos)
+
+    dcs = {t.dc for t in ordenadas}
+    return {
+        "historico_sugerido": sugerido,
+        # D/C só sai preenchido quando a seleção inteira concorda. Uma regra tem
+        # UM lado; devolver um palpite para seleção mista faria metade dos
+        # lançamentos escolhidos ficarem de fora da própria regra que os criou.
+        "dc": next(iter(dcs)) if len(dcs) == 1 else None,
+        "dc_misturado": len(dcs) > 1,
+        "transacoes_consideradas": len(ordenadas),
+        "ids_ignorados": [i for i in transacao_ids if i not in por_id],
+    }
+
+
+def _prefixo_comum_de_palavras(historicos: list[str]) -> str:
+    """Maior prefixo de palavras da primeira linha contido em todas as demais."""
+    if not historicos:
+        return ""
+    palavras = (historicos[0] or "").split()
+    canonicos = [normalizar_para_match(h) for h in historicos]
+
+    melhor = 0
+    for quantas in range(1, len(palavras) + 1):
+        alvo = normalizar_para_match(" ".join(palavras[:quantas]))
+        if alvo and all(alvo in c for c in canonicos):
+            melhor = quantas
+        else:
+            # Prefixo que falha não volta a casar ao crescer: o mais longo
+            # contém o mais curto.
+            break
+    return " ".join(palavras[:melhor])

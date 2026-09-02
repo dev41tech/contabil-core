@@ -182,6 +182,9 @@ class NeoClassificarLoteRequest(BaseModel):
     transacao_ids: list[UUID] = Field(..., min_length=1, max_length=200)
     conta_id: UUID
     descricao: str = Field(..., min_length=2, max_length=500)
+    # Opcional: além de classificar os selecionados, cadastra a regra que os
+    # cobre. Ausente = só classifica, que é o comportamento de sempre.
+    regra: "NeoRegraDaSelecao | None" = None
 
     @field_validator("transacao_ids")
     @classmethod
@@ -189,6 +192,48 @@ class NeoClassificarLoteRequest(BaseModel):
         # Repetições podem surgir ao mesclar grupos na tela. Removê-las aqui
         # impede uma segunda tentativa de contabilizar a mesma transação.
         return list(dict.fromkeys(ids))
+
+
+class NeoRegraDaSelecao(BaseModel):
+    """Pedido de cadastrar a regra que cobre as transações selecionadas.
+
+    Vai junto do lote, e não numa chamada seguinte, porque as duas metades
+    precisam viver ou morrer juntas: classificar sem cadastrar deixa o próximo
+    lançamento igual caindo como pendente de novo, e cadastrar sem classificar
+    deixa a regra valendo para o futuro e a seleção intacta na tela. Duas
+    chamadas separadas têm um estado intermediário que ninguém consegue
+    explicar depois.
+
+    `dc` não vem daqui: sai das próprias transações selecionadas, e a seleção
+    com D e C misturados é recusada. Uma regra tem UM lado — deixar o cliente
+    escolher permitiria criar a regra do lado oposto ao dos lançamentos que
+    acabaram de ser classificados por ela.
+    """
+
+    historico: str = Field(..., min_length=2, max_length=500)
+    # `None` = vale para todos os bancos. É o padrão, não a exceção.
+    agencia_id: UUID | None = None
+    manter_historico: bool = False
+    # Rodar o motor logo depois é o que faz a regra valer para os SEMELHANTES
+    # que não foram selecionados — que é o motivo de cadastrá-la.
+    aplicar_nos_semelhantes: bool = True
+
+    @field_validator("historico", mode="before")
+    @classmethod
+    def limpar_historico(cls, valor: str) -> str:
+        return valor.strip() if isinstance(valor, str) else valor
+
+
+class NeoSugerirRegraRequest(BaseModel):
+    transacao_ids: list[UUID] = Field(..., min_length=1, max_length=200)
+
+
+class NeoSugerirRegraResponse(BaseModel):
+    historico_sugerido: str
+    dc: str | None = None
+    dc_misturado: bool = False
+    transacoes_consideradas: int
+    ids_ignorados: list[UUID] = Field(default_factory=list)
 
 
 class NeoClassificarLoteBloqueio(BaseModel):
@@ -206,12 +251,22 @@ class NeoClassificarLoteResponse(BaseModel):
     # por isso vem com texto, e não só com o id.
     bloqueadas: int = 0
     bloqueios: list[NeoClassificarLoteBloqueio] = Field(default_factory=list)
+    # Preenchidos quando o lote veio com `regra`. `regra_criada` nulo com
+    # `regra` pedida nunca acontece: a criação falha alto e derruba o lote
+    # inteiro, em vez de classificar e engolir o erro do cadastro.
+    regra_criada: RegraResponse | None = None
+    # Quantos lançamentos a regra alcançou ALÉM dos selecionados, quando
+    # `aplicar_nos_semelhantes` estava ligado.
+    semelhantes_classificados: int | None = None
 
 
 class NeoSimularRegraRequest(BaseModel):
     historico: str = Field(..., min_length=2, max_length=500)
     dc: str
-    agencia_id: UUID
+    # `None` = regra para TODOS os bancos, como a migration 0034 permite e como
+    # o escritório pede na maioria dos casos. Enquanto isto era obrigatório, o
+    # cenário mais comum era o único que não dava para simular antes de salvar.
+    agencia_id: UUID | None = None
     conta_id: UUID
 
     @field_validator("historico", mode="before")

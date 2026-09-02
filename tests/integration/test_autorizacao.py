@@ -113,6 +113,11 @@ def test_metodo_que_muda_estado_nao_declara_apenas_leitura():
         # Extrai os campos do PDF para pré-preencher o formulário; quem grava é
         # o POST /comprovantes seguinte.
         "/comprovantes/extrair-pdf",
+        # Deduz o texto de regra que cobre as transações marcadas na tela. É
+        # POST pela mesma razão que `simular-regra`: recebe até 200 UUIDs, que
+        # não cabem numa query string. Não grava nada — quem cadastra a regra é
+        # o `classificar-lote` seguinte, que declara `neo.execute`.
+        "/neo/pendencias/sugerir-regra",
     }
 
     for rota in _rotas_de_empresa():
