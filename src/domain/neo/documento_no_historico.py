@@ -24,6 +24,22 @@ em corrida MÁXIMA de dígitos — um pedaço de um número maior não é docume
 (`09.033.833/0001-23`) é reconhecida à parte, porque limpar pontuação da linha
 inteira grudaria números vizinhos e inventaria documentos que não existem.
 
+CADA BANCO PONTUA DE UM JEITO
+
+A primeira versão exigia a barra do CNPJ canônico, e isso não é o que os bancos
+imprimem. O Sicoob escreve `81.450.538 0001-08`, com ESPAÇO no lugar da barra —
+e, nos seis extratos de jan–jun/2026 de uma conta só, isso era **661 CNPJs que
+o extrator achava zero**. Os padrões abaixo afrouxam os dois últimos separadores
+e mantêm os dois primeiros pontos obrigatórios; a nota junto de cada um explica
+por que essa é a linha certa entre abrangente e frouxo.
+
+O QUE NUNCA VAI CASAR, E TUDO BEM
+
+CPF de pessoa física vem MASCARADO em PIX (`***.674.379-**`). Não há como
+recuperar os dígitos, então essas linhas não resolvem por documento — e, nos
+mesmos seis extratos, são 442 das 1.103. Resolver PIX para pessoa física
+depende do nome, que é evidência mais fraca, ou de classificação manual.
+
 Este módulo não decide nada: devolve os candidatos, e quem chama confronta com
 o cadastro. Casar só contra contraparte cadastrada é o que impede uma sequência
 de 14 dígitos qualquer de virar classificação.
@@ -36,8 +52,25 @@ import re
 # Corrida máxima de dígitos: as bordas `(?<!\d)`/`(?!\d)` impedem que um
 # pedaço de 14 dígitos de um número de 20 seja lido como CNPJ.
 _SEM_PONTUACAO = re.compile(r"(?<!\d)(\d{11}|\d{14})(?!\d)")
-_CNPJ_PONTUADO = re.compile(r"(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d)")
-_CPF_PONTUADO = re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}-\d{2}(?!\d)")
+
+# Os DOIS primeiros pontos são obrigatórios; os dois separadores seguintes, não.
+#
+# É o que torna o padrão abrangente sem torná-lo frouxo. Exigir os pontos
+# ancora o achado numa string que já se declara pontuada, e por isso um par de
+# números soltos separados por espaço (`12 345 678 9012 34`) não vira candidato.
+# Afrouxar só as duas últimas posições cobre o que os bancos realmente imprimem:
+#
+#     09.033.833/0001-23   canônico
+#     81.450.538 0001-08   Sicoob — espaço no lugar da barra
+#     09.033.833.0001-23   ponto no lugar da barra
+#     09.033.8330001-23    sem separador nenhum ali
+#
+# Os tamanhos dos grupos continuam fixos (2-3-3-4-2), então nenhum afrouxamento
+# de separador deixa o padrão engolir um dígito a mais ou a menos.
+_CNPJ_PONTUADO = re.compile(
+    r"(?<!\d)\d{2}\.\d{3}\.\d{3}[./\s-]?\d{4}[-./\s]?\d{2}(?!\d)"
+)
+_CPF_PONTUADO = re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}[-./\s]?\d{2}(?!\d)")
 
 
 def documentos_no_historico(historico: str | None) -> list[str]:
