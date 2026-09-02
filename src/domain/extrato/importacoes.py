@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import UUID
 
 import structlog
@@ -71,6 +71,45 @@ async def abrir_importacao(
     return importacao
 
 
+async def ancora_de_saldo(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    agencia_id: UUID,
+    antes_de: date,
+) -> ExtratoImportacao | None:
+    """Último lote desta conta com fechamento declarado ANTES de ``antes_de``.
+
+    Ordena por `data_saldo_declarado`, não por `created_at`: é o que faz a
+    conferência sobreviver a upload fora de ordem. Subir junho e depois
+    fevereiro não elege junho como âncora de fevereiro — a âncora é o período
+    anterior, independentemente de quando o arquivo foi enviado.
+
+    A comparação é estritamente menor de propósito. Reenviar o MESMO arquivo
+    encontraria a si próprio como âncora e acusaria diferença igual ao movimento
+    inteiro do período; com `<`, o reenvio simplesmente não tem âncora e nada é
+    alegado.
+
+    Lote cancelado não serve de âncora: as transações dele foram removidas, e o
+    fechamento que ele declara não corresponde mais a nada no banco.
+    """
+    return (
+        await db.execute(
+            select(ExtratoImportacao)
+            .where(
+                ExtratoImportacao.empresa_id == empresa_id,
+                ExtratoImportacao.agencia_id == agencia_id,
+                ExtratoImportacao.deleted_at.is_(None),
+                ExtratoImportacao.cancelada_em.is_(None),
+                ExtratoImportacao.data_saldo_declarado.is_not(None),
+                ExtratoImportacao.data_saldo_declarado < antes_de,
+            )
+            .order_by(ExtratoImportacao.data_saldo_declarado.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
 async def registrar_resultado(
     db: AsyncSession, importacao: ExtratoImportacao, resultado
 ) -> None:
@@ -79,6 +118,11 @@ async def registrar_resultado(
     importacao.importadas = getattr(resultado, "importadas", 0) or 0
     importacao.duplicadas = getattr(resultado, "duplicadas", 0) or 0
     importacao.rejeitadas = getattr(resultado, "rejeitadas", 0) or 0
+    # Só o OFX declara fechamento de período; no PDF estes três ficam nulos, e a
+    # completude de lá continua sendo a cadeia de saldos por lançamento.
+    importacao.saldo_declarado = getattr(resultado, "saldo_declarado", None)
+    importacao.data_saldo_declarado = getattr(resultado, "data_saldo_declarado", None)
+    importacao.alerta_saldo = getattr(resultado, "alerta_saldo", None)
 
 
 async def cancelar_importacao(

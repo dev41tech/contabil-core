@@ -40,6 +40,13 @@ class ImportacaoResult(BaseModel):
     # número específico não é confiável.
     rejeitadas: int = 0
     motivos_rejeicao: list[str] = []
+    # Fechamento de período que o arquivo declara (`<LEDGERBAL>` do OFX) e o
+    # aviso de quando ele não bate com o lote anterior desta conta. É conferência
+    # de completude, categoria diferente de `rejeitadas`: aqui todas as linhas
+    # entraram, e o que está em dúvida é se ALGUMA ficou de fora do arquivo.
+    saldo_declarado: Decimal | None = None
+    data_saldo_declarado: date | None = None
+    alerta_saldo: str | None = None
     transacoes: list[TransacaoResponse]
 
 
@@ -79,6 +86,12 @@ class ImportacaoResponse(BaseModel):
     # que alguma é removida individualmente — é o que diz se ainda há o que
     # cancelar.
     transacoes_ativas: int = 0
+    saldo_declarado: Decimal | None = None
+    data_saldo_declarado: date | None = None
+    # Frase pronta para a tela quando o fechamento declarado não fecha com o
+    # lote anterior desta conta. Nulo significa "não verificado" — arquivo sem
+    # saldo declarado, ou primeiro da conta — e não "conferido e certo".
+    alerta_saldo: str | None = None
     cancelada_em: datetime | None = None
     motivo_cancelamento: str | None = None
 

@@ -39,7 +39,7 @@ def _para_decimal(texto: str) -> Decimal | None:
         return None
 
 
-def _reais(valor: Decimal) -> str:
+def reais(valor: Decimal) -> str:
     """Formata no padrão brasileiro — a mensagem é lida por contador."""
     inteiro, _, centavos = f"{valor:.2f}".partition(".")
     milhar = f"{int(inteiro):,}".replace(",", ".")
@@ -72,13 +72,13 @@ def motivo_valor_nao_confiavel(historico: str, valor: Decimal) -> str | None:
 
     if gravado == ultimo:
         return (
-            f"o valor lido ({_reais(ultimo)}) é o último número da linha, que num "
+            f"o valor lido ({reais(ultimo)}) é o último número da linha, que num "
             f"extrato é o saldo da conta — o valor da transação parece ser "
-            f"{_reais(primeiro)}"
+            f"{reais(primeiro)}"
         )
 
     return (
-        f"o valor lido ({_reais(gravado)}) não corresponde a nenhum valor da "
+        f"o valor lido ({reais(gravado)}) não corresponde a nenhum valor da "
         f"linha do extrato"
     )
 

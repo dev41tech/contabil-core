@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from uuid import UUID
 
 import structlog
@@ -18,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Transacao
+from src.domain.extrato.conferencia import conferir_fechamento
+from src.domain.extrato.importacoes import ancora_de_saldo
 from src.domain.extrato.ofx_parser import OFXParseError, TransacaoOFX, parse_ofx_detalhado
 from src.domain.extrato.ordenacao import ordenar_como_o_extrato
 from src.domain.extrato.validacao import (
@@ -113,7 +116,14 @@ class ExtratoService:
                     agencia_id=agencia_id,
                     data=t.data,
                     valor=abs(t.valor),
-                    historico=t.historico or t.tipo_ofx,
+                    # `Transacao.historico` é VARCHAR(500). Desde que o
+                    # histórico do OFX passou a juntar MEMO e NAME, o texto
+                    # ficou maior e estourar deixou de ser hipótese remota — e
+                    # o modo de falha é o pior desta base: o SQLite da suíte
+                    # aceita silenciosamente e o PostgreSQL recusa a linha, ou
+                    # seja, verde aqui e importação quebrada em produção. O
+                    # Open Banking já cortava; este caminho nunca cortou.
+                    historico=(t.historico or t.tipo_ofx)[:500],
                     dc=dc,
                     saldo_apos=t.saldo_apos,   # OFX não informa: fica NULL
                     ordem=t.ordem,
@@ -142,6 +152,8 @@ class ExtratoService:
             rejeitadas=rejeitadas,
         )
 
+        alerta = await self._conferir_fechamento(agencia_id, parse_result)
+
         return ImportacaoResult(
             agencia_id=agencia_id,
             total_no_arquivo=parse_result.total_blocos,
@@ -150,8 +162,52 @@ class ExtratoService:
             erros=erros,
             rejeitadas=rejeitadas,
             motivos_rejeicao=motivos_rejeicao,
+            saldo_declarado=parse_result.saldo_declarado,
+            data_saldo_declarado=parse_result.data_saldo,
+            alerta_saldo=alerta,
             transacoes=[TransacaoResponse.model_validate(t) for t in novas],
         )
+
+    async def _conferir_fechamento(
+        self, agencia_id: UUID, parse_result
+    ) -> str | None:
+        """Compara o fechamento declarado com o do lote anterior desta conta.
+
+        O movimento somado é o de TODAS as transações lidas do arquivo, não só
+        as importadas: quem não entrou por já existir no banco continua fazendo
+        parte do período que o `LEDGERBAL` descreve. Somar apenas as novas faria
+        todo reenvio parcial acusar diferença.
+        """
+        if parse_result.saldo_declarado is None or parse_result.data_saldo is None:
+            return None
+
+        anterior = await ancora_de_saldo(
+            self._db,
+            empresa_id=self._empresa_id,
+            agencia_id=agencia_id,
+            antes_de=parse_result.data_saldo,
+        )
+        if anterior is None:
+            return None
+
+        alerta = conferir_fechamento(
+            saldo_anterior=anterior.saldo_declarado,
+            data_anterior=anterior.data_saldo_declarado,
+            movimento=sum(
+                (t.valor for t in parse_result.transacoes), Decimal("0")
+            ),
+            saldo_declarado=parse_result.saldo_declarado,
+            data_declarada=parse_result.data_saldo,
+        )
+        if alerta:
+            logger.warning(
+                "extrato.fechamento_nao_confere",
+                empresa_id=str(self._empresa_id),
+                agencia_id=str(agencia_id),
+                saldo_declarado=str(parse_result.saldo_declarado),
+                ancora=str(anterior.data_saldo_declarado),
+            )
+        return alerta
 
     async def importar_transacoes_raw(
         self,
@@ -224,7 +280,10 @@ class ExtratoService:
                     agencia_id=agencia_id,
                     data=t.data,
                     valor=abs(t.valor),
-                    historico=t.historico or "EXTRATO PDF",
+                    # Mesmo teto do caminho de OFX: VARCHAR(500) no banco, e um
+                    # adaptador de layout novo pode juntar linhas até passar
+                    # disso sem que nada na suíte em SQLite acuse.
+                    historico=(t.historico or "EXTRATO PDF")[:500],
                     dc=dc,
                     saldo_apos=t.saldo_apos,
                     ordem=t.ordem,
