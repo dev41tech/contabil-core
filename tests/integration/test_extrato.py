@@ -754,3 +754,182 @@ async def test_reimportar_depois_de_cancelar_traz_as_transacoes_de_volta(
     assert segunda.json()["importadas"] == 2, (
         "o cancelamento não liberou o arquivo: a reimportação veio zerada"
     )
+
+
+# ── Conferência de completude pelo saldo declarado no arquivo
+
+def _ofx_com_saldo(fitid: str, dia: str, valor: str, saldo: str, dia_saldo: str) -> str:
+    """OFX mínimo com `<LEDGERBAL>` — a estrutura que o Sicoob emite."""
+    return f"""\
+OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+
+<OFX>
+<BANKMSGSRSV1><STMTTRNRS><STMTRS>
+<BANKTRANLIST>
+<STMTTRN>
+<TRNTYPE>DEBIT
+<DTPOSTED>{dia}
+<TRNAMT>{valor}
+<FITID>{fitid}
+<MEMO>PIX EMITIDO OUTRA IF
+<NAME>Pagamento Pix 11.222.333 0001-44
+</STMTTRN>
+</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{saldo}
+<DTASOF>{dia_saldo}
+</LEDGERBAL>
+</STMTRS></STMTTRNRS></BANKMSGSRSV1>
+</OFX>
+"""
+
+
+@pytest.mark.asyncio
+async def test_primeiro_arquivo_da_conta_nao_recebe_alerta(
+    client, tenant, usuario, empresa
+):
+    """Sem lote anterior não há âncora, e a ausência de alerta não é aprovação."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    r = await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S1", "20260130", "-100.00", "911.18", "20260130"),
+    )
+
+    assert r.status_code in (200, 201, 202)
+    assert r.json()["alerta_saldo"] is None
+    assert Decimal(str(r.json()["saldo_declarado"])) == Decimal("911.18")
+
+
+@pytest.mark.asyncio
+async def test_cadeia_que_fecha_entre_dois_arquivos_nao_alerta(
+    client, tenant, usuario, empresa
+):
+    """911,18 do primeiro − 94,94 do segundo = 816,24 declarado no segundo."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S1", "20260130", "-100.00", "911.18", "20260130"),
+    )
+    r = await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S2", "20260227", "-94.94", "816.24", "20260227"),
+    )
+
+    assert r.json()["alerta_saldo"] is None
+
+
+@pytest.mark.asyncio
+async def test_periodo_faltando_gera_alerta_sem_recusar_o_arquivo(
+    client, tenant, usuario, empresa
+):
+    """O lote ENTRA — recusar travaria um arquivo correto por causa de outro.
+
+    É o caso do contador que sobe fevereiro e depois abril: abril está certo, e
+    o que falta é março.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S1", "20260227", "-10.00", "816.24", "20260227"),
+    )
+    r = await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S2", "20260430", "1621.61", "2191.77", "20260430"),
+    )
+
+    corpo = r.json()
+    assert corpo["importadas"] == 1, "o arquivo divergente ainda assim é importado"
+    assert corpo["alerta_saldo"] is not None
+    assert "R$ 246,08" in corpo["alerta_saldo"]
+    assert "27/02/2026" in corpo["alerta_saldo"]
+
+
+@pytest.mark.asyncio
+async def test_alerta_fica_gravado_no_lote(client, tenant, usuario, empresa):
+    """A frase precisa sobreviver à requisição — quem confere olha a lista de lotes."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S1", "20260227", "-10.00", "816.24", "20260227"),
+    )
+    await _importar(
+        client, empresa, agencia["id"], csrf,
+        conteudo=_ofx_com_saldo("S2", "20260430", "1621.61", "2191.77", "20260430"),
+    )
+
+    lotes = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/extrato/importacoes")
+    ).json()["items"]
+
+    divergente = next(i for i in lotes if i["alerta_saldo"] is not None)
+    assert "R$ 246,08" in divergente["alerta_saldo"]
+    assert divergente["data_saldo_declarado"] == "2026-04-30"
+
+
+@pytest.mark.asyncio
+async def test_reenviar_o_mesmo_arquivo_nao_se_toma_por_ancora(
+    client, tenant, usuario, empresa
+):
+    """A âncora é ESTRITAMENTE anterior.
+
+    Sem isso o reenvio encontraria a si próprio e acusaria diferença igual ao
+    movimento inteiro do período — um alerta falso no caminho mais banal que
+    existe, que é subir o mesmo arquivo duas vezes.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    conteudo = _ofx_com_saldo("S1", "20260130", "-100.00", "911.18", "20260130")
+
+    await _importar(client, empresa, agencia["id"], csrf, conteudo=conteudo)
+    r = await _importar(client, empresa, agencia["id"], csrf, conteudo=conteudo)
+
+    assert r.json()["duplicadas"] == 1
+    assert r.json()["alerta_saldo"] is None
+
+
+@pytest.mark.asyncio
+async def test_ofx_sem_ledgerbal_nao_grava_saldo_nem_alerta(
+    client, tenant, usuario, empresa
+):
+    """O OFX antigo dos testes não tem LEDGERBAL — e continua importando igual."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    r = await _importar(client, empresa, agencia["id"], csrf)
+
+    assert r.json()["importadas"] == 2
+    assert r.json()["saldo_declarado"] is None
+    assert r.json()["alerta_saldo"] is None
+
+
+@pytest.mark.asyncio
+async def test_historico_longo_nao_estoura_a_coluna(client, tenant, usuario, empresa):
+    """`Transacao.historico` é VARCHAR(500), e juntar MEMO e NAME aproxima o teto.
+
+    O modo de falha sem o corte é o pior desta base: o SQLite da suíte aceita o
+    texto maior em silêncio e o PostgreSQL recusa a linha. Verde aqui, quebrado
+    em produção — a mesma classe do bug dos enums D/C.
+    """
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    gigante = _OFX_VALIDO.replace(
+        "<MEMO>TED RECEBIDA EMPRESA XYZ", "<MEMO>" + "A" * 400 + "\n<NAME>" + "B" * 400
+    )
+
+    r = await _importar(client, empresa, agencia["id"], csrf, conteudo=gigante)
+
+    assert r.json()["importadas"] == 2
+    transacao = next(
+        t for t in r.json()["transacoes"] if t["historico"].startswith("A")
+    )
+    assert len(transacao["historico"]) == 500

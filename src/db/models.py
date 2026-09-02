@@ -539,8 +539,32 @@ class ExtratoImportacao(Base, TimestampMixin):
     )
     motivo_cancelamento: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
+    # Saldo de fechamento que o ARQUIVO declara, e a data em que ele vale. Só o
+    # OFX traz (`<LEDGERBAL>`); no PDF fica nulo, porque lá a completude já é
+    # conferida pela cadeia de saldos por lançamento.
+    #
+    # Guardar isto é o que torna a conferência possível ENTRE arquivos: o
+    # fechamento de um lote é a âncora do lote seguinte da mesma conta. É a
+    # verificação que a cadeia de saldos não dá — ela prova que os valores
+    # presentes são consistentes, não que nada foi acrescentado ou perdido.
+    saldo_declarado: Mapped[Decimal | None] = mapped_column(
+        Numeric(15, 2), nullable=True
+    )
+    data_saldo_declarado: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Preenchido quando o fechamento declarado não bate com a âncora anterior.
+    # É AVISO, não recusa: o lote entra, e a frase diz o que conferir. Recusar
+    # travaria o mês inteiro no caso legítimo de um período ainda não importado.
+    alerta_saldo: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     __table_args__ = (
         Index("ix_importacao_empresa_criada", "empresa_id", "created_at"),
+        # Sustenta a busca da âncora: último fechamento declarado desta conta
+        # antes da data deste arquivo.
+        Index(
+            "ix_importacao_agencia_saldo",
+            "agencia_id",
+            "data_saldo_declarado",
+        ),
     )
 
 

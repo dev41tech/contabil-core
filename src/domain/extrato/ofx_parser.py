@@ -43,6 +43,16 @@ class OFXParseResult:
     transacoes: list[TransacaoOFX]
     total_blocos: int
     erros: list[str]
+    # Saldo de fechamento do período, declarado pelo banco em `<LEDGERBAL>`.
+    #
+    # O OFX não traz saldo POR LANÇAMENTO — daí `TransacaoOFX.saldo_apos` seguir
+    # nulo — mas traz o saldo do PERÍODO, e ninguém lia. Encadeado entre arquivos
+    # consecutivos da mesma conta (fechamento do anterior + movimento deste =
+    # fechamento deste), ele prova o que a cadeia de saldos do PDF não prova:
+    # que nada foi acrescentado nem perdido. Medido nos seis extratos Sicoob de
+    # jan–jun/2026: os cinco encadeáveis fecham no centavo.
+    saldo_declarado: Decimal | None = None
+    data_saldo: date | None = None
 
 
 def parse_ofx(conteudo: str) -> list[TransacaoOFX]:
@@ -86,7 +96,14 @@ def _parse_sgml(conteudo: str) -> OFXParseResult:
         except (OFXParseError, ValueError) as exc:
             erros.append(f"Transação {indice}: {exc}")
 
-    return OFXParseResult(transacoes=transacoes, total_blocos=len(blocos), erros=erros)
+    saldo, data_saldo = _saldo_declarado(conteudo)
+    return OFXParseResult(
+        transacoes=transacoes,
+        total_blocos=len(blocos),
+        erros=erros,
+        saldo_declarado=saldo,
+        data_saldo=data_saldo,
+    )
 
 
 def _parse_xml(conteudo: str) -> OFXParseResult:
@@ -111,7 +128,18 @@ def _parse_xml(conteudo: str) -> OFXParseResult:
             transacoes.append(_parse_bloco(bloco, ordem=indice))
         except (OFXParseError, ValueError) as exc:
             erros.append(f"Transação {indice}: {exc}")
-    return OFXParseResult(transacoes=transacoes, total_blocos=len(blocos), erros=erros)
+
+    # A leitura do saldo é por texto nos dois formatos: em XML o `<LEDGERBAL>`
+    # tem a mesma forma, e a busca por texto evita duplicar a regra de escolha
+    # (um único LEDGERBAL, ou nenhum) em dois lugares.
+    saldo, data_saldo = _saldo_declarado(conteudo)
+    return OFXParseResult(
+        transacoes=transacoes,
+        total_blocos=len(blocos),
+        erros=erros,
+        saldo_declarado=saldo,
+        data_saldo=data_saldo,
+    )
 
 
 def _get_tag(bloco: str, tag: str) -> str | None:
@@ -119,11 +147,89 @@ def _get_tag(bloco: str, tag: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _montar_historico(memo: str | None, name: str | None) -> str:
+    """Junta os DOIS campos de descrição do OFX, nessa ordem.
+
+    Antes daqui a regra era ``MEMO or NAME`` — e o NAME nunca era lido, porque
+    todo banco que preenche um preenche o outro. Nos extratos do Sicoob isso
+    custava a identidade do lançamento: o MEMO é o TIPO da operação, um
+    vocabulário fechado (``PIX EMITIDO OUTRA IF``, ``CRÉD.TED-STR``), e o NAME é
+    a contraparte (``Pagamento Pix 38.924.906 0001-75``, ``ARCELORMITTAL
+    GONVARRI BRASIL PR``). Medido nos seis extratos de jan–jun/2026: 2.101
+    lançamentos colapsavam em 17 a 28 textos por mês, e **1.103 deles (52,5%)
+    traziam CPF ou CNPJ dentro do NAME** — nenhum no MEMO. É por esse documento
+    que o NEO resolve contraparte, e ele era descartado na porta de entrada.
+
+    O MEMO vem PRIMEIRO de propósito: a estratégia de casamento por substring
+    procura o texto da regra dentro do histórico, então toda regra já cadastrada
+    pelo texto do MEMO continua casando. Inverter a ordem também funcionaria
+    para a substring, mas trocar o começo da linha muda o que o contador lê na
+    varredura da fila.
+    """
+    memo = re.sub(r"\s+", " ", (memo or "")).strip()
+    name = re.sub(r"\s+", " ", (name or "")).strip()
+    if not name:
+        return memo
+    if not memo:
+        return name
+    # Banco que repete a mesma informação nos dois campos não deve produzir
+    # histórico com o texto duplicado.
+    if name.casefold() in memo.casefold():
+        return memo
+    if memo.casefold() in name.casefold():
+        return name
+    return f"{memo} {name}"
+
+
+def _valor_monetario(bruto: str) -> Decimal:
+    """Decimal a partir do formato OFX padrão (``1500.00``) ou BR (``1.500,00``)."""
+    texto = bruto.strip()
+    if "," in texto and "." in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    else:
+        texto = texto.replace(",", ".")
+    valor = Decimal(texto)
+    if not valor.is_finite():
+        raise InvalidOperation
+    return valor
+
+
+def _saldo_declarado(conteudo: str) -> tuple[Decimal | None, date | None]:
+    """Saldo de fechamento do período, de ``<LEDGERBAL>``.
+
+    Deliberadamente NÃO lê ``<AVAILBAL>``: saldo disponível desconta limite e
+    bloqueio, então ele não fecha com a soma dos lançamentos e uma conferência
+    apoiada nele acusaria diferença em arquivo correto.
+
+    Arquivo com mais de um ``LEDGERBAL`` (vários extratos no mesmo envelope)
+    devolve nada, em vez de escolher um: aqui o valor serve de âncora para
+    conferir completude, e âncora escolhida no chute é pior que âncora nenhuma.
+    """
+    blocos = re.findall(
+        r"<LEDGERBAL>(.*?)(?=</LEDGERBAL>|<AVAILBAL>|</STMTRS>|$)",
+        conteudo,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if len(blocos) != 1:
+        return None, None
+
+    bruto = _get_tag(blocos[0], "BALAMT")
+    if not bruto:
+        return None, None
+    try:
+        saldo = _valor_monetario(bruto)
+    except InvalidOperation:
+        return None, None
+
+    dtasof = _get_tag(blocos[0], "DTASOF")
+    return saldo, _parse_data(dtasof) if dtasof else None
+
+
 def _parse_bloco(bloco: str, ordem: int | None = None) -> TransacaoOFX:
     fitid = _get_tag(bloco, "FITID")
     dtposted = _get_tag(bloco, "DTPOSTED")
     trnamt = _get_tag(bloco, "TRNAMT")
-    memo = _get_tag(bloco, "MEMO") or _get_tag(bloco, "NAME") or ""
+    memo = _montar_historico(_get_tag(bloco, "MEMO"), _get_tag(bloco, "NAME"))
     trntype = _get_tag(bloco, "TRNTYPE") or "OTHER"
 
     ausentes = [
@@ -134,15 +240,7 @@ def _parse_bloco(bloco: str, ordem: int | None = None) -> TransacaoOFX:
         raise OFXParseError(f"campo(s) obrigatório(s) ausente(s): {', '.join(ausentes)}")
 
     try:
-        # Formato OFX padrão: ponto decimal ("1500.00")
-        # Formato BR: separador de milhar ponto + decimal vírgula ("1.500,00")
-        if "," in trnamt and "." in trnamt:
-            trnamt = trnamt.replace(".", "").replace(",", ".")
-        else:
-            trnamt = trnamt.replace(",", ".")
-        valor = Decimal(trnamt)
-        if not valor.is_finite():
-            raise InvalidOperation
+        valor = _valor_monetario(trnamt)
     except InvalidOperation as exc:
         raise OFXParseError("valor TRNAMT inválido") from exc
 
