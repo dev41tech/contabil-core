@@ -29,9 +29,17 @@ CADA BANCO PONTUA DE UM JEITO
 A primeira versão exigia a barra do CNPJ canônico, e isso não é o que os bancos
 imprimem. O Sicoob escreve `81.450.538 0001-08`, com ESPAÇO no lugar da barra —
 e, nos seis extratos de jan–jun/2026 de uma conta só, isso era **661 CNPJs que
-o extrator achava zero**. Os padrões abaixo afrouxam os dois últimos separadores
-e mantêm os dois primeiros pontos obrigatórios; a nota junto de cada um explica
-por que essa é a linha certa entre abrangente e frouxo.
+o extrator achava zero**.
+
+A segunda versão trocou a barra por "os dois primeiros pontos são obrigatórios",
+e ainda era estreita: `41250201 0001-24` tem a raiz sem pontuação nenhuma e
+continuava de fora. Duas tentativas com a mesma forma de erro — descrever os
+formatos vistos até ali em vez da propriedade que os distingue.
+
+A que vale é a terceira: **todo separador é opcional, e basta que UM deles seja
+ponto, barra ou traço.** Não é onde o separador está, é qual ele é. Ponto, barra
+e traço aparecem porque alguém formatou um documento; espaço aparece entre dois
+números quaisquer, e por isso `12 345 678 9012 34` continua não sendo candidato.
 
 O QUE NUNCA VAI CASAR, E TUDO BEM
 
@@ -53,24 +61,37 @@ import re
 # pedaço de 14 dígitos de um número de 20 seja lido como CNPJ.
 _SEM_PONTUACAO = re.compile(r"(?<!\d)(\d{11}|\d{14})(?!\d)")
 
-# Os DOIS primeiros pontos são obrigatórios; os dois separadores seguintes, não.
+# Todo separador é opcional aqui; o que segura o padrão é a guarda logo abaixo.
 #
-# É o que torna o padrão abrangente sem torná-lo frouxo. Exigir os pontos
-# ancora o achado numa string que já se declara pontuada, e por isso um par de
-# números soltos separados por espaço (`12 345 678 9012 34`) não vira candidato.
-# Afrouxar só as duas últimas posições cobre o que os bancos realmente imprimem:
+# Os grupos, sim, têm tamanho fixo (2-3-3-4-2 e 3-3-3-2), então nenhum
+# afrouxamento deixa o padrão engolir um dígito a mais ou a menos. O que os
+# bancos deste escritório imprimem:
 #
 #     09.033.833/0001-23   canônico
 #     81.450.538 0001-08   Sicoob — espaço no lugar da barra
-#     09.033.833.0001-23   ponto no lugar da barra
-#     09.033.8330001-23    sem separador nenhum ali
-#
-# Os tamanhos dos grupos continuam fixos (2-3-3-4-2), então nenhum afrouxamento
-# de separador deixa o padrão engolir um dígito a mais ou a menos.
+#     41.250.201-0001-24   traço no lugar da barra
+#     41250201 0001-24     raiz sem pontuação, separador só no fim
+#     09.033.8330001-23    sem separador entre raiz e ordem
 _CNPJ_PONTUADO = re.compile(
-    r"(?<!\d)\d{2}\.\d{3}\.\d{3}[./\s-]?\d{4}[-./\s]?\d{2}(?!\d)"
+    r"(?<!\d)\d{2}\.?\d{3}\.?\d{3}[./\s-]?\d{4}[-./\s]?\d{2}(?!\d)"
 )
-_CPF_PONTUADO = re.compile(r"(?<!\d)\d{3}\.\d{3}\.\d{3}[-./\s]?\d{2}(?!\d)")
+_CPF_PONTUADO = re.compile(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}[-./\s]?\d{2}(?!\d)")
+
+# A guarda que substituiu "os dois pontos são obrigatórios".
+#
+# Exigir os pontos deixava de fora `41250201 0001-24` — raiz sem pontuação e
+# separador só nas duas últimas posições, que é uma das formas que o escritório
+# recebe. Mas largar a exigência inteira faria `12 345 678 9012 34` virar
+# candidato, e aí o padrão casaria qualquer fileira de números separados por
+# espaço.
+#
+# O que separa um do outro não é ONDE o separador está, é QUAL ele é: ponto,
+# barra ou traço aparecem porque alguém formatou um documento; espaço aparece
+# entre dois números quaisquer. Basta um separador forte em qualquer posição.
+#
+# Documento sem separador nenhum não passa por aqui e nem precisa: `_SEM_PONTUACAO`
+# já cobre a corrida crua de 11 ou 14 dígitos, com a mesma guarda de borda.
+_SEPARADOR_FORTE = re.compile(r"[./-]")
 
 
 def documentos_no_historico(historico: str | None) -> list[str]:
@@ -84,8 +105,13 @@ def documentos_no_historico(historico: str | None) -> list[str]:
 
     encontrados: list[str] = []
     for padrao in (_CNPJ_PONTUADO, _CPF_PONTUADO, _SEM_PONTUACAO):
+        exige_separador = padrao is not _SEM_PONTUACAO
         for achado in padrao.finditer(historico):
-            digitos = re.sub(r"\D", "", achado.group(0))
+            texto = achado.group(0)
+            if exige_separador and not _SEPARADOR_FORTE.search(texto):
+                # Só espaços entre os grupos: é fileira de números, não documento.
+                continue
+            digitos = re.sub(r"\D", "", texto)
             if digitos not in encontrados:
                 encontrados.append(digitos)
     return encontrados
