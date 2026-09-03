@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "contabil-front",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "C:/Users/nathan.carvalho/Documents/contabil-front"],
+      "port": 5173
+    }
+  ]
+}

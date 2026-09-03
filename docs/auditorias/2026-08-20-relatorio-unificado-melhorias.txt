@@ -1,0 +1,249 @@
+NOTA DE EXTRAÇÃO
+================
+Texto extraído de "Relatorio_Unificado_Melhorias_Sistema_TI.pdf" (14 páginas,
+atualizado em 20/08/2026) com pdfplumber.
+
+Extração limpa: zero caracteres perdidos, acentuação preservada. (O terminal
+que gerou este arquivo renderiza mal acento — o conteúdo do arquivo está
+correto em UTF-8.)
+
+O PDF original está ao lado: `2026-08-20-relatorio-unificado-melhorias.pdf`.
+
+
+
+===== PÁGINA 1 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+RELATÓRIO CONSOLIDADO
+Melhorias e ajustes no sistema
+Extrato Bancário • NEO • ConcilPro • Documentos • Configurações
+Objetivo do relatório
+Unificar todos os pontos levantados nos testes, retirar repetições e deixar as solicitações
+organizadas por assunto, mantendo próximas as mudanças que afetam a mesma parte do sistema.
+Agosto/2026
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 2 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+1. Resumo dos pontos levantados
+Este relatório reúne em um único documento todos os pontos levantados nos testes do sistema. Os assuntos
+foram agrupados por área e por relação entre as funcionalidades, para facilitar a análise e a execução das
+alterações pelo TI, evitando repetições e retrabalho.
+Área Tipo Resumo
+Busca e filtros gerais Correção / melhoria Busca por código da conta
+contábil, reimportação do Plano
+de Contas, filtros consistentes e
+colunas ajustáveis.
+Extrato Bancário Melhoria Filtros, paginação,
+leitura/importação do Sicredi e
+conferência de divergências de
+valor/saldo.
+NEO / Conciliação Correção / melhoria Filtros, visualização, prioridade da
+conciliação manual e classificação
+automática a partir de
+Contrapartes.
+Comprovantes Correção / melhoria Leitura incompleta em alguns arquivos,
+prevenção de duplicidade, salvar em
+lote, editar, excluir e melhorar a
+associação.
+Notas Fiscais Melhoria Filtro por valor, visualização da NF e
+identificação clara de entrada/compra e
+saída/venda.
+Cartão de Crédito Melhoria Excluir fatura, vincular pagamentos
+automaticamente e exportar os dados.
+Aplicações Financeiras Melhoria Leitura de extratos de aplicação para
+auxiliar a identificação e conferência.
+Configurações / exclusões Correção / melhoria Permitir excluir regras, agências e
+outros registros indicados nos
+testes.
+ConcilPro Correção / melhoria Navegação entre empresas,
+melhor visualização e
+reconhecimento/vinculação dos
+pagamentos de fornecedores.
+Ponto que aparece em mais de uma tela
+A busca pelo número/código da conta contábil não está funcionando de forma adequada. Como esse ponto
+aparece no NEO, no Plano de Contas e em outros filtros, o ideal é tratar a busca por código como um ajuste
+geral do sistema.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 3 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+2. Busca e filtros gerais do sistema
+2.1 Busca pela conta contábil
+Situação encontrada
+Em vários pontos, a conta está sendo localizada pela classificação, mas a busca pelo número/código da conta
+contábil não retorna o resultado esperado.
+• Permitir a busca pelo número/código da conta contábil nos filtros do sistema.
+• Manter a identificação da classificação e descrição da conta para facilitar a conferência.
+• Aplicar o mesmo comportamento de busca onde houver seleção de conta contábil, evitando diferenças
+entre as telas.
+Exemplo do campo atual de seleção de conta e referência do cadastro que apresenta o código da conta.
+No Plano de Contas, a busca pelo número da conta também foi apontada como não funcional.
+2.2 Reimportação do Plano de Contas
+• Ao reimportar o Plano de Contas, a leitura das contas está vindo incorretamente.
+• Não e possível excluir contas que tem lançamentos ou regras
+• O problema se repete em várias contas. Nos testes foram identificados, entre outros, os números 16, 17,
+21, 22, 27, 49 ,64 e outros.
+• Algumas contas estão sendo classificadas incorretamente como despesas.
+• Na reimportação, as contas existentes não estão sendo sobrescritas/atualizadas corretamente.
+• O filtro utilizado nessa área também não está funcionando conforme o esperado.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 4 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Exemplos do Plano de Contas após a reimportação, com divergências na leitura e classificação das contas.
+2.3 Colunas e visualização
+• Permitir ampliar/reduzir a largura das colunas para facilitar a leitura, de forma semelhante ao Excel.
+• Nos locais em que a tabela possui muitas informações, permitir ajustar a visualização sem perder os
+dados necessários para a conferência.
+3. Extrato Bancário
+3.1 Filtros e visualização
+Manter
+Manter os filtros atuais de empresa, agência, status e período.
+• Criar filtro na área de transações com: Data, Histórico do Banco, Valor, Saldo, D/C e Status.
+• Permitir ajustar/arrastar as colunas para facilitar a visualização.
+• Permitir escolher a quantidade de lançamentos exibidos por página, em vez de ficar limitado à
+visualização padrão de 20 registros.
+Tela atual do Extrato Bancário e lista de transações usada como referência para os filtros.
+Exemplo da paginação atual, que limita a quantidade de registros exibidos.
+3.2 Leitura/importação do extrato Sicredi
+• O sistema não está lendo corretamente o extrato do banco Sicredi utilizado no teste.
+• Arquivo utilizado no teste: J:\SINCOPEÇAS - SINDICATO DO COMERCIO VAREJISTA,
+ATACADISTA\CONTABIL\EXTRATOS\2026\07.2026
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 5 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Tela do Extrato Bancário durante o teste de leitura/importação do arquivo do Sicredi.
+3.3 Divergência de valores no Extrato Bancário
+• Foram encontrados valores no Extrato Bancário que estão divergentes dos valores apresentados na tela
+de extratos do sistema.
+• Exemplo - No extrato bancário, o valor de R$ 84.906,12 corresponde a uma aplicação. Entretanto, no
+sistema, esse mesmo valor está sendo apresentado como tarifa, indicando que o sistema está
+interpretando o saldo da movimentação como se fosse o valor da transação.
+Comparação entre o extrato bancário original e o lançamento apresentado no sistema.
+Comparação entre o extrato bancário original e o lançamento apresentado no sistema
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 6 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+4. NEO - Caixa de classificação e conciliação
+4.1 Filtros e consulta
+• Incluir filtros por Data, Histórico do Banco, Valor mínimo, Valor máximo, D/C, Histórico contábil, Motivo e
+Ação/Editar.
+• Facilitar a localização de lançamentos para conferência e conciliação, tanto nas pendências quanto nos
+classificados.
+Sugestão apresentada nos testes para ampliar os filtros das transações classificadas.
+4.2 Visualização do que está sendo classificado
+• Mostrar de forma clara qual lançamento está sendo classificado, por exemplo: Data | Histórico | Valor |
+Ação de classificar.
+• Quando aparecer o histórico conciliado, ao passar o mouse deve ser possível consultar o histórico
+bancário original para conferência.
+• Manter a opção de conciliação diretamente no lançamento.
+Exemplo do agrupamento atual e sugestão para deixar a classificação mais visível por lançamento.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 7 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+4.3 Conciliação manual
+Regra importante
+A conciliação manual deve ter prioridade sobre as automáticas. Na conciliação manual, deve ser possível
+alterar o histórico e a conta contábil antes de concluir.
+• Manter a separação entre Pendentes e Classificadas, pois a divisão foi considerada positiva.
+• Criar uma área/aba específica para a conciliação, evitando que a conciliação fique misturada com a
+simples visualização dos classificados.
+• Criar um local mais simples para alocar pagamentos que não foram identificados corretamente,
+facilitando entender do que se trata antes de classificar.
+• Manter a ideia de agrupar lançamentos com nomes/históricos semelhantes, pois isso facilita o tratamento
+em lote.
+Visão atual do NEO com agrupamento por histórico.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 8 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Exemplo de lançamento que precisa de melhor identificação antes da classificação.
+Agrupamento de lançamentos semelhantes: recurso considerado útil nos testes.
+4.4 Contrapartes e classificação automática de fornecedores
+• Os fornecedores cadastrados em Contrapartes não estão sendo classificados automaticamente no NEO
+conforme a conta contábil vinculada ao cadastro.
+• No teste apresentado, o fornecedor consta cadastrado em Contrapartes, mas o lançamento continua
+aparecendo no NEO sem a classificação automática esperada.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 9 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Fornecedor cadastrado em Contrapartes e lançamento correspondente ainda apresentado no NEO.
+4.5 Ponto para confirmar com o TI
+Dúvida
+Na conciliação, o sistema considera apenas os movimentos dos bancos ou também utiliza os dados do razão
+contábil?
+5. ConcilPro
+5.1 Navegação e visualização
+• Na seleção de empresa, permitir navegar/rolar a lista com facilidade para localizar a empresa desejada.
+• Avaliar uma visualização de conciliação semelhante à referência utilizada no Mister, principalmente para
+facilitar a identificação e alocação dos pagamentos.
+Referência de conciliação utilizada no Mister e apresentada como inspiração.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 10 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Na lista de empresas do ConcilPro, foi apontada dificuldade para navegar/arrastar a relação durante a consulta.
+5.2 Reconhecimento e vinculação de pagamentos
+• O ConcilPro não está reconhecendo corretamente alguns pagamentos de fornecedores realizados pelo
+banco.
+• No teste com o fornecedor Unimed Curitiba, os pagamentos constam no extrato bancário, porém não
+foram vinculados automaticamente ao fornecedor no ConcilPro.
+Tela do ConcilPro utilizada no teste de reconhecimento dos pagamentos.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 11 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Comparação entre as compras pendentes da Unimed Curitiba e os pagamentos identificados no extrato bancário.
+6. Comprovantes
+Situação encontrada
+Os comprovantes estão sendo lidos, porém alguns arquivos não são interpretados por completo.
+• Criar uma função para impedir comprovantes duplicados, com opção de habilitar ou desabilitar essa
+verificação.
+• Ao importar vários comprovantes, permitir salvar/processar em lote, sem precisar confirmar um por um
+manualmente.
+• Permitir editar e excluir comprovantes já cadastrados.
+• Melhorar a associação do comprovante com o pagamento. Hoje a busca automática considera valores
+correspondentes e o mesmo histórico; seria importante também ter uma busca manual para localizar e
+vincular o pagamento correto.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 12 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Tela de associação do comprovante com uma transação.
+7. Notas Fiscais
+• Criar filtro por valor.
+• Permitir visualizar a nota fiscal diretamente na tela de consulta.
+• Identificar de forma clara se a NF é de entrada (compra) ou de saída (venda).
+Tela atual de Notas Fiscais usada como referência para os filtros e identificação do tipo da nota.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 13 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+8. Cartão de Crédito
+• Criar função para excluir uma fatura cadastrada.
+• Melhorar a vinculação automática das compras do cartão com fornecedores e demais pagamentos
+relacionados.
+• Criar uma forma de exportar os lançamentos/documentos do cartão.
+• Na exportação e vinculação, utilizar as informações disponíveis nas notas fiscais e os históricos
+padronizados.
+Tela atual das faturas de cartão de crédito.
+9. Aplicações Financeiras
+• Criar uma leitura das aplicações financeiras para auxiliar a identificação e a conferência.
+• A leitura pode considerar o extrato de aplicação e, quando a aplicação aparecer no próprio extrato
+bancário, utilizar essas informações no processo de identificação.
+10. Configurações e funções de exclusão
+Situação encontrada
+Não foi identificado um local para excluir regras já cadastradas.
+• Criar função para excluir regras e agências.
+• Também foi solicitada possibilidade de exclusão para razão, comprovantes e extratos, além dos demais
+registros citados nos testes.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026
+
+===== PÁGINA 14 =====
+RELATÓRIO DE MELHORIAS DO SISTEMA
+Tela de Configurações / Regras NEO, onde foi apontada a falta de uma opção de exclusão.
+Relatório consolidado • Agosto/2026 | Atualizado em 20/08/2026

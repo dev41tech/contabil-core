@@ -176,3 +176,53 @@ def test_cadastro_e_extrato_se_encontram_em_qualquer_formatacao(
     ).documento
 
     assert documentos_no_historico(como_o_banco_imprimiu) == [cadastrado]
+
+
+# ── Terceira volta: o que separa documento de fileira de números é QUAL separador
+
+@pytest.mark.parametrize(
+    "historico,esperado",
+    [
+        # Os três formatos que o escritório relatou em 02/09, depois de a
+        # segunda versão ainda deixar um de fora.
+        ("PIX 41.250.201 0001-24 FORNECEDOR", ["41250201000124"]),
+        ("PIX 41250201 0001-24 FORNECEDOR", ["41250201000124"]),
+        ("PIX 41.250.201-0001-24 FORNECEDOR", ["41250201000124"]),
+        # O que já passava, e não pode regredir.
+        ("PIX 41.250.201/0001-24 FORNECEDOR", ["41250201000124"]),
+        ("PIX 41250201000124 FORNECEDOR", ["41250201000124"]),
+        ("PIX 41.250.201.0001-24 FORNECEDOR", ["41250201000124"]),
+        ("PIX 41250201/0001-24 FORNECEDOR", ["41250201000124"]),
+        # CPF com a raiz sem pontuação.
+        ("TED 123456789-01 JOAO", ["12345678901"]),
+    ],
+)
+def test_basta_um_separador_forte_em_qualquer_posicao(historico, esperado):
+    """Ponto, barra ou traço marcam documento formatado — em qualquer posição.
+
+    As duas primeiras versões deste módulo descreveram os formatos que tinham
+    sido vistos (primeiro a barra, depois os dois pontos) em vez da propriedade
+    que os distingue, e cada uma deixou de fora o formato seguinte que apareceu.
+    """
+    assert documentos_no_historico(historico) == esperado
+
+
+@pytest.mark.parametrize(
+    "historico",
+    [
+        # Espaço é o separador que aparece entre dois números QUAISQUER, e por
+        # isso sozinho não basta. Sem esta guarda o padrão casaria qualquer
+        # fileira de números da linha do extrato.
+        "DOC 12 345 678 9012 34 REF",
+        "TRANSF 09 033 833 0001 23",
+        "SALDO 12345678 9012 34 REF",
+        # Valor monetário: a vírgula decimal quebra o padrão.
+        "TARIFA 12.345.678,90 COBRADA",
+        # Data com pontos seguida de número: os grupos não fecham em 2-3-3-4-2.
+        "EM 01.02.2026 VALOR 1234-56 REF",
+        # Corrida máxima: um pedaço de 14 dígitos de um número de 20 não é CNPJ.
+        "CREDITO LIBERACAO JUDICIAL 50628121920254047000",
+    ],
+)
+def test_espaco_sozinho_nao_faz_documento(historico):
+    assert documentos_no_historico(historico) == []
