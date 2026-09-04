@@ -34,16 +34,20 @@ from src.domain.extrato.bancos import (
     c6,
     caixa,
     cresol,
+    daycoval,
     fitbank,
     grafeno,
     inter,
     itau,
     mercadopago,
     nubank,
+    safra,
     santander,
     sicoob,
     sicredi,
     stone,
+    unicred,
+    viacredi,
 )
 
 ADAPTADORES: tuple[ModuleType, ...] = (
@@ -53,16 +57,20 @@ ADAPTADORES: tuple[ModuleType, ...] = (
     c6,
     caixa,
     cresol,
+    daycoval,
     fitbank,
     grafeno,
     inter,
     itau,
     mercadopago,
     nubank,
+    safra,
     santander,
     sicoob,
     sicredi,
     stone,
+    unicred,
+    viacredi,
 )
 
 
