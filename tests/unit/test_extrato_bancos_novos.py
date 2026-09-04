@@ -26,7 +26,15 @@ from datetime import date
 from decimal import Decimal
 
 from src.domain.extrato import bancos
-from src.domain.extrato.bancos import daycoval, safra, sicredi, unicred, viacredi
+from src.domain.extrato.bancos import (
+    cora,
+    daycoval,
+    iugu,
+    safra,
+    sicredi,
+    unicred,
+    viacredi,
+)
 
 # ─────────────────────────────────────────────────────────────────── Viacredi
 
@@ -440,3 +448,176 @@ def test_sicredi_aceita_a_abertura_escrita_so_como_saldo():
     (bloco,) = sicredi._extrair_valor_e_saldo(linhas, 2025)
 
     assert bloco.saldo_anterior == Decimal("1000.00")
+
+
+# ─────────────────────────────────────────────── Transpocred: mesmo layout Ailos
+
+_TRANSPOCRED = """\
+Emitido em 12/05/2026 às 12:08:08
+EXTRATO
+Período 01/01/2025 a 31/01/2025
+Nome: EXEMPLO GUINCHOS LTDA
+Cooperativa: TRANSPOCRED | Banco: 085 | Agência: 0108-2 | Conta: 273953
+DATA DESCRIÇÃO DOCUMENTO CRÉDITO (R$) DÉBITO (R$) SALDO (R$)
+SALDO ANTERIOR 1.000,00
+02/01/2025 CREDITO PIX - ALFA MARIA 548470.357 425,00 1.425,00
+02/01/2025 PIX TRANSF PAGADOR 548478.757 -1,00 1.424,00
+TOTAL 425,00 -1,00 1.424,00
+""".splitlines()
+
+
+def test_transpocred_usa_o_mesmo_adaptador_do_viacredi():
+    """São duas singulares do MESMO sistema (Ailos, banco 085).
+
+    O relatório é idêntico — muda só o nome depois de "Cooperativa:". Ancorar a
+    assinatura no código do banco e não no nome faz a terceira singular que
+    aparecer entrar sozinha, em vez de virar mais uma cópia do mesmo módulo.
+    """
+    assert viacredi.reconhece(_TRANSPOCRED) is True
+    assert bancos.por_conteudo(_TRANSPOCRED) is viacredi
+
+    (bloco,) = viacredi.extrair(_TRANSPOCRED, 2025)
+    assert [t.valor for t in bloco.transacoes] == [Decimal("425.00"), Decimal("-1.00")]
+
+
+# ─────────────────────────────────────────────────────────────────────── Cora
+
+_CORA = """\
+EXEMPLO PET
+CNPJ 00.000.000/0001-00
+Agência: 0001 - Conta: 1304099-4
+Extrato do período 01/12/2025 a 31/12/2025
+Saldo inicial disponível R$ 100,00
+Total de entradas + R$ 300,00
+Total de saídas - R$ 250,00
+Saldo final disponível R$ 150,00
+Transações
+29/12/2025 Saldo do dia R$ 150,00
+Pagamento recebido Alfa - Joinville 00.000.000/0001-25 + R$ 200,00
+28/12/2025 Saldo do dia R$ -50,00
+Transf Pix enviada BETA COMER… 00.000.000/0001-63 - R$ 250,00
+27/12/2025 Saldo do dia R$ 200,00
+Pagamento recebido Gama - Taquari… 00.000.000/0001-71 + R$ 100,00
+Cora SCFI - CNPJ 37.880.206/0001-63
+Extrato gerado no dia 07/01/2026 às 15:05 pág 1 de 2
+""".splitlines()
+
+
+def test_cora_reconhece_pela_instituicao_mais_o_saldo_do_dia():
+    assert cora.reconhece(_CORA) is True
+    assert bancos.por_conteudo(_CORA) is cora
+
+
+def test_cora_o_lancamento_herda_a_data_do_cabecalho_do_dia():
+    """Só o cabeçalho tem data; o lançamento abaixo dele não tem nenhuma."""
+    (bloco,) = cora.extrair(_CORA, 2025)
+
+    assert [t.data for t in bloco.transacoes] == [
+        date(2025, 12, 27),
+        date(2025, 12, 28),
+        date(2025, 12, 29),
+    ]
+
+
+def test_cora_o_saldo_do_dia_e_fechamento_e_a_lista_e_decrescente():
+    """Ancorar no primeiro lançamento abaixo do cabeçalho desloca a cadeia.
+
+    27/12 fecha em 200,00; 28/12 tem um débito de 250,00 e fecha em −50,00;
+    29/12 tem um crédito de 200,00 e fecha em 150,00. Só lendo do dia mais
+    antigo para o mais recente a conta fecha.
+    """
+    (bloco,) = cora.extrair(_CORA, 2025)
+
+    assert [t.saldo_apos for t in bloco.transacoes] == [
+        Decimal("200.00"),
+        Decimal("-50.00"),
+        Decimal("150.00"),
+    ]
+
+
+def test_cora_saldo_do_dia_negativo_e_lido():
+    (bloco,) = cora.extrair(_CORA, 2025)
+
+    assert bloco.transacoes[1].saldo_apos == Decimal("-50.00")
+
+
+def test_cora_o_rodape_nao_vira_lancamento():
+    """`Cora SCFI - CNPJ 37.880.206/0001-63` não tem valor, mas o rodapé com
+    "pág 1 de 2" se repete em toda página e não pode entrar na conta."""
+    (bloco,) = cora.extrair(_CORA, 2025)
+
+    assert len(bloco.transacoes) == 3
+    assert all("Cora SCFI" not in t.historico for t in bloco.transacoes)
+
+
+# ─────────────────────────────────────────────────────────────────────── Iugu
+
+_IUGU = """\
+Extrato Conta Azú
+Saldo anterior R$ 100,00
+01/04/2026 a 30/04/2026
+Total de entradas R$ 500,00
+Total de saídas R$ 300,00
+Iugu Instituição de Pagamento SA | Ag. 0002 | C/C. 5499342 | 00.000.000/0001-80
+Saldo final R$ 300,00
+Data Descrição do lançamento bancário Conciliação bancária Valor Saldo
+01/04/2026 Saldo do dia R$ 400,00
+01/04/2026 Recebimento por PIX de ALFA COMUNICACAO ✓ Conciliado R$ 500,00
+01/04/2026 Pagamento por PIX para Beta Servicos ✓ Conciliado - R$ 200,00
+02/04/2026 Saldo do dia R$ 300,00
+02/04/2026 Pagamento de Boleto para Nome não encontrado Conciliado - R$ 100,00
+30/04/2026 Saldo final R$ 300,00
+RCI - EXEMPLO LTDA - Página 49 de 49
+""".splitlines()
+
+
+def test_iugu_reconhece_pela_instituicao():
+    assert iugu.reconhece(_IUGU) is True
+    assert bancos.por_conteudo(_IUGU) is iugu
+
+
+def test_iugu_o_saldo_do_dia_e_fechamento_com_a_lista_crescente():
+    """Cora e Iugu abrem o dia com o fechamento, mas em ordens opostas.
+
+    Aqui os lançamentos abaixo do cabeçalho vão do primeiro ao último, então o
+    saldo pertence ao ÚLTIMO sem inverter nada. Copiar a inversão da Cora
+    ancoraria na ponta errada — e as duas formas parecem iguais no arquivo.
+    """
+    (bloco,) = iugu.extrair(_IUGU, 2026)
+
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("500.00"),
+        Decimal("-200.00"),
+        Decimal("-100.00"),
+    ]
+    assert bloco.transacoes[0].saldo_apos is None
+    assert bloco.transacoes[1].saldo_apos == Decimal("400.00")
+    assert bloco.transacoes[2].saldo_apos == Decimal("300.00")
+
+
+def test_iugu_a_linha_de_saldo_final_nao_e_lancamento():
+    """`30/04/2026 Saldo final R$ 300,00` tem a forma exata de um crédito.
+
+    Sem reconhecê-la à parte, o extrato ganhava um crédito fantasma e fechava
+    com o dobro do saldo final. Mesma família da linha de rodapé do Itaú que
+    entrou como crédito de R$ 19.070,30 em agosto.
+    """
+    (bloco,) = iugu.extrair(_IUGU, 2026)
+
+    assert len(bloco.transacoes) == 3
+    assert all("Saldo final" not in t.historico for t in bloco.transacoes)
+    assert bloco.saldo_final == Decimal("300.00")
+
+
+def test_iugu_o_status_de_conciliacao_sai_do_historico():
+    """`✓ Conciliado` é coluna própria, não parte do nome da contraparte."""
+    (bloco,) = iugu.extrair(_IUGU, 2026)
+
+    assert bloco.transacoes[0].historico == "Recebimento por PIX de ALFA COMUNICACAO"
+    assert all("onciliad" not in t.historico for t in bloco.transacoes)
+
+
+def test_iugu_a_cadeia_fecha_com_o_saldo_final_declarado():
+    (bloco,) = iugu.extrair(_IUGU, 2026)
+
+    assert Decimal("100.00") + sum(t.valor for t in bloco.transacoes) == bloco.saldo_final

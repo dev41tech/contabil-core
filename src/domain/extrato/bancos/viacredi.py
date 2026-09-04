@@ -1,4 +1,4 @@
-"""Extrato da Viacredi (cooperativa do sistema Ailos, banco 085).
+"""Extrato das cooperativas do sistema Ailos (banco 085) — Viacredi, Transpocred.
 
 O layout é o mais direto desta base — uma linha por lançamento, com o saldo
 corrente na ponta:
@@ -41,7 +41,7 @@ from decimal import Decimal
 from src.domain.extrato._comum import Bloco, gerar_fitid, parse_data, parse_valor
 from src.domain.extrato.ofx_parser import TransacaoOFX
 
-SIGLAS = frozenset({"VIACREDI", "AILOS", "085"})
+SIGLAS = frozenset({"VIACREDI", "TRANSPOCRED", "AILOS", "085"})
 
 _DATA = r"\d{2}/\d{2}/\d{4}"
 _VALOR = r"-?\d{1,3}(?:\.\d{3})*,\d{2}"
@@ -52,11 +52,21 @@ _LINHA = re.compile(rf"^({_DATA})\s+(.+?)\s+({_VALOR})\s+({_VALOR})\s*$")
 
 _SALDO_ANTERIOR = re.compile(rf"^SALDO\s+ANTERIOR\s+({_VALOR})\s*$", re.IGNORECASE)
 
-# A assinatura é a linha de identificação da cooperativa. "Cooperativa:" sozinho
-# não serve — a Unicred e o Sicredi também a imprimem, com outro layout de
-# colunas; o que identifica é o nome do sistema junto do código do banco.
+# UM LAYOUT, VÁRIAS COOPERATIVAS
+#
+# Viacredi e Transpocred emitem o MESMO relatório — mesmo cabeçalho de colunas,
+# mesma linha `SALDO ANTERIOR`, mesma `TOTAL` no fim. Muda só o nome depois de
+# "Cooperativa:". São duas singulares do mesmo sistema (Ailos), e o extrato sai
+# do mesmo emissor.
+#
+# Por isso a assinatura ancora no `Banco: 085` — o código do sistema — e não no
+# nome. Um adaptador por cooperativa seria o mesmo código copiado, e a terceira
+# singular que aparecer entraria sozinha.
+#
+# "Cooperativa:" sozinho não serve: Unicred e Sicredi também a imprimem, com
+# outro layout de colunas.
 _ASSINATURA = re.compile(
-    r"Cooperativa:\s*VIACREDI|VIACREDI\s*\|\s*Banco:\s*085", re.IGNORECASE
+    r"Cooperativa:\s*\w+\s*\|\s*Banco:\s*085", re.IGNORECASE
 )
 
 _IGNORAR = re.compile(
