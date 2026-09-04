@@ -26,7 +26,7 @@ from datetime import date
 from decimal import Decimal
 
 from src.domain.extrato import bancos
-from src.domain.extrato.bancos import daycoval, safra, unicred, viacredi
+from src.domain.extrato.bancos import daycoval, safra, sicredi, unicred, viacredi
 
 # ─────────────────────────────────────────────────────────────────── Viacredi
 
@@ -326,3 +326,117 @@ def test_unicred_nao_ancora_no_saldo_do_cabecalho():
 
     assert bloco.saldo_anterior is None
     assert all(t.saldo_apos is not None for t in bloco.transacoes)
+
+
+# ─────────────────────────── Sicredi, segundo layout: valor com sinal + saldo
+
+_SICREDI_VALOR_SALDO = """\
+Associado: EXEMPLO COSMETICOS LTDA ME
+Cooperativa: 0752
+Conta: 18535-3
+Extrato (Período de 01/12/2025 a 31/12/2025)
+Data Descrição Documento Valor (R$) Saldo (R$)
+SALDO ANTERIOR 1.000,00
+01/12/2025 RECEBIMENTO PIX 00000000000 Alfa da Silva PIX_CRED 50,00 1.050,00
+01/12/2025 LIQUIDACAO BOLETO 00000000000100 BETA DISTRIB -200,00 850,00
+PAGAMENTO PIX 00000000000 GAMA COMERCIO DE
+02/12/2025 PIX_DEB -100,00 750,00
+PECAS LTDA
+02/12/2025 -50,00 700,00
+Lançamentos Futuros (Próximos 30 dias)
+Data Descrição Valor (R$)
+25/01/2026 CESTA EMPRESARIAL 02 -67,30
+Sicredi Fone 3003 4770 (Capitais e Regiões Metropolitanas)
+""".splitlines()
+
+
+def test_sicredi_le_o_layout_de_valor_com_sinal():
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+
+    assert len(bloco.transacoes) == 4
+    assert bloco.saldo_anterior == Decimal("1000.00")
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("50.00"),
+        Decimal("-200.00"),
+        Decimal("-100.00"),
+        Decimal("-50.00"),
+    ]
+
+
+def test_sicredi_para_nos_lancamentos_futuros():
+    """`Lançamentos Futuros` lista débitos AGENDADOS, que ainda não ocorreram.
+
+    É o que recusava 23 dos 38 arquivos deste layout: a seção não tem coluna de
+    saldo, então lê-la quebrava a cadeia e derrubava o extrato inteiro.
+
+    A recusa escondia o defeito pior. Sem a cadeia, `25/01/2026 CESTA
+    EMPRESARIAL 02 -67,30` entraria no razão como movimento realizado — um
+    débito futuro contabilizado hoje.
+    """
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+
+    assert all(t.data.year == 2025 for t in bloco.transacoes)
+    assert all("CESTA EMPRESARIAL" not in t.historico for t in bloco.transacoes)
+
+
+def test_sicredi_a_cadeia_fecha_com_o_saldo_de_abertura():
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+
+    esperado = bloco.saldo_anterior + sum(t.valor for t in bloco.transacoes)
+    assert esperado == bloco.transacoes[-1].saldo_apos
+
+
+def test_sicredi_descricao_quebrada_e_remontada_com_o_documento_no_fim():
+    """Descrição longa vira três linhas, e o meio guarda só o documento.
+
+    `PIX_DEB` sozinho não identifica ninguém — o nome da contraparte está nas
+    linhas de cima e de baixo, e é ele que o NEO usa para classificar.
+
+    A ordem remontada reproduz a da linha que cabe inteira: descrição primeiro,
+    documento no fim (`... Alfa da Silva PIX_CRED`). Assim os dois casos
+    produzem a mesma forma de histórico.
+    """
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+    pix = bloco.transacoes[2]
+
+    assert pix.historico == (
+        "PAGAMENTO PIX 00000000000 GAMA COMERCIO DE PECAS LTDA PIX_DEB"
+    )
+
+
+def test_sicredi_nao_rouba_o_texto_solto_do_vizinho():
+    """Colar SEMPRE erraria: a quebra de um lançamento é adjacente ao seguinte.
+
+    O lançamento com descrição própria na linha não pode absorver o "PECAS
+    LTDA" que pertence ao de cima.
+    """
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+    seguinte = bloco.transacoes[3]
+
+    assert "PECAS LTDA" not in seguinte.historico
+    # E o cabeçalho da seção de agendados não é nome de contraparte.
+    assert "Futuros" not in seguinte.historico
+
+
+def test_sicredi_linha_sem_descricao_nenhuma_ainda_e_lancamento():
+    """`02/12/2025 -50,00 700,00` — só data, valor e saldo.
+
+    Exigir ao menos um caractere de descrição descartava esses lançamentos, e o
+    extrato fechava com linhas a menos e a cadeia quebrada.
+    """
+    (bloco,) = sicredi._extrair_valor_e_saldo(_SICREDI_VALOR_SALDO, 2025)
+
+    assert bloco.transacoes[3].valor == Decimal("-50.00")
+    assert bloco.transacoes[3].saldo_apos == Decimal("700.00")
+
+
+def test_sicredi_aceita_a_abertura_escrita_so_como_saldo():
+    """Há duas formas na base: `SALDO ANTERIOR 1.000,00` e `SALDO 1.000,00`."""
+    linhas = [
+        ln.replace("SALDO ANTERIOR 1.000,00", "SALDO 1.000,00")
+        for ln in _SICREDI_VALOR_SALDO
+    ]
+
+    (bloco,) = sicredi._extrair_valor_e_saldo(linhas, 2025)
+
+    assert bloco.saldo_anterior == Decimal("1000.00")
