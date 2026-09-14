@@ -400,15 +400,18 @@ async def test_content_type_segue_a_extensao(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
     csrf = await _login(client, tenant, usuario)
-    conteudo = base64.b64encode(b"\x89PNG fake").decode()
 
-    for nome, esperado in [
+    # Um arquivo e um valor por volta: o mesmo arquivo três vezes é, desde
+    # 14/09/2026, o mesmo comprovante reenviado — e é recusado.
+    for valor, (nome, esperado) in enumerate([
         ("recibo.png", "image/png"),
         ("recibo.jpg", "image/jpeg"),
         ("recibo.desconhecido", "application/octet-stream"),
-    ]:
+    ], start=1):
+        conteudo = base64.b64encode(b"\x89PNG fake " + nome.encode()).decode()
         criado = await _criar(
-            client, empresa, csrf, arquivo_nome=nome, arquivo_base64=conteudo
+            client, empresa, csrf, arquivo_nome=nome, arquivo_base64=conteudo,
+            valor_pago=valor * 100,
         )
         r = await client.get(_url(empresa.id, f"/{criado['id']}/arquivo"))
         assert r.headers["content-type"] == esperado, nome
@@ -558,6 +561,32 @@ async def test_extrair_pdf_aceita_arquivo_reconhecido_pela_assinatura(
 
 
 @pytest.mark.asyncio
+async def test_extrair_pdf_de_nota_fiscal_recusa_com_codigo_proprio(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    """A tela precisa distinguir "é nota" de "não consegui ler".
+
+    A falha comum diz "preencha manualmente" — e preencher à mão a NFS-e é como
+    ela entrava na lista. Com o código, a fila pula o arquivo.
+    """
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    def _nota(conteudo: bytes):
+        raise pdf_parser_module.DocumentoNaoEComprovanteError(
+            pdf_parser_module.MENSAGEM_NOTA_FISCAL
+        )
+
+    monkeypatch.setattr(pdf_parser_module, "parse_pdf", _nota)
+
+    csrf = await _login(client, tenant, usuario)
+    r = await _extrair_pdf(client, empresa, csrf)
+
+    assert r.status_code == 422
+    assert r.json()["error"] == "DOCUMENTO_NAO_E_COMPROVANTE"
+    assert "nota fiscal" in r.json()["message"]
+
+
+@pytest.mark.asyncio
 async def test_extrair_pdf_rejeita_formato_que_nao_e_comprovante(
     client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
 ):
@@ -570,3 +599,212 @@ async def test_extrair_pdf_rejeita_formato_que_nao_e_comprovante(
     )
     assert r.status_code == 422
     assert "Formato não suportado" in r.json()["message"]
+
+
+# ── duplicidade ─────────────────────────────────────────────────────────────
+#
+# Relato de 2026-09-14 (UNIQUE MOMENT EVENTOS LTDA): reenviar os arquivos criava
+# um segundo registro para cada comprovante. Além da lista poluída, o NEO só
+# associa sozinho quando há EXATAMENTE um candidato — com o duplicado, a
+# associação automática parava em silêncio para esses pagamentos.
+
+_ARQUIVO_PIX = b"%PDF-1.4 comprovante pix da maria"
+
+
+def _b64(conteudo: bytes) -> str:
+    return base64.b64encode(conteudo).decode()
+
+
+@pytest.mark.asyncio
+async def test_o_mesmo_arquivo_reenviado_e_recusado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    primeiro = await _criar(
+        client, empresa, csrf, arquivo_nome="pix.pdf", arquivo_base64=_b64(_ARQUIVO_PIX)
+    )
+
+    r = await client.post(
+        _url(empresa.id),
+        json={
+            "favorecido": "OUTRO NOME DIGITADO",
+            "valor_pago": 999,
+            "arquivo_nome": "pix (1).pdf",
+            "arquivo_base64": _b64(_ARQUIVO_PIX),
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 409
+    corpo = r.json()
+    assert corpo["error"] == "COMPROVANTE_JA_IMPORTADO"
+    # O contador precisa reconhecer QUAL registro já existe.
+    assert corpo["details"]["comprovante_id"] == primeiro["id"]
+    assert "R$ 1.500,00" in corpo["message"]
+    assert (await client.get(_url(empresa.id))).json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_o_mesmo_arquivo_com_base64_quebrado_em_linhas_e_o_mesmo_comprovante(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """O hash é dos bytes, não do texto: outro cliente pode quebrar o base64."""
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+
+    inteiro = _b64(_ARQUIVO_PIX)
+    quebrado = "\n".join(inteiro[i:i + 8] for i in range(0, len(inteiro), 8))
+    assert quebrado != inteiro
+    r = await client.post(
+        _url(empresa.id),
+        json={"valor_pago": 10, "arquivo_base64": quebrado},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 409
+    assert r.json()["error"] == "COMPROVANTE_JA_IMPORTADO"
+
+
+@pytest.mark.asyncio
+async def test_confirmar_duplicado_nao_libera_o_mesmo_arquivo(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """A confirmação existe para dois pagamentos distintos, não para o mesmo PDF."""
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+
+    r = await client.post(
+        _url(empresa.id),
+        json={"valor_pago": 1_500, "arquivo_base64": _b64(_ARQUIVO_PIX),
+              "permitir_duplicado": True},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_mesmo_pagamento_com_outro_arquivo_pede_confirmacao(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """O mesmo comprovante baixado de novo do app sai com bytes diferentes.
+
+    Documento formatado de outro jeito não pode esconder a repetição.
+    """
+    csrf = await _login(client, tenant, usuario)
+    await _criar(
+        client, empresa, csrf,
+        cpf_cnpj="12.345.678/0001-95", arquivo_base64=_b64(b"%PDF-1.4 download 1"),
+    )
+
+    payload = {
+        "favorecido": "ACME SERVICOS LTDA",
+        "cpf_cnpj": "12345678000195",
+        "valor_pago": 1_500,
+        "data_pagamento": "2026-03-10T00:00:00Z",
+        "arquivo_base64": _b64(b"%PDF-1.4 download 2"),
+    }
+    r = await client.post(_url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 409
+    assert r.json()["error"] == "COMPROVANTE_POSSIVEL_DUPLICADO"
+
+    # Dois pagamentos iguais existem — quem sabe é o contador.
+    payload["permitir_duplicado"] = True
+    r = await client.post(_url(empresa.id), json=payload, headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 201
+    assert (await client.get(_url(empresa.id))).json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mesmo_valor_e_dia_para_favorecidos_diferentes_nao_e_duplicado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Dois boletos de R$ 1.500,00 no mesmo dia, de fornecedores diferentes."""
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, cpf_cnpj="12.345.678/0001-95")
+
+    await _criar(
+        client, empresa, csrf, favorecido="BETA COMERCIO LTDA", cpf_cnpj="98.765.432/0001-10"
+    )
+
+    assert (await client.get(_url(empresa.id))).json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mesmo_valor_e_dia_sem_favorecido_nenhum_nao_e_duplicado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Sem identidade em comum não há o que comparar — barrar travaria o trabalho."""
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, favorecido=None)
+
+    await _criar(client, empresa, csrf, favorecido=None)
+
+    assert (await client.get(_url(empresa.id))).json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_comprovante_excluido_nao_impede_reenviar_o_arquivo(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """Excluir é como o contador corrige a importação errada."""
+    csrf = await _login(client, tenant, usuario)
+    primeiro = await _criar(client, empresa, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+    r = await client.delete(
+        _url(empresa.id, f"/{primeiro['id']}"), headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 204
+
+    await _criar(client, empresa, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+
+
+@pytest.mark.asyncio
+async def test_duplicidade_nao_atravessa_a_fronteira_da_empresa(
+    client: AsyncClient,
+    db: AsyncSession,
+    tenant: Tenant,
+    usuario: Usuario,
+    empresa: Empresa,
+):
+    """Um 409 aqui contaria a um cliente o que outro cliente importou."""
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA LTDA",
+        cnpj="52.540.787/0001-88",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+
+    csrf = await _login(client, tenant, usuario)
+    await _criar(client, empresa, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+
+    await _criar(client, outra, csrf, arquivo_base64=_b64(_ARQUIVO_PIX))
+
+
+@pytest.mark.asyncio
+async def test_extrair_arquivo_ja_importado_recusa_antes_de_ler(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa, monkeypatch
+):
+    """Soltar a pasta de novo: a repetição aparece ANTES do formulário.
+
+    E sem gastar leitura — ler um arquivo que já está no sistema pode custar
+    chamada de IA à toa.
+    """
+    from src.domain.comprovantes import pdf_parser as pdf_parser_module
+
+    def _nao_deveria_ler(conteudo: bytes):
+        raise AssertionError("o arquivo já importado não deveria ser lido de novo")
+
+    monkeypatch.setattr(pdf_parser_module, "parse_pdf", _nao_deveria_ler)
+
+    csrf = await _login(client, tenant, usuario)
+    primeiro = await _criar(
+        client, empresa, csrf, arquivo_nome="comprovante.pdf", arquivo_base64=_b64(_PDF_BYTES)
+    )
+
+    r = await _extrair_pdf(client, empresa, csrf)
+
+    assert r.status_code == 409
+    assert r.json()["error"] == "COMPROVANTE_JA_IMPORTADO"
+    assert r.json()["details"]["comprovante_id"] == primeiro["id"]

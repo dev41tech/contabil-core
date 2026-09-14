@@ -98,9 +98,24 @@ async def extrair_dados_pdf(
     """
     from src.core.config import get_settings
     from src.core.errors import ValidationError as AppValidationError
-    from src.domain.comprovantes.pdf_parser import PDFParseError, parse_imagem, parse_pdf
+    from src.domain.comprovantes.pdf_parser import (
+        DocumentoNaoEComprovanteError,
+        PDFParseError,
+        parse_imagem,
+        parse_pdf,
+    )
+    from src.domain.comprovantes.service import erro_ja_importado, hash_do_arquivo
 
     conteudo = await ler_upload_limitado(arquivo)
+
+    # Antes de ler, e não só no salvar: o contador soltava a pasta inteira de
+    # novo, revisava cada formulário e só descobria a repetição no fim — quando
+    # descobria. E ler um arquivo que já está no sistema ainda gasta chamada de
+    # IA à toa.
+    existente = await _svc(empresa_id, db).buscar_por_arquivo(hash_do_arquivo(conteudo))
+    if existente:
+        raise erro_ja_importado(existente)
+
     nome_lower = (arquivo.filename or "").lower()
     # O content-type entra como segunda evidência porque arrastar-e-soltar nem
     # sempre preserva o nome do arquivo: dependendo do navegador e da origem do
@@ -138,6 +153,11 @@ async def extrair_dados_pdf(
         raise AppValidationError(
             message="Processamento do arquivo excedeu o tempo limite."
         ) from None
+    except DocumentoNaoEComprovanteError as e:
+        # Código próprio para a tela PULAR o arquivo. A falha de extração comum
+        # convida a preencher à mão — e preencher à mão uma nota fiscal é
+        # exatamente como ela entrava na lista de comprovantes.
+        raise AppValidationError(message=str(e), code="DOCUMENTO_NAO_E_COMPROVANTE") from e
     except PDFParseError as e:
         # `PDFParseError` já carrega uma frase pronta para o contador ("Não foi
         # possível identificar o valor pago...", "PDF sem páginas."). Prefixar
