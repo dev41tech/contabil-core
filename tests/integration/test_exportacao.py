@@ -426,6 +426,90 @@ async def test_exportar_lancamentos_importacao_ignora_lancamento_sem_par(
     assert linhas == []
 
 
+# ── Lançamento cancelado não sai no arquivo
+#
+# Relato de 2026-09-14: desfazer a importação de um extrato e exportar os
+# registros — os lançamentos cancelados continuavam no arquivo. Cancelar não gera
+# estorno, marca as partidas com `deleted_at`; as duas exportações de lançamentos
+# filtravam só empresa e data.
+
+
+async def _desfazer_importacao(client, empresa, csrf) -> None:
+    lotes = (
+        await client.get(f"/api/v1/empresas/{empresa.id}/extrato/importacoes")
+    ).json()["items"]
+    assert len(lotes) == 1
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importacoes/{lotes[0]['id']}/cancelar",
+        json={"motivo": "extrato do mes errado"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["lancamentos_cancelados"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tipo", ["lancamentos", "lancamentos_importacao"])
+async def test_desfazer_a_importacao_tira_os_lancamentos_da_exportacao(
+    client, db, tenant, usuario, empresa, tipo
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+    antes = await client.post(
+        _url(empresa.id), json={"formato": "csv", "tipo": tipo}, headers={"X-CSRF-Token": csrf}
+    )
+    # Sem isto o teste passaria com o NEO sem classificar nada.
+    assert antes.headers.get("X-Total-Registros") != "0"
+
+    await _desfazer_importacao(client, empresa, csrf)
+
+    depois = await client.post(
+        _url(empresa.id), json={"formato": "csv", "tipo": tipo}, headers={"X-CSRF-Token": csrf}
+    )
+    assert depois.status_code == 200
+    assert depois.headers.get("X-Total-Registros") == "0"
+    assert "SERVICO" not in depois.content.decode("utf-8-sig").upper()
+
+
+@pytest.mark.asyncio
+async def test_lancamento_cancelado_nao_sai_mas_o_vigente_sim(db, empresa, usuario):
+    """O filtro tira o cancelado — e só ele. Um filtro que zerasse tudo também
+    passaria no teste acima."""
+    from src.db.models import RegistroContabil
+
+    conta = PlanoConta(empresa_id=empresa.id, codigo="4.1.1", descricao="Serviços", tipo="receita")
+    banco = PlanoConta(empresa_id=empresa.id, codigo="1.1.1", descricao="Banco", tipo="ativo")
+    agencia = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="ITAU", agencia="0001", numero="12345")
+    db.add_all([conta, banco, agencia])
+    await db.flush()
+
+    def _partidas(historico: str, cancelado: bool):
+        lancamento_id = uuid4()
+        agora = datetime.now(UTC) if cancelado else None
+        return [
+            RegistroContabil(
+                empresa_id=empresa.id, lancamento_id=lancamento_id,
+                conta_id=conta_id, agencia_id=agencia.id, descricao=historico,
+                historico=historico, historico_extrato=historico, dc=dc,
+                tipo_regra="manual", valor=Decimal("100.00"),
+                data_lancamento=datetime(2024, 8, 1, tzinfo=UTC),
+                deleted_at=agora, cancelado_em=agora,
+            )
+            for conta_id, dc in ((banco.id, "D"), (conta.id, "C"))
+        ]
+
+    db.add_all(_partidas("VIGENTE", cancelado=False) + _partidas("CANCELADO", cancelado=True))
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    pareadas, _ = await service._exportar_lancamentos_importacao(ExportJobCreate(formato="csv"), "csv")
+    partidas, _ = await service._exportar_lancamentos(ExportJobCreate(formato="csv"), "csv")
+
+    assert [l["Complemento Histórico"] for l in pareadas] == ["VIGENTE"]
+    assert {p.historico for p in partidas} == {"VIGENTE"}
+    assert len(partidas) == 2
+
+
 # ── Exportar extrato bancário
 
 

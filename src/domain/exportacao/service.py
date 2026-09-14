@@ -189,20 +189,41 @@ class ExportacaoService:
 
     # ── lançamentos contábeis (original) ─────────────────────────────────────
 
-    async def _exportar_lancamentos(
-        self, data: ExportJobCreate, fmt: str
-    ) -> tuple[list, bytes]:
+    async def _registros_vigentes(self, data: ExportJobCreate) -> list[RegistroContabil]:
+        """Partidas que valem no razão, no período pedido.
+
+        O CANCELADO SAÍA NO ARQUIVO
+
+        As duas exportações de lançamentos filtravam só empresa e data. Cancelar
+        um lançamento não gera estorno: marca as partidas com `deleted_at` e
+        `cancelado_em` (`neo.cancelamento.cancelar_lancamento`). Desfazer a
+        importação de um extrato cancela os lançamentos do lote por esse mesmo
+        caminho — e o arquivo exportado continuava trazendo todos eles, prontos
+        para entrar no sistema contábil externo como se valessem.
+
+        Todas as outras leituras de `RegistroContabil` já filtravam — a tela do
+        razão, o NEO, as estatísticas. A exportação era a única que não, e é
+        justamente a que sai do sistema.
+        """
         q = select(RegistroContabil).where(
-            RegistroContabil.empresa_id == self._empresa_id
+            RegistroContabil.empresa_id == self._empresa_id,
+            RegistroContabil.deleted_at.is_(None),
         )
         if data.data_de:
             q = q.where(RegistroContabil.data_lancamento >= data.data_de)
         if data.data_ate:
             q = q.where(RegistroContabil.data_lancamento <= data.data_ate)
 
-        rows = (
-            await self._db.execute(q.order_by(RegistroContabil.data_lancamento))
-        ).scalars().all()
+        return list(
+            (await self._db.execute(q.order_by(RegistroContabil.data_lancamento)))
+            .scalars()
+            .all()
+        )
+
+    async def _exportar_lancamentos(
+        self, data: ExportJobCreate, fmt: str
+    ) -> tuple[list, bytes]:
+        rows = await self._registros_vigentes(data)
 
         if fmt == "csv":
             conteudo = self._lancamentos_csv(rows)
@@ -260,17 +281,7 @@ class ExportacaoService:
         Código Matriz/Filial, Centro de Custo) saem em branco — a planilha ainda
         é válida para import, só sem esses dados preenchidos.
         """
-        q = select(RegistroContabil).where(
-            RegistroContabil.empresa_id == self._empresa_id
-        )
-        if data.data_de:
-            q = q.where(RegistroContabil.data_lancamento >= data.data_de)
-        if data.data_ate:
-            q = q.where(RegistroContabil.data_lancamento <= data.data_ate)
-
-        registros = (
-            await self._db.execute(q.order_by(RegistroContabil.data_lancamento))
-        ).scalars().all()
+        registros = await self._registros_vigentes(data)
 
         # Resolve o código da conta em lote: a alternativa é uma query por linha.
         # Este layout importa num sistema contábil externo (legado do MrContador),
