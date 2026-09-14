@@ -16,7 +16,14 @@ from src.db.models import Job
 from src.db.session import get_db
 from src.domain.jobs import JobRuntime, executar_importacao_extrato
 from src.domain.extrato.service import ExtratoService
-from src.domain.extrato.importacoes import cancelar_importacao, listar_importacoes
+from src.domain.extrato.importacoes import (
+    cancelar_importacao,
+    erro_extrato_ja_importado,
+    excluir_importacao,
+    hash_do_arquivo,
+    listar_importacoes,
+    lote_com_o_mesmo_arquivo,
+)
 from src.schemas.extrato import (
     CancelarImportacaoRequest,
     CancelarImportacaoResponse,
@@ -56,6 +63,16 @@ async def importar_extrato(
     """Enfileira a importação OFX/PDF sem manter a requisição pendurada."""
     conteudo_bytes = await ler_upload_limitado(arquivo)
     nome = (arquivo.filename or "").lower()
+
+    # Aqui, antes do job, e não dentro dele: a recusa chega na hora, na mesma
+    # resposta do envio, em vez de virar um job "falhou" que o contador precisa
+    # abrir para entender. E o lote vazio que motivou isto nem chega a nascer.
+    existente = await lote_com_o_mesmo_arquivo(
+        db, empresa_id=empresa_id, hash_arquivo=hash_do_arquivo(conteudo_bytes)
+    )
+    if existente:
+        raise erro_extrato_ja_importado(*existente)
+
     runtime: JobRuntime = getattr(request.app.state, "job_runtime", JobRuntime())
     job = Job(
         empresa_id=empresa_id,
@@ -166,6 +183,24 @@ async def cancelar_importacao_endpoint(
         importacao_id=resultado.importacao_id,
         transacoes_removidas=resultado.transacoes_removidas,
         lancamentos_cancelados=resultado.lancamentos_cancelados,
+    )
+
+
+@router.delete(
+    "/importacoes/{importacao_id}",
+    status_code=204,
+    dependencies=[requer("extrato.execute"), Depends(require_csrf)],
+)
+async def excluir_importacao_endpoint(
+    empresa_id: UUID,
+    importacao_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Tira da lista um lote sem transações — reenvio zerado, leitura que falhou,
+    lote já desfeito. Lote com transação precisa ser desfeito antes (409)."""
+    await excluir_importacao(
+        db, empresa_id=empresa_id, importacao_id=importacao_id, usuario_id=ctx.user_id
     )
 
 

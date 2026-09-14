@@ -116,9 +116,19 @@ async def test_importar_ofx_sucesso(client, tenant, usuario, empresa):
     assert len(body["transacoes"]) == 2
 
 
+def _baixado_de_novo(conteudo: str) -> str:
+    """O mesmo período exportado outra vez: mesmas linhas, bytes diferentes.
+
+    Desde 14/09/2026 o arquivo IDÊNTICO é recusado antes de ser lido. A
+    deduplicação por linha continua sendo o que protege o caso abaixo dele — o
+    extrato baixado de novo do banco, ou de 01 a 31 depois de 01 a 15.
+    """
+    return conteudo + "\n"
+
+
 @pytest.mark.asyncio
 async def test_importar_ofx_deduplicacao(client, tenant, usuario, empresa):
-    """Segunda importação do mesmo arquivo deve registrar 2 duplicadas."""
+    """O mesmo período baixado de novo registra as linhas como duplicadas."""
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)
 
@@ -126,7 +136,7 @@ async def test_importar_ofx_deduplicacao(client, tenant, usuario, empresa):
     assert r1.status_code == 202
     assert r1.json()["importadas"] == 2
 
-    r2 = await _importar(client, empresa, agencia["id"], csrf)
+    r2 = await _importar(client, empresa, agencia["id"], csrf, _baixado_de_novo(_OFX_VALIDO))
     assert r2.status_code == 202
     body2 = r2.json()
     assert body2["importadas"] == 0
@@ -756,6 +766,216 @@ async def test_reimportar_depois_de_cancelar_traz_as_transacoes_de_volta(
     )
 
 
+# ── Reenvio do mesmo arquivo, e o lote que não tinha como sair da lista
+#
+# Relato de 2026-09-14, logo depois do caso dos comprovantes: na tela de
+# Importações "acontece a mesma coisa". O lote gravava `hash_arquivo` e nada o
+# lia; reenviar o extrato abria um lote novo que nascia com 0 importadas — e,
+# sem transação, o "Desfazer" ficava desabilitado. O card não saía mais.
+
+
+async def _enviar(client, empresa, agencia_id, csrf, conteudo=None):
+    """O envio cru, sem seguir o job: a recusa de arquivo repetido é síncrona."""
+    return await client.post(
+        f"/api/v1/empresas/{empresa.id}/extrato/importar?agencia_id={agencia_id}",
+        files={"arquivo": ("extrato.ofx", io.BytesIO((conteudo or _OFX_VALIDO).encode()),
+                           "application/octet-stream")},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+
+@pytest.mark.asyncio
+async def test_o_mesmo_arquivo_reenviado_e_recusado_sem_abrir_lote(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    primeiro = (await client.get(_imp_url(empresa.id))).json()["items"][0]
+
+    r = await _enviar(client, empresa, agencia["id"], csrf)
+
+    assert r.status_code == 409
+    corpo = r.json()
+    assert corpo["error"] == "EXTRATO_JA_IMPORTADO"
+    assert corpo["details"]["importacao_id"] == primeiro["id"]
+    # A mensagem nomeia a conta e diz como sair da situação.
+    assert "BB ag. 0001 c/c 11111" in corpo["message"]
+    assert "desfaça" in corpo["message"]
+    # O lote vazio que motivou isto nem chega a nascer.
+    assert (await client.get(_imp_url(empresa.id))).json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_o_mesmo_arquivo_em_outra_conta_tambem_e_recusado(
+    client, tenant, usuario, empresa
+):
+    """Um extrato é de UMA conta. O mesmo arquivo em outra é quase sempre a conta
+    errada — e a mensagem aponta onde ele já está."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    outra = await client.post(
+        f"/api/v1/empresas/{empresa.id}/agencias",
+        json={"banco_sigla": "ITAU", "agencia": "7285", "numero": "12287"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await _enviar(client, empresa, outra.json()["id"], csrf)
+
+    assert r.status_code == 409
+    assert "BB ag. 0001 c/c 11111" in r.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_arquivo_que_falhou_na_leitura_pode_ser_reenviado(
+    client, tenant, usuario, empresa
+):
+    """O layout pode passar a ser lido depois — barrar prenderia o arquivo."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    ilegivel = "isto nao e um ofx"
+
+    primeira = await _enviar(client, empresa, agencia["id"], csrf, ilegivel)
+    segunda = await _enviar(client, empresa, agencia["id"], csrf, ilegivel)
+
+    assert primeira.status_code == 202
+    assert segunda.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_lote_com_as_transacoes_todas_removidas_libera_o_arquivo(
+    client, db, tenant, usuario, empresa
+):
+    """No banco o arquivo já não existe — o reenvio tem de passar."""
+    from datetime import UTC, datetime
+
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    for t in (await db.execute(select(Transacao))).scalars():
+        t.deleted_at = datetime.now(UTC)
+    await db.flush()
+
+    r = await _enviar(client, empresa, agencia["id"], csrf)
+
+    assert r.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_o_mesmo_arquivo_em_outra_empresa_nao_e_barrado(
+    client, db, tenant, usuario, empresa
+):
+    """Um 409 aqui contaria a um cliente o que outro cliente importou."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA LTDA",
+        cnpj="52.540.787/0001-88",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+    agencia_outra = await _criar_agencia(client, outra, csrf)
+
+    r = await _enviar(client, outra, agencia_outra["id"], csrf)
+
+    assert r.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_excluir_o_lote_zerado_do_reenvio(client, tenant, usuario, empresa):
+    """O card que ficava preso: 0 importadas, "Desfazer" desabilitado."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    await _importar(client, empresa, agencia["id"], csrf, _baixado_de_novo(_OFX_VALIDO))
+    zerado = next(
+        lote for lote in (await client.get(_imp_url(empresa.id))).json()["items"]
+        if lote["transacoes_ativas"] == 0
+    )
+
+    r = await client.delete(f"{_imp_url(empresa.id)}/{zerado['id']}", headers={"X-CSRF-Token": csrf})
+
+    assert r.status_code == 204
+    restantes = (await client.get(_imp_url(empresa.id))).json()
+    assert restantes["total"] == 1
+    assert restantes["items"][0]["transacoes_ativas"] == 2
+    # Excluir o registro não mexe em transação nenhuma.
+    assert (await _listar(client, empresa))["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_desfeito(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+    await client.post(
+        f"{_imp_url(empresa.id)}/{lote_id}/cancelar",
+        json={"motivo": "arquivo errado"}, headers={"X-CSRF-Token": csrf},
+    )
+
+    r = await client.delete(f"{_imp_url(empresa.id)}/{lote_id}", headers={"X-CSRF-Token": csrf})
+
+    assert r.status_code == 204
+    assert (await client.get(_imp_url(empresa.id))).json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_com_transacoes_exige_desfazer_antes(
+    client, tenant, usuario, empresa
+):
+    """Sumir com o registro deixaria transações presas a um lote invisível — sem
+    o "Desfazer", que é o que cancela os lançamentos junto."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _importar(client, empresa, agencia["id"], csrf)
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+
+    r = await client.delete(f"{_imp_url(empresa.id)}/{lote_id}", headers={"X-CSRF-Token": csrf})
+
+    assert r.status_code == 409
+    assert r.json()["error"] == "IMPORTACAO_COM_TRANSACOES"
+    assert (await client.get(_imp_url(empresa.id))).json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_de_outra_empresa_devolve_404(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _enviar(client, empresa, agencia["id"], csrf, "isto nao e um ofx")
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+    outra = Empresa(
+        tenant_id=tenant.id,
+        razao_social="OUTRA EMPRESA LTDA",
+        cnpj="52.540.787/0001-88",
+        regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+
+    r = await client.delete(f"{_imp_url(outra.id)}/{lote_id}", headers={"X-CSRF-Token": csrf})
+
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_excluir_lote_sem_csrf_rejeita(client, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _enviar(client, empresa, agencia["id"], csrf, "isto nao e um ofx")
+    lote_id = (await client.get(_imp_url(empresa.id))).json()["items"][0]["id"]
+
+    r = await client.delete(f"{_imp_url(empresa.id)}/{lote_id}")
+
+    assert r.status_code == 403
+
+
 # ── Conferência de completude pelo saldo declarado no arquivo
 
 def _ofx_com_saldo(fitid: str, dia: str, valor: str, saldo: str, dia_saldo: str) -> str:
@@ -884,14 +1104,15 @@ async def test_reenviar_o_mesmo_arquivo_nao_se_toma_por_ancora(
 
     Sem isso o reenvio encontraria a si próprio e acusaria diferença igual ao
     movimento inteiro do período — um alerta falso no caminho mais banal que
-    existe, que é subir o mesmo arquivo duas vezes.
+    existe, que é subir o mesmo período duas vezes. O arquivo idêntico é barrado
+    antes (EXTRATO_JA_IMPORTADO); o período baixado de novo ainda chega aqui.
     """
     csrf = await _login(client, tenant, usuario)
     agencia = await _criar_agencia(client, empresa, csrf)
     conteudo = _ofx_com_saldo("S1", "20260130", "-100.00", "911.18", "20260130")
 
     await _importar(client, empresa, agencia["id"], csrf, conteudo=conteudo)
-    r = await _importar(client, empresa, agencia["id"], csrf, conteudo=conteudo)
+    r = await _importar(client, empresa, agencia["id"], csrf, conteudo=_baixado_de_novo(conteudo))
 
     assert r.json()["duplicadas"] == 1
     assert r.json()["alerta_saldo"] is None
