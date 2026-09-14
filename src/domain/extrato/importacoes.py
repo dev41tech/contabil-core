@@ -29,7 +29,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import ConflictError, NotFoundError
-from src.db.models import ExtratoImportacao, RegistroContabil, Transacao
+from src.db.models import AgenciaBancaria, ExtratoImportacao, RegistroContabil, Transacao
 from src.domain.auditoria.service import registrar_auditoria
 from src.domain.neo.cancelamento import cancelar_lancamento
 
@@ -45,6 +45,86 @@ class CancelamentoLoteResultado:
 
 def hash_do_arquivo(conteudo: bytes) -> str:
     return hashlib.sha256(conteudo).hexdigest()
+
+
+CODIGO_EXTRATO_JA_IMPORTADO = "EXTRATO_JA_IMPORTADO"
+
+
+async def lote_com_o_mesmo_arquivo(
+    db: AsyncSession, *, empresa_id: UUID, hash_arquivo: str
+) -> tuple[ExtratoImportacao, int, AgenciaBancaria | None] | None:
+    """Lote vivo desta empresa com exatamente este arquivo, e o que ele ainda tem.
+
+    O HASH ERA GRAVADO E NUNCA LIDO
+
+    `abrir_importacao` guarda `hash_arquivo` em todo lote desde que os lotes
+    existem, e nada o consultava. Reenviar o mesmo extrato abria um lote novo; a
+    deduplicação por linha impedia as transações de duplicar, então o lote nascia
+    com 0 importadas e selo de "Concluída" — e, sem transação, o "Desfazer" ficava
+    desabilitado. O card repetido não saía mais da tela.
+
+    O QUE CONTA COMO "O ARQUIVO JÁ ESTÁ NO SISTEMA"
+
+    Ter transação viva, e não ter sido importado um dia. Três casos em que o
+    reenvio TEM de passar:
+
+    - lote desfeito — é o fluxo de conserto: desfaz o errado, sobe de novo;
+    - lote que falhou na leitura — o layout pode ter passado a ser lido depois;
+    - lote cujas transações foram todas removidas uma a uma — no banco, o
+      arquivo já não existe.
+
+    A busca é por empresa, não por conta: o mesmo arquivo enviado para outra
+    conta é quase sempre a conta errada, e a mensagem nomeia a de destino.
+    """
+    vivas = (
+        select(func.count())
+        .where(
+            Transacao.importacao_id == ExtratoImportacao.id,
+            Transacao.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
+    linha = (
+        await db.execute(
+            select(ExtratoImportacao, vivas, AgenciaBancaria)
+            .outerjoin(AgenciaBancaria, AgenciaBancaria.id == ExtratoImportacao.agencia_id)
+            .where(
+                ExtratoImportacao.empresa_id == empresa_id,
+                ExtratoImportacao.hash_arquivo == hash_arquivo,
+                ExtratoImportacao.deleted_at.is_(None),
+                ExtratoImportacao.cancelada_em.is_(None),
+                vivas > 0,
+            )
+            .order_by(ExtratoImportacao.created_at)
+            .limit(1)
+        )
+    ).first()
+    if linha is None:
+        return None
+    return linha[0], linha[1], linha[2]
+
+
+def erro_extrato_ja_importado(
+    lote: ExtratoImportacao, transacoes_vivas: int, agencia: AgenciaBancaria | None
+) -> ConflictError:
+    conta = ""
+    if agencia is not None:
+        conta = f" na conta {agencia.banco_sigla or ''} ag. {agencia.agencia} c/c {agencia.numero}"
+    return ConflictError(
+        message=(
+            f"Este arquivo já foi importado em {lote.created_at.strftime('%d/%m/%Y')}"
+            f"{conta} ({lote.nome_arquivo}, {transacoes_vivas} transações no sistema). "
+            "Para importá-lo de novo, desfaça aquela importação na tela de Importações."
+        ),
+        code=CODIGO_EXTRATO_JA_IMPORTADO,
+        details={
+            "importacao_id": str(lote.id),
+            "agencia_id": str(lote.agencia_id),
+            "nome_arquivo": lote.nome_arquivo,
+            "importado_em": lote.created_at.isoformat(),
+            "transacoes_ativas": transacoes_vivas,
+        },
+    )
 
 
 async def abrir_importacao(
@@ -224,6 +304,81 @@ async def cancelar_importacao(
         transacoes_removidas=len(transacoes),
         lancamentos_cancelados=lancamentos_cancelados,
     )
+
+
+async def excluir_importacao(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    importacao_id: UUID,
+    usuario_id: UUID | None = None,
+) -> None:
+    """Tira da lista um lote que não tem mais nada no sistema.
+
+    É o caminho que faltava para os cards que o "Desfazer" não alcança: reenvio
+    que entrou zerado, arquivo que falhou na leitura, lote já desfeito. Todos têm
+    0 transações vivas — e o botão de desfazer ficava desabilitado justamente aí.
+
+    Lote com transação viva é recusado: excluir o registro deixaria transações
+    apontando para um lote invisível, sem o "Desfazer" que as removeria junto com
+    os lançamentos. Para esse, o caminho é desfazer primeiro.
+
+    Exclusão lógica, com auditoria: o que o lote trouxe e se ele foi desfeito
+    continua rastreável.
+    """
+    importacao = (
+        await db.execute(
+            select(ExtratoImportacao)
+            .where(
+                ExtratoImportacao.id == importacao_id,
+                ExtratoImportacao.empresa_id == empresa_id,
+                ExtratoImportacao.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if importacao is None:
+        raise NotFoundError(message="Importação não encontrada.")
+
+    vivas = (
+        await db.execute(
+            select(func.count()).where(
+                Transacao.importacao_id == importacao_id,
+                Transacao.empresa_id == empresa_id,
+                Transacao.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    if vivas:
+        raise ConflictError(
+            message=(
+                f"Esta importação ainda tem {vivas} transações no sistema. "
+                "Desfaça a importação antes de excluir o registro."
+            ),
+            code="IMPORTACAO_COM_TRANSACOES",
+            details={"transacoes_ativas": vivas},
+        )
+
+    importacao.deleted_at = datetime.now(UTC)
+    await registrar_auditoria(
+        db,
+        acao="extrato_importacao.excluida",
+        entidade="extrato_importacao",
+        entidade_id=importacao_id,
+        dados_antes={
+            "nome_arquivo": importacao.nome_arquivo,
+            "importadas": importacao.importadas,
+            "duplicadas": importacao.duplicadas,
+            "rejeitadas": importacao.rejeitadas,
+            "cancelada_em": (
+                importacao.cancelada_em.isoformat() if importacao.cancelada_em else None
+            ),
+        },
+        dados_depois={"excluida": True},
+        empresa_id=empresa_id,
+        usuario_id=usuario_id,
+    )
+    logger.info("extrato.importacao_excluida", importacao_id=str(importacao_id))
 
 
 async def listar_importacoes(
