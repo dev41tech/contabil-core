@@ -57,6 +57,12 @@ class ExportJobCreate(BaseModel):
             "informado, tem precedência sobre data_de/data_ate."
         ),
     )
+    # Lançamentos e conferência deixam de fora as contas bancárias inativadas,
+    # a menos que isto venha ligado. Inativar preserva o histórico de propósito
+    # (conta encerrada), então o histórico continua alcançável — só não entra
+    # mais sem ninguém pedir. Não se aplica ao tipo `extrato`, em que a conta é
+    # escolhida explicitamente na tela.
+    incluir_contas_inativas: bool = False
 
     # Filtros usados apenas pelo tipo `extrato`, para o arquivo sair com as
     # mesmas linhas que a tela mostra. Ignorados nos demais tipos.

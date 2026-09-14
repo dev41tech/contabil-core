@@ -189,6 +189,14 @@ class ExportacaoService:
 
     # ── lançamentos contábeis (original) ─────────────────────────────────────
 
+    def _agencias_ativas(self):
+        """Contas bancárias ativas desta empresa, como subconsulta para `IN`."""
+        return select(AgenciaBancaria.id).where(
+            AgenciaBancaria.empresa_id == self._empresa_id,
+            AgenciaBancaria.ativa.is_(True),
+            AgenciaBancaria.deleted_at.is_(None),
+        )
+
     async def _registros_vigentes(self, data: ExportJobCreate) -> list[RegistroContabil]:
         """Partidas que valem no razão, no período pedido.
 
@@ -204,11 +212,20 @@ class ExportacaoService:
         Todas as outras leituras de `RegistroContabil` já filtravam — a tela do
         razão, o NEO, as estatísticas. A exportação era a única que não, e é
         justamente a que sai do sistema.
+
+        CONTA BANCÁRIA INATIVADA
+
+        Fica de fora, a menos que `incluir_contas_inativas` venha ligado. Inativar
+        não apaga nada — é para conta encerrada, cujo histórico continua valendo
+        —, e por isso a opção existe: exportar um mês em que a conta ainda estava
+        aberta precisa conseguir trazê-la.
         """
         q = select(RegistroContabil).where(
             RegistroContabil.empresa_id == self._empresa_id,
             RegistroContabil.deleted_at.is_(None),
         )
+        if not data.incluir_contas_inativas:
+            q = q.where(RegistroContabil.agencia_id.in_(self._agencias_ativas()))
         if data.data_de:
             q = q.where(RegistroContabil.data_lancamento >= data.data_de)
         if data.data_ate:
@@ -539,6 +556,10 @@ class ExportacaoService:
             Transacao.empresa_id == self._empresa_id,
             Transacao.deleted_at.is_(None),
         )
+        # Mesma regra dos lançamentos: a conferência sai da mesma tela, e um
+        # arquivo sem a conta inativa ao lado de outro com ela não conferiria.
+        if not data.incluir_contas_inativas:
+            q = q.where(Transacao.agencia_id.in_(self._agencias_ativas()))
         # `Transacao.data` é `Date`; o filtro chega como datetime porque o mesmo
         # schema serve ao razão, cujo `data_lancamento` é instante. Converter aqui
         # evita que o Postgres resolva a comparação pelo fuso da sessão.

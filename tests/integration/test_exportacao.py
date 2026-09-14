@@ -510,6 +510,129 @@ async def test_lancamento_cancelado_nao_sai_mas_o_vigente_sim(db, empresa, usuar
     assert len(partidas) == 2
 
 
+# ── Conta bancária inativada
+#
+# Relato de 2026-09-14: a exportação dos registros trazia as contas bancárias
+# inativadas. Inativar preserva o histórico de propósito (conta encerrada), então
+# a decisão foi deixar de fora por padrão, com `incluir_contas_inativas` para
+# quando o histórico for preciso.
+
+
+async def _inativar_a_conta(client, empresa, csrf) -> None:
+    agencias = (await client.get(f"/api/v1/empresas/{empresa.id}/agencias")).json()
+    agencias = agencias.get("items", agencias)
+    assert len(agencias) == 1
+    r = await client.delete(
+        f"/api/v1/empresas/{empresa.id}/agencias/{agencias[0]['id']}",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 204, r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tipo", ["lancamentos", "lancamentos_importacao", "conferencia"])
+async def test_conta_inativada_fica_fora_da_exportacao_por_padrao(
+    client, db, tenant, usuario, empresa, tipo
+):
+    csrf = await _login(client, tenant, usuario)
+    await _setup_registros(client, db, empresa, csrf)
+    antes = await client.post(
+        _url(empresa.id), json={"formato": "csv", "tipo": tipo}, headers={"X-CSRF-Token": csrf}
+    )
+    assert antes.headers.get("X-Total-Registros") != "0"
+
+    await _inativar_a_conta(client, empresa, csrf)
+
+    padrao = await client.post(
+        _url(empresa.id), json={"formato": "csv", "tipo": tipo}, headers={"X-CSRF-Token": csrf}
+    )
+    com_inativas = await client.post(
+        _url(empresa.id),
+        json={"formato": "csv", "tipo": tipo, "incluir_contas_inativas": True},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert padrao.headers.get("X-Total-Registros") == "0"
+    # O histórico da conta encerrada continua alcançável — é o motivo de
+    # inativar não apagar nada.
+    assert com_inativas.headers.get("X-Total-Registros") == antes.headers.get("X-Total-Registros")
+
+
+@pytest.mark.asyncio
+async def test_conta_inativa_sai_e_a_ativa_fica(db, empresa, usuario):
+    """O filtro tira a conta inativa — e só ela."""
+    from src.db.models import RegistroContabil
+
+    receita = PlanoConta(empresa_id=empresa.id, codigo="4.1.1", descricao="Serviços", tipo="receita")
+    banco = PlanoConta(empresa_id=empresa.id, codigo="1.1.1", descricao="Banco", tipo="ativo")
+    ativa = AgenciaBancaria(empresa_id=empresa.id, banco_sigla="ITAU", agencia="0001", numero="1")
+    inativa = AgenciaBancaria(
+        empresa_id=empresa.id, banco_sigla="BB", agencia="0002", numero="2", ativa=False
+    )
+    db.add_all([receita, banco, ativa, inativa])
+    await db.flush()
+
+    def _partidas(historico: str, agencia_id):
+        lancamento_id = uuid4()
+        return [
+            RegistroContabil(
+                empresa_id=empresa.id, lancamento_id=lancamento_id,
+                conta_id=conta_id, agencia_id=agencia_id, descricao=historico,
+                historico=historico, historico_extrato=historico, dc=dc,
+                tipo_regra="manual", valor=Decimal("100.00"),
+                data_lancamento=datetime(2024, 8, 1, tzinfo=UTC),
+            )
+            for conta_id, dc in ((banco.id, "D"), (receita.id, "C"))
+        ]
+
+    db.add_all(_partidas("DA ATIVA", ativa.id) + _partidas("DA INATIVA", inativa.id))
+    db.add_all([
+        Transacao(
+            empresa_id=empresa.id, agencia_id=agencia.id, data=date(2024, 8, 1),
+            valor=Decimal("100.00"), historico=historico, dc="C", hash_dedup=historico,
+        )
+        for agencia, historico in ((ativa, "TX ATIVA"), (inativa, "TX INATIVA"))
+    ])
+    await db.flush()
+
+    service = ExportacaoService(db, empresa.id, usuario.id)
+    padrao = ExportJobCreate(formato="csv")
+    tudo = ExportJobCreate(formato="csv", incluir_contas_inativas=True)
+
+    pareadas, _ = await service._exportar_lancamentos_importacao(padrao, "csv")
+    assert [l["Complemento Histórico"] for l in pareadas] == ["DA ATIVA"]
+    pareadas, _ = await service._exportar_lancamentos_importacao(tudo, "csv")
+    assert sorted(l["Complemento Histórico"] for l in pareadas) == ["DA ATIVA", "DA INATIVA"]
+
+    conferencia, _ = await service._exportar_conferencia(padrao, "csv")
+    assert {l["historico_extrato"] for l in conferencia} == {"TX ATIVA"}
+    conferencia, _ = await service._exportar_conferencia(tudo, "csv")
+    assert {l["historico_extrato"] for l in conferencia} == {"TX ATIVA", "TX INATIVA"}
+
+
+@pytest.mark.asyncio
+async def test_exportar_extrato_da_conta_inativa_continua_funcionando(
+    client, tenant, usuario, empresa
+):
+    """No extrato a conta é escolhida explicitamente na tela — a opção não se aplica,
+    e o extrato de uma conta encerrada não pode ficar inalcançável."""
+    csrf = await _login(client, tenant, usuario)
+    agencia_id = await _setup_extrato(client, empresa, csrf)
+    r = await client.delete(
+        f"/api/v1/empresas/{empresa.id}/agencias/{agencia_id}", headers={"X-CSRF-Token": csrf}
+    )
+    assert r.status_code == 204
+
+    exportado = await client.post(
+        _url(empresa.id),
+        json={"formato": "csv", "tipo": "extrato", "agencia_id": agencia_id},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert exportado.status_code == 200
+    assert exportado.headers.get("X-Total-Registros") == "3"
+
+
 # ── Exportar extrato bancário
 
 
