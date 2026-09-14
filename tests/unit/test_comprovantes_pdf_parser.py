@@ -292,3 +292,192 @@ def test_dica_de_ia_desligada_entra_na_mensagem_de_erro(monkeypatch):
         pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
 
     assert "OPENAI_API_KEY" in str(exc.value)
+
+
+# ── Nota fiscal não é comprovante ────────────────────────────────────────────
+#
+# Relato de 2026-09-14 (UNIQUE MOMENT EVENTOS LTDA): uma NFS-e de R$ 1.245,00
+# entrou na lista de comprovantes. Nenhuma camada perguntava o tipo do documento
+# — todas procuravam um valor, e nota fiscal tem valor.
+
+_DANFSE_PADRAO_NACIONAL = [
+    "DANFSe v1.0",
+    "Documento Auxiliar da NFS-e",
+    "Chave de Acesso da NFS-e",
+    "41069022200000000000000000000000000000000000",
+    "EMITENTE DA NFS-e",
+    "Prestador / Fornecedor",
+    "CNPJ / CPF / NIF 000.000.000-00",
+    "Nome / Nome Empresarial MARIA EXEMPLO DA SILVA",
+    "TOMADOR DO SERVIÇO",
+    "Nome / Nome Empresarial EXEMPLO EVENTOS LTDA",
+    "SERVIÇO PRESTADO",
+    "VALOR TOTAL DA NFS-E",
+    "Valor do Serviço R$ 1.245,00",
+    "Valor Líquido da NFS-e R$ 1.245,00",
+]
+
+
+def _texto_do_pdf(monkeypatch, linhas: list[str]) -> None:
+    monkeypatch.setattr(
+        pdf_parser,
+        "_extrair_linhas",
+        lambda _conteudo, _budget: (linhas, sum(len(l) for l in linhas)),
+    )
+
+
+def test_a_regex_sozinha_aceitava_a_nfse_como_comprovante():
+    """O defeito, isolado: `valor\\s+total\\b` casa no valor da nota.
+
+    Este teste documenta POR QUE a classificação tem de vir antes da regex — não
+    é o comportamento desejado do sistema, é o da camada 1 quando ninguém a
+    protege.
+    """
+    assert _parse_por_regex(_DANFSE_PADRAO_NACIONAL).valor_pago == Decimal("1245.00")
+
+
+def test_danfse_do_emissor_nacional_e_recusada(monkeypatch):
+    """O layout do Emissor Nacional, obrigatório para MEI — o caso relatado."""
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, _DANFSE_PADRAO_NACIONAL)
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError, match="nota fiscal"):
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+
+def test_nfse_municipal_com_prestador_e_tomador_e_recusada(monkeypatch):
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, [
+        "PREFEITURA MUNICIPAL DE EXEMPLO",
+        "NOTA FISCAL DE SERVIÇOS ELETRÔNICA - NFS-e",
+        "Código de Verificação AB12CD34",
+        "PRESTADOR DE SERVIÇOS",
+        "CPF/CNPJ: 00.000.000/0001-00",
+        "TOMADOR DE SERVIÇOS",
+        "DISCRIMINAÇÃO DOS SERVIÇOS",
+        "VALOR TOTAL DA NOTA = R$ 1.245,00",
+    ])
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+
+def test_nfse_impressa_do_portal_so_com_cabecalho_do_navegador_e_recusada(monkeypatch):
+    """~40 NFS-e de São Paulo na pasta do escritório são assim.
+
+    Salvas com Ctrl+P no portal da prefeitura, o corpo da nota vira imagem e o
+    único texto do PDF é o que o navegador imprime em volta: título e URL. Não
+    há prestador nem tomador para casar — sobra o endereço de impressão, que
+    comprovante nenhum carrega.
+    """
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, [
+        "04/01/2024, 08:19 Usuário: 00.000.000/0001-00 - NF-e - Nota Fiscal Eletrônica de "
+        "Serviços - São Paulo",
+        "https://nfe.prefeitura.sp.gov.br/contribuinte/notaprint.aspx?nf=1&inscricao=1 1/1",
+    ])
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+
+def test_danfe_de_nota_de_produto_e_recusada(monkeypatch):
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, [
+        "DANFE",
+        "DOCUMENTO AUXILIAR DA NOTA FISCAL ELETRÔNICA",
+        "CHAVE DE ACESSO",
+        "VALOR TOTAL DA NOTA 3.200,00",
+    ])
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+
+def test_pix_que_paga_uma_nfse_continua_sendo_comprovante(monkeypatch):
+    """O lado que não pode quebrar: comprovante menciona nota o tempo todo.
+
+    "Pagamento NFS-e 123" na descrição do PIX é a regra, não a exceção. O título
+    solto não recusa; o que recusa é a estrutura da nota — documento auxiliar,
+    prestador e tomador, portal emissor.
+    """
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, [
+        "Comprovante de Pagamento Pix",
+        "Pagamento NFS-e 123 - Nota Fiscal de Serviços ref. 08/2026",
+        "Valor: R$ 1.245,00",
+        "Realizado em: 13/09/2026 - 09:33:52",
+        "Nome do destinatário: MARIA EXEMPLO DA SILVA",
+        "CPF do destinatário: 000.000.000-00",
+        "Nome do pagador: EXEMPLO EVENTOS LTDA",
+    ])
+
+    resultado = pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+    assert resultado.valor_pago == Decimal("1245.00")
+
+
+def test_boleto_pago_de_prestador_de_servico_continua_sendo_comprovante(monkeypatch):
+    """"Prestador" sozinho aparece em comprovante de boleto de fornecedor."""
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=False))
+    _texto_do_pdf(monkeypatch, [
+        "Comprovante de pagamento de boleto",
+        "Beneficiário: EXEMPLO PRESTADOR DE SERVIÇOS LTDA",
+        "CNPJ: 00.000.000/0001-00",
+        "Pagador: EXEMPLO EVENTOS LTDA",
+        "Valor pago: R$ 780,00",
+        "Data do pagamento: 10/09/2026",
+    ])
+
+    assert pdf_parser.parse_pdf(b"%PDF-1.4 qualquer").valor_pago == Decimal("780.00")
+
+
+def test_imagem_que_a_vision_classifica_como_nota_e_recusada_mesmo_com_valor(monkeypatch):
+    """Na imagem não há texto local: só a Vision pode dizer o tipo.
+
+    O valor vir preenchido é justamente o problema — sem a pergunta do tipo, a
+    nota passava por ter um número.
+    """
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=True))
+    item = dict(_ITEM_VISION_VALIDO, tipo_documento="nota_fiscal", valor_pago=1245.00)
+    _instalar_fake_openai(monkeypatch, json.dumps(item))
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_imagem(b"fake-png-bytes", "image/png")
+
+
+def test_pdf_escaneado_que_a_vision_classifica_como_nota_e_recusado(monkeypatch):
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=True))
+    item = dict(_ITEM_VISION_VALIDO, tipo_documento="nota_fiscal")
+    _instalar_fake_openai(monkeypatch, json.dumps(item))
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_pdf(_pdf_em_branco())
+
+
+def test_ia_de_texto_que_classifica_como_nota_recusa(monkeypatch):
+    """Texto sem marcador que a regex conheça, e a IA reconhece a nota."""
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=True))
+    _texto_do_pdf(monkeypatch, ["Recibo de serviço municipal", "Total R 1245"])
+    item = dict(_ITEM_VISION_VALIDO, tipo_documento="nota_fiscal")
+    _instalar_fake_openai(monkeypatch, json.dumps(item))
+
+    with pytest.raises(pdf_parser.DocumentoNaoEComprovanteError):
+        pdf_parser.parse_pdf(b"%PDF-1.4 qualquer")
+
+
+def test_vision_sem_tipo_declarado_segue_como_antes(monkeypatch):
+    """Resposta sem `tipo_documento` (modelo antigo, chave omitida) não recusa.
+
+    Recusar na ausência da chave transformaria qualquer resposta incompleta da
+    IA em "isto é nota fiscal" — uma afirmação que ninguém fez.
+    """
+    monkeypatch.setattr(pdf_parser, "get_settings", lambda: _FakeSettings(ai_ligada=True))
+    _instalar_fake_openai(monkeypatch, json.dumps(_ITEM_VISION_VALIDO))
+
+    assert pdf_parser.parse_imagem(b"fake-png-bytes").valor_pago == Decimal("150.00")
+
+
+def test_recusa_de_nota_continua_sendo_erro_de_leitura_para_quem_so_conhece_esse():
+    """Quem só trata `PDFParseError` não pode ver a recusa virar exceção nova."""
+    assert issubclass(pdf_parser.DocumentoNaoEComprovanteError, PDFParseError)

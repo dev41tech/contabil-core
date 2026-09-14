@@ -58,6 +58,14 @@ class PDFParseError(Exception):
     pass
 
 
+class DocumentoNaoEComprovanteError(PDFParseError):
+    """O arquivo é legível, mas não é prova de pagamento — é uma nota fiscal.
+
+    Classe própria porque o tratamento é outro: falha de extração convida o
+    contador a preencher à mão, e aqui preencher à mão é justamente o erro.
+    """
+
+
 @dataclass
 class ComprovantePDF:
     favorecido: str | None = None
@@ -164,6 +172,72 @@ def _apos_rotulo(linha: str, rotulo_re: re.Pattern[str]) -> str | None:
     return resto or None
 
 
+# ──────────────────────────────────────────────────────────── o arquivo é comprovante?
+
+# NENHUMA CAMADA PERGUNTAVA ISSO
+#
+# As três camadas procuram um valor, e nota fiscal tem valor: a NFS-e de
+# R$ 1.245,00 da UNIQUE MOMENT casou em `valor\s+total\b` e entrou como
+# comprovante. O prompt da IA também começava com "analise este comprovante" —
+# assumia a resposta da pergunta que ninguém fazia.
+#
+# O dano não para na lista. O NEO associa sozinho o comprovante sem vínculo a um
+# débito de mesmo valor em ±3 dias, então a nota vira evidência de pagamento de
+# um lançamento que ela não prova.
+#
+# POR QUE ESTES MARCADORES, E NÃO "NOTA FISCAL" SOLTO
+#
+# Comprovante de verdade menciona nota o tempo todo — "Pagamento NF 1234" na
+# descrição do PIX. O que só existe na nota é a ESTRUTURA:
+#
+#   - o nome do documento auxiliar (DANFSe, DANFE), que só a própria nota imprime;
+#   - as duas partes do serviço, prestador E tomador — comprovante fala em
+#     pagador e favorecido/beneficiário, nunca em tomador;
+#   - o endereço de impressão do portal emissor.
+#
+# O terceiro veio da medição, não do desenho. Das 145 notas com texto na pasta
+# do escritório, ~40 escapavam: NFS-e de São Paulo salvas com Ctrl+P no portal
+# da prefeitura. Nelas o corpo da nota é IMAGEM, e o único texto do PDF é o
+# cabeçalho e o rodapé do navegador — título e URL, sem prestador nem tomador.
+_NOTA_DOCUMENTO_AUXILIAR = re.compile(
+    r"\bDANFS-?e\b|\bDANFE\b"
+    r"|documento\s+auxiliar\s+da\s+(?:nota\s+fiscal|nfs-?e|nf-?e)"
+    r"|notaprint\.aspx|nfe\.prefeitura\.|nfse\.gov\.br",
+    re.IGNORECASE,
+)
+_NOTA_TITULO = re.compile(
+    r"nota\s+fiscal\s+(?:eletr[ôo]nica\s+)?de\s+servi[çc]os?|\bNFS-?e\b",
+    re.IGNORECASE,
+)
+_NOTA_PRESTADOR = re.compile(r"\bprestador", re.IGNORECASE)
+_NOTA_TOMADOR = re.compile(r"\btomador", re.IGNORECASE)
+
+MENSAGEM_NOTA_FISCAL = (
+    "Este arquivo é uma nota fiscal, não um comprovante de pagamento. "
+    "Notas fiscais são importadas na tela de Notas Fiscais; aqui entra a prova "
+    "de que o pagamento saiu (PIX, TED, boleto pago)."
+)
+
+
+def _parece_nota_fiscal(linhas: list[str]) -> bool:
+    texto = "\n".join(linhas)
+    if _NOTA_DOCUMENTO_AUXILIAR.search(texto):
+        return True
+    tem_prestador = bool(_NOTA_PRESTADOR.search(texto))
+    tem_tomador = bool(_NOTA_TOMADOR.search(texto))
+    if tem_prestador and tem_tomador:
+        return True
+    # Título de NFS-e com uma das partes. O título sozinho não basta: é o que
+    # aparece na descrição de um PIX que paga a nota.
+    return bool(_NOTA_TITULO.search(texto)) and (tem_prestador or tem_tomador)
+
+
+def _recusar_se_nota_pela_ia(item: dict) -> None:
+    """A IA declarou o tipo — nas camadas sem texto local, é a única que pode."""
+    if str(item.get("tipo_documento") or "").strip().lower() == "nota_fiscal":
+        raise DocumentoNaoEComprovanteError(MENSAGEM_NOTA_FISCAL)
+
+
 # ──────────────────────────────────────────────────────────── Camada 1: regex por rótulo
 
 _ROTULO_FAVORECIDO = re.compile(
@@ -265,9 +339,13 @@ _AI_SYSTEM = (
 )
 
 _AI_PROMPT = """\
-Analise este comprovante de pagamento brasileiro (PIX, TED, DOC ou boleto) e extraia os dados.
+Analise este documento brasileiro. Primeiro diga que tipo de documento ele é; se for um
+comprovante de pagamento (PIX, TED, DOC ou boleto pago), extraia os dados.
 
 Retorne um único objeto JSON com EXATAMENTE estas chaves:
+  "tipo_documento"  → "comprovante_pagamento" se o documento PROVA que um pagamento foi feito;
+                       "nota_fiscal" se for nota fiscal (NFS-e, NF-e, DANFE, DANFSe), mesmo que
+                       ela traga valor, prestador e tomador; "outro" para qualquer outra coisa
   "favorecido"      → nome de quem recebeu o pagamento, ou null
   "cpf_cnpj"        → CPF ou CNPJ do favorecido (como aparece no documento), ou null
   "valor_pago"      → número decimal (ponto como separador) do valor efetivamente pago, ou null
@@ -283,9 +361,10 @@ Regras obrigatórias:
 - Use EXATAMENTE os nomes de campo acima
 - Se um campo não aparecer no documento, use null (não invente valores)
 - Valores brasileiros: "1.234,56" vira 1234.56
+- Nota fiscal NÃO é comprovante de pagamento: o valor dela é o do serviço, não o que saiu da conta
 
 Exemplo de saída:
-{"favorecido":"JOAO DA SILVA","cpf_cnpj":"123.456.789-00","valor_pago":150.00,"valor_documento":null,"data_pagamento":"05/01/2026","data_vencimento":null,"juros":null,"multa":null,"desconto":null}"""
+{"tipo_documento":"comprovante_pagamento","favorecido":"JOAO DA SILVA","cpf_cnpj":"123.456.789-00","valor_pago":150.00,"valor_documento":null,"data_pagamento":"05/01/2026","data_vencimento":null,"juros":null,"multa":null,"desconto":null}"""
 
 _AI_TEXT_MAX_CHARS = 40_000
 
@@ -378,6 +457,7 @@ def _parse_por_ai_texto(linhas: list[str], budget: _PDFBudget) -> ComprovantePDF
 
     raw = response.choices[0].message.content or ""
     item = _parse_ai_response(raw)
+    _recusar_se_nota_pela_ia(item)
     return _comprovante_from_item(item, confianca="ia")
 
 
@@ -441,6 +521,7 @@ def _parse_por_vision_pdf(conteudo_bytes: bytes, budget: _PDFBudget) -> Comprova
         logger.info("Vision: processando página %d/%d", page_num + 1, num_pages)
         png_bytes = _render_page_to_png(conteudo_bytes, page_num)
         item = _extrair_via_vision(png_bytes, "image/png", budget)
+        _recusar_se_nota_pela_ia(item)
         resultado = _comprovante_from_item(item, confianca="ia")
         if resultado is not None and resultado.valor_pago is not None:
             return resultado
@@ -485,6 +566,7 @@ def parse_imagem(conteudo_bytes: bytes, content_type: str = "image/png") -> Comp
         ai_calls_restantes=settings.pdf_max_ai_calls,
     )
     item = _extrair_via_vision(conteudo_bytes, content_type, budget)
+    _recusar_se_nota_pela_ia(item)
     resultado = _comprovante_from_item(item, confianca="ia")
     if resultado is None or resultado.valor_pago is None:
         raise PDFParseError(
@@ -564,6 +646,11 @@ def parse_pdf(conteudo_bytes: bytes) -> ComprovantePDF:
             "Não foi possível identificar o valor pago neste comprovante escaneado. "
             "Preencha os campos manualmente." + _dica_camadas_ia()
         )
+
+    # Antes da regex, e não depois: a regex acha o valor da nota e devolve
+    # sucesso — foi exatamente assim que a NFS-e entrou.
+    if _parece_nota_fiscal(linhas):
+        raise DocumentoNaoEComprovanteError(MENSAGEM_NOTA_FISCAL)
 
     resultado = _parse_por_regex(linhas)
     if resultado.valor_pago is not None:

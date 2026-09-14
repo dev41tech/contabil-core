@@ -791,10 +791,17 @@ class Comprovante(Base, TimestampMixin):
     observacao: Mapped[str | None] = mapped_column(String(500), nullable=True)
     arquivo_nome: Mapped[str | None] = mapped_column(String(255), nullable=True)
     arquivo_base64: Mapped[str | None] = mapped_column(Text, nullable=True)  # PDF/imagem em base64
+    # SHA-256 dos BYTES do arquivo (não do texto base64): o mesmo PDF reenviado
+    # tem de dar o mesmo hash mesmo que outro cliente quebre o base64 em linhas.
+    arquivo_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_comprovante_empresa", "empresa_id"),
         Index("ix_comprovante_transacao", "transacao_id"),
+        # Sem UNIQUE, de propósito: a base já tem duplicados de antes desta
+        # coluna existir, e um índice único faria a migration derrubar o
+        # container. Quem barra o duplicado novo é o service.
+        Index("ix_comprovante_empresa_arquivo_sha256", "empresa_id", "arquivo_sha256"),
     )
 
 

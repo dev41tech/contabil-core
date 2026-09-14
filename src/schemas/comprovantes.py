@@ -24,6 +24,10 @@ class ComprovanteCreate(BaseModel):
     transacao_id: UUID | None = None
     arquivo_nome: str | None = None
     arquivo_base64: str | None = None  # base64 do arquivo
+    # Confirmação do contador de que são dois pagamentos distintos com o mesmo
+    # valor, dia e favorecido. Não libera o MESMO arquivo reenviado — esse é
+    # sempre o mesmo comprovante.
+    permitir_duplicado: bool = False
 
 
 class ComprovanteResponse(BaseModel):
