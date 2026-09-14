@@ -118,3 +118,36 @@ class CancelarImportacaoResponse(BaseModel):
     importacao_id: UUID
     transacoes_removidas: int
     lancamentos_cancelados: int
+
+
+class TransacoesSemLoteResponse(BaseModel):
+    """Transações de uma conta que não pertencem a lote nenhum.
+
+    Importadas antes de 25/08/2026, quando o sistema ainda não registrava de qual
+    arquivo cada linha veio (migration 0028, sem backfill de propósito), ou
+    sincronizadas pelo Open Banking. Nenhum "Desfazer" de lote as alcança.
+    """
+
+    agencia_id: UUID
+    banco_sigla: str | None
+    agencia: str
+    numero: str
+    agencia_ativa: bool
+    transacoes_ativas: int
+    lancamentos_ativos: int
+    primeira_data: date
+    ultima_data: date
+
+
+class TransacoesSemLoteListResponse(BaseModel):
+    items: list[TransacoesSemLoteResponse]
+
+
+class RemoverSemLoteRequest(CancelarImportacaoRequest):
+    agencia_id: UUID
+
+
+class RemoverSemLoteResponse(BaseModel):
+    agencia_id: UUID
+    transacoes_removidas: int
+    lancamentos_cancelados: int

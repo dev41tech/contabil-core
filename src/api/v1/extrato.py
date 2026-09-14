@@ -23,12 +23,18 @@ from src.domain.extrato.importacoes import (
     hash_do_arquivo,
     listar_importacoes,
     lote_com_o_mesmo_arquivo,
+    remover_transacoes_sem_lote,
+    transacoes_sem_lote,
 )
 from src.schemas.extrato import (
     CancelarImportacaoRequest,
     CancelarImportacaoResponse,
     ImportacaoListResponse,
     ImportacaoResponse,
+    RemoverSemLoteRequest,
+    RemoverSemLoteResponse,
+    TransacoesSemLoteListResponse,
+    TransacoesSemLoteResponse,
     ExtratoPendentesResponse,
     TransacaoFiltro,
     TransacaoResponse,
@@ -152,6 +158,52 @@ async def listar_importacoes_endpoint(
         resposta.append(item)
     return ImportacaoListResponse(
         items=resposta, total=total, page=page, page_size=page_size
+    )
+
+
+# As rotas de /importacoes/sem-lote vêm ANTES das de /importacoes/{importacao_id}:
+# pela mesma razão da nota acima, "sem-lote" seria lido como UUID e daria 422.
+@router.get(
+    "/importacoes/sem-lote",
+    response_model=TransacoesSemLoteListResponse,
+    dependencies=[requer("extrato.read")],
+)
+async def listar_transacoes_sem_lote_endpoint(
+    empresa_id: UUID,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> TransacoesSemLoteListResponse:
+    """Por conta, as transações que não pertencem a lote nenhum — importadas antes
+    dos lotes existirem, ou vindas do Open Banking."""
+    itens = await transacoes_sem_lote(db, empresa_id=empresa_id)
+    return TransacoesSemLoteListResponse(
+        items=[TransacoesSemLoteResponse(**item) for item in itens]
+    )
+
+
+@router.post(
+    "/importacoes/sem-lote/remover",
+    response_model=RemoverSemLoteResponse,
+    dependencies=[requer("extrato.execute"), Depends(require_csrf)],
+)
+async def remover_transacoes_sem_lote_endpoint(
+    empresa_id: UUID,
+    body: RemoverSemLoteRequest,
+    ctx: AuthContext = Depends(get_company_context),
+    db: AsyncSession = Depends(get_db),
+) -> RemoverSemLoteResponse:
+    """Remove as transações sem lote de uma conta, cancelando antes os lançamentos."""
+    removidas, canceladas = await remover_transacoes_sem_lote(
+        db,
+        empresa_id=empresa_id,
+        agencia_id=body.agencia_id,
+        motivo=body.motivo,
+        usuario_id=ctx.user_id,
+    )
+    return RemoverSemLoteResponse(
+        agencia_id=body.agencia_id,
+        transacoes_removidas=removidas,
+        lancamentos_cancelados=canceladas,
     )
 
 

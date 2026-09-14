@@ -976,6 +976,202 @@ async def test_excluir_lote_sem_csrf_rejeita(client, tenant, usuario, empresa):
     assert r.status_code == 403
 
 
+# ── Transações sem lote
+#
+# Relato de 2026-09-14 na SINCOPEÇAS: depois de desfazer todas as importações, o
+# Extrato e os Registros ainda mostravam lançamentos. Eram transações de antes
+# da migration 0028, que ficaram sem lote — e nenhum "Desfazer" as alcançava.
+
+
+def _sem_lote_url(empresa_id) -> str:
+    return f"/api/v1/empresas/{empresa_id}/extrato/importacoes/sem-lote"
+
+
+async def _classificar_tudo(client, db, empresa, agencia_id, csrf) -> None:
+    """Uma regra que casa com as transações de `_semear`, e o NEO rodando."""
+    from src.db.models import PlanoConta
+
+    conta = PlanoConta(empresa_id=empresa.id, codigo="3.1.1", descricao="Despesas", tipo="despesa")
+    db.add(conta)
+    await db.flush()
+    r = await client.post(
+        f"/api/v1/empresas/{empresa.id}/regras",
+        json={"conta_id": str(conta.id), "agencia_id": agencia_id, "descricao": "Tarifa",
+              "historico": "TARIFA", "dc": "D", "tipo": "automatica"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert r.status_code == 201, r.text
+    await client.post(
+        f"/api/v1/empresas/{empresa.id}/neo/processar", json={}, headers={"X-CSRF-Token": csrf}
+    )
+
+
+@pytest.mark.asyncio
+async def test_transacoes_sem_lote_aparecem_por_conta_e_as_do_lote_nao(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    await _importar(client, empresa, agencia["id"], csrf)
+
+    r = await client.get(_sem_lote_url(empresa.id))
+
+    # 200 e não 422: a rota literal vem antes de /importacoes/{importacao_id}.
+    assert r.status_code == 200, r.text
+    (grupo,) = r.json()["items"]
+    assert grupo["agencia_id"] == agencia["id"]
+    assert grupo["transacoes_ativas"] == 3
+    assert grupo["primeira_data"] == "2026-03-01"
+    assert grupo["ultima_data"] == "2026-03-31"
+
+
+@pytest.mark.asyncio
+async def test_desfazer_todas_as_importacoes_deixava_as_sem_lote_para_tras(
+    client, db, tenant, usuario, empresa
+):
+    """O relato, reproduzido — e o que o novo caminho resolve."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    await _importar(client, empresa, agencia["id"], csrf)
+    await _classificar_tudo(client, db, empresa, agencia["id"], csrf)
+    registros = f"/api/v1/empresas/{empresa.id}/contabil"
+    assert (await client.get(registros)).json()["total"] > 0
+
+    for lote in (await client.get(_imp_url(empresa.id))).json()["items"]:
+        await client.post(
+            f"{_imp_url(empresa.id)}/{lote['id']}/cancelar",
+            json={"motivo": "limpando a empresa"}, headers={"X-CSRF-Token": csrf},
+        )
+    # O defeito: sem lote para desfazer, as antigas continuam nas duas telas.
+    assert (await _listar(client, empresa))["total"] == 3
+    assert (await client.get(registros)).json()["total"] > 0
+
+    r = await client.post(
+        f"{_sem_lote_url(empresa.id)}/remover",
+        json={"agencia_id": agencia["id"], "motivo": "limpando a empresa"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["transacoes_removidas"] == 3
+    assert r.json()["lancamentos_cancelados"] == 1
+    assert (await _listar(client, empresa))["total"] == 0
+    assert (await client.get(registros)).json()["total"] == 0
+    assert (await client.get(_sem_lote_url(empresa.id))).json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_remover_sem_lote_nao_toca_nas_transacoes_de_lote(
+    client, db, tenant, usuario, empresa
+):
+    """Quem tem lote sai pelo "Desfazer" do lote — com o registro de qual arquivo era."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    await _importar(client, empresa, agencia["id"], csrf)
+
+    await client.post(
+        f"{_sem_lote_url(empresa.id)}/remover",
+        json={"agencia_id": agencia["id"], "motivo": "so as antigas"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert (await _listar(client, empresa))["total"] == 2
+    assert (await client.get(_imp_url(empresa.id))).json()["items"][0]["transacoes_ativas"] == 2
+
+
+@pytest.mark.asyncio
+async def test_remover_sem_lote_so_alcanca_a_conta_escolhida(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    outra = (await client.post(
+        f"/api/v1/empresas/{empresa.id}/agencias",
+        json={"banco_sigla": "ITAU", "agencia": "7285", "numero": "12287"},
+        headers={"X-CSRF-Token": csrf},
+    )).json()
+    from datetime import date
+    from uuid import UUID
+
+    await _semear(db, empresa, agencia["id"])
+    db.add(Transacao(
+        empresa_id=empresa.id, agencia_id=UUID(outra["id"]),
+        data=date(2026, 4, 1), valor=Decimal("9.00"),
+        historico="DA OUTRA CONTA", dc="D", hash_dedup="hash_outra_conta",
+    ))
+    await db.flush()
+
+    await client.post(
+        f"{_sem_lote_url(empresa.id)}/remover",
+        json={"agencia_id": agencia["id"], "motivo": "so esta conta"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    (restante,) = (await client.get(_sem_lote_url(empresa.id))).json()["items"]
+    assert restante["agencia_id"] == outra["id"]
+    assert restante["transacoes_ativas"] == 1
+
+
+@pytest.mark.asyncio
+async def test_remover_sem_lote_de_conta_de_outra_empresa_devolve_404(
+    client, db, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    outra = Empresa(
+        tenant_id=tenant.id, razao_social="OUTRA EMPRESA LTDA",
+        cnpj="52.540.787/0001-88", regime_tributario="lucro_real",
+    )
+    db.add(outra)
+    await db.flush()
+
+    r = await client.post(
+        f"{_sem_lote_url(outra.id)}/remover",
+        json={"agencia_id": agencia["id"], "motivo": "conta de outra empresa"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 404
+    assert (await _listar(client, empresa))["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_remover_sem_lote_de_conta_que_nao_tem_devolve_409(
+    client, tenant, usuario, empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+
+    r = await client.post(
+        f"{_sem_lote_url(empresa.id)}/remover",
+        json={"agencia_id": agencia["id"], "motivo": "nada para remover"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_remover_sem_lote_exige_motivo_e_csrf(client, db, tenant, usuario, empresa):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _criar_agencia(client, empresa, csrf)
+    await _semear(db, empresa, agencia["id"])
+    url = f"{_sem_lote_url(empresa.id)}/remover"
+
+    sem_motivo = await client.post(
+        url, json={"agencia_id": agencia["id"], "motivo": " "}, headers={"X-CSRF-Token": csrf}
+    )
+    sem_csrf = await client.post(url, json={"agencia_id": agencia["id"], "motivo": "valido"})
+
+    assert sem_motivo.status_code == 422
+    assert sem_csrf.status_code == 403
+    assert (await _listar(client, empresa))["total"] == 3
+
+
 # ── Conferência de completude pelo saldo declarado no arquivo
 
 def _ofx_com_saldo(fitid: str, dia: str, valor: str, saldo: str, dia_saldo: str) -> str:

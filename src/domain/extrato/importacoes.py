@@ -246,29 +246,15 @@ async def cancelar_importacao(
         .all()
     )
 
-    lancamentos_cancelados = 0
     agora = datetime.now(UTC)
-    for transacao in transacoes:
-        lancamento_id = (
-            await db.execute(
-                select(RegistroContabil.lancamento_id).where(
-                    RegistroContabil.transacao_id == transacao.id,
-                    RegistroContabil.deleted_at.is_(None),
-                ).limit(1)
-            )
-        ).scalar_one_or_none()
-        if lancamento_id is not None:
-            # Primeiro o lançamento: apagar a transação antes deixaria partidas
-            # órfãs no razão, sem transação para explicá-las.
-            await cancelar_lancamento(
-                db,
-                empresa_id=empresa_id,
-                lancamento_id=lancamento_id,
-                motivo=f"Importação cancelada: {motivo}",
-                usuario_id=usuario_id,
-            )
-            lancamentos_cancelados += 1
-        transacao.deleted_at = agora
+    lancamentos_cancelados = await _remover_transacoes(
+        db,
+        empresa_id=empresa_id,
+        transacoes=transacoes,
+        motivo_lancamento=f"Importação cancelada: {motivo}",
+        usuario_id=usuario_id,
+        agora=agora,
+    )
 
     importacao.cancelada_em = agora
     importacao.cancelada_por = usuario_id
@@ -304,6 +290,190 @@ async def cancelar_importacao(
         transacoes_removidas=len(transacoes),
         lancamentos_cancelados=lancamentos_cancelados,
     )
+
+
+async def _remover_transacoes(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    transacoes: list[Transacao],
+    motivo_lancamento: str,
+    usuario_id: UUID | None,
+    agora: datetime,
+) -> int:
+    """Remove transações já travadas, cancelando antes o lançamento de cada uma.
+
+    Devolve quantos lançamentos foram cancelados. Compartilhado entre o lote e o
+    conjunto sem lote: a ordem é a mesma nos dois, e é ela que importa.
+    """
+    lancamentos_cancelados = 0
+    for transacao in transacoes:
+        lancamento_id = (
+            await db.execute(
+                select(RegistroContabil.lancamento_id).where(
+                    RegistroContabil.transacao_id == transacao.id,
+                    RegistroContabil.deleted_at.is_(None),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if lancamento_id is not None:
+            # Primeiro o lançamento: apagar a transação antes deixaria partidas
+            # órfãs no razão, sem transação para explicá-las.
+            await cancelar_lancamento(
+                db,
+                empresa_id=empresa_id,
+                lancamento_id=lancamento_id,
+                motivo=motivo_lancamento,
+                usuario_id=usuario_id,
+            )
+            lancamentos_cancelados += 1
+        transacao.deleted_at = agora
+    return lancamentos_cancelados
+
+
+# ── Transações sem lote ──────────────────────────────────────────────────────
+#
+# APAGAR TODAS AS IMPORTAÇÕES NÃO LIMPAVA A EMPRESA
+#
+# Relato de 2026-09-14 na SINCOPEÇAS: depois de desfazer todas as importações de
+# extrato, o Extrato e os Registros ainda mostravam lançamentos.
+#
+# Os lotes só existem desde a migration 0028 (25/08/2026), que deixou as
+# transações anteriores com `importacao_id` nulo — sem backfill de propósito,
+# porque nada no banco diz qual upload trouxe qual linha, e inventar lote seria
+# pior que não ter. O Open Banking também cria transação sem lote. Nenhuma delas
+# aparecia em Importações, e nenhum "Desfazer" as alcançava.
+#
+# O agrupamento é por CONTA, não por arquivo: é o único conjunto que existe de
+# fato no banco. Não finge ser o lote que nunca existiu.
+
+
+def _sem_lote(empresa_id: UUID):
+    return (
+        Transacao.empresa_id == empresa_id,
+        Transacao.importacao_id.is_(None),
+        Transacao.deleted_at.is_(None),
+    )
+
+
+async def transacoes_sem_lote(db: AsyncSession, *, empresa_id: UUID) -> list[dict]:
+    """Por conta bancária: quantas transações vivas sem lote, e de que período."""
+    lancamentos = (
+        select(func.count(func.distinct(RegistroContabil.lancamento_id)))
+        .join(Transacao, Transacao.id == RegistroContabil.transacao_id)
+        .where(
+            *_sem_lote(empresa_id),
+            RegistroContabil.deleted_at.is_(None),
+            Transacao.agencia_id == AgenciaBancaria.id,
+        )
+        .scalar_subquery()
+    )
+    linhas = (
+        await db.execute(
+            select(
+                AgenciaBancaria,
+                func.count(Transacao.id),
+                func.min(Transacao.data),
+                func.max(Transacao.data),
+                lancamentos,
+            )
+            .join(Transacao, Transacao.agencia_id == AgenciaBancaria.id)
+            .where(*_sem_lote(empresa_id), AgenciaBancaria.empresa_id == empresa_id)
+            .group_by(AgenciaBancaria.id)
+            .order_by(AgenciaBancaria.banco_sigla, AgenciaBancaria.agencia, AgenciaBancaria.numero)
+        )
+    ).all()
+    return [
+        {
+            "agencia_id": agencia.id,
+            "banco_sigla": agencia.banco_sigla,
+            "agencia": agencia.agencia,
+            "numero": agencia.numero,
+            "agencia_ativa": agencia.ativa,
+            "transacoes_ativas": quantidade,
+            "lancamentos_ativos": lancamentos_ativos or 0,
+            "primeira_data": primeira,
+            "ultima_data": ultima,
+        }
+        for agencia, quantidade, primeira, ultima, lancamentos_ativos in linhas
+    ]
+
+
+async def remover_transacoes_sem_lote(
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    agencia_id: UUID,
+    motivo: str,
+    usuario_id: UUID | None = None,
+) -> tuple[int, int]:
+    """Remove as transações sem lote de UMA conta, com os lançamentos delas.
+
+    Mesma operação do "Desfazer" do lote — lançamento cancelado antes, transação
+    removida depois, motivo obrigatório e auditoria —, sobre o conjunto que o
+    lote não alcança. Por conta, e não da empresa inteira de uma vez: o raio de
+    uma ação irreversível pela tela tem de caber no que o contador está vendo.
+    """
+    agencia = (
+        await db.execute(
+            select(AgenciaBancaria).where(
+                AgenciaBancaria.id == agencia_id,
+                AgenciaBancaria.empresa_id == empresa_id,
+                AgenciaBancaria.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if agencia is None:
+        raise NotFoundError(message="Conta bancária não encontrada.")
+
+    transacoes = list(
+        (
+            await db.execute(
+                select(Transacao)
+                .where(*_sem_lote(empresa_id), Transacao.agencia_id == agencia_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not transacoes:
+        raise ConflictError(message="Esta conta não tem transações sem lote de importação.")
+
+    lancamentos_cancelados = await _remover_transacoes(
+        db,
+        empresa_id=empresa_id,
+        transacoes=transacoes,
+        motivo_lancamento=f"Transações sem lote removidas: {motivo}",
+        usuario_id=usuario_id,
+        agora=datetime.now(UTC),
+    )
+
+    await registrar_auditoria(
+        db,
+        acao="extrato_sem_lote.removido",
+        entidade="agencia_bancaria",
+        entidade_id=agencia_id,
+        dados_antes={
+            "transacoes_ativas": len(transacoes),
+            "primeira_data": min(t.data for t in transacoes).isoformat(),
+            "ultima_data": max(t.data for t in transacoes).isoformat(),
+        },
+        dados_depois={
+            "motivo": motivo,
+            "transacoes_removidas": len(transacoes),
+            "lancamentos_cancelados": lancamentos_cancelados,
+        },
+        empresa_id=empresa_id,
+        usuario_id=usuario_id,
+    )
+    logger.info(
+        "extrato.sem_lote_removido",
+        agencia_id=str(agencia_id),
+        transacoes=len(transacoes),
+        lancamentos=lancamentos_cancelados,
+    )
+    return len(transacoes), lancamentos_cancelados
 
 
 async def excluir_importacao(
