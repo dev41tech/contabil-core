@@ -36,6 +36,7 @@ from src.domain.extrato._comum import gerar_fitid as _gerar_fitid
 from src.domain.extrato._comum import parse_data as _parse_data
 from src.domain.extrato._comum import parse_valor as _parse_valor
 from src.domain.extrato.ofx_parser import TransacaoOFX
+from src.domain.extrato.periodo import ajustar_virada_de_ano, fim_do_periodo
 
 logger = logging.getLogger(__name__)
 
@@ -1114,7 +1115,11 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
         if total_chars >= 50 and legibilidade >= _FRACAO_LEGIVEL_MINIMA:
             logger.info("pdfplumber: %d chars extraídos", total_chars)
 
-            referencia_ano = datetime.now(UTC).year
+            # O ano vem do documento. Até 16/09/2026 vinha do relógio, e um
+            # extrato de fev/2025 importado em 2026 entrava inteiro em 2026 —
+            # ver `periodo.py`. O relógio só vale quando o extrato não diz.
+            fim = fim_do_periodo(linhas)
+            referencia_ano = fim.year if fim else datetime.now(UTC).year
 
             # ── Camada 0: adaptador do banco ─────────────────────────────────
             adaptador = bancos.escolher(banco_sigla, linhas)
@@ -1134,7 +1139,8 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
                         _validar_completude(linhas, transacoes)
                     # `ordem` é a posição no ARQUIVO, não no bloco.
                     transacoes = [
-                        replace(t, ordem=i) for i, t in enumerate(transacoes)
+                        replace(t, ordem=i)
+                        for i, t in enumerate(ajustar_virada_de_ano(transacoes, fim))
                     ]
                     logger.info(
                         "PDF parser: %d transações via adaptador %s (camada 0)",
@@ -1158,6 +1164,7 @@ def parse_pdf(conteudo_bytes: bytes, banco_sigla: str | None = None) -> list[Tra
             transacoes = _parse_linhas_multipagina(linhas, referencia_ano)
             if transacoes:
                 _validar_completude(linhas, transacoes)
+                transacoes = ajustar_virada_de_ano(transacoes, fim)
                 logger.info(
                     "PDF parser: %d transações via pdfplumber regex (camada 1)",
                     len(transacoes),

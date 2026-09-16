@@ -25,6 +25,7 @@ from src.api.v1.cartoes import router as cartoes_router
 from src.api.v1.openbanking import router as openbanking_router
 from src.api.v1.relatorios import router as relatorios_router
 from src.api.v1.concilpro import router as concilpro_router
+from src.api.v1.conciliacao_bancaria import router as conciliacao_bancaria_router
 
 router = APIRouter(prefix="/api/v1")
 
@@ -51,3 +52,4 @@ router.include_router(cartoes_router)
 router.include_router(openbanking_router)
 router.include_router(relatorios_router)
 router.include_router(concilpro_router)
+router.include_router(conciliacao_bancaria_router)
