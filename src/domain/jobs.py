@@ -233,6 +233,36 @@ async def _importar_extrato(db: AsyncSession, empresa_id: UUID, agencia_id: UUID
         await registrar_resultado(db, importacao, resultado)
         return resultado
 
+    from src.domain.extrato.planilha_parser import EXTENSOES as EXTENSOES_PLANILHA
+
+    # Planilha antes do OFX, e não no `else` dele. Até 04/09/2026 tudo que não
+    # terminava em `.pdf` ia para o parser de OFX, e um `.xlsx` falhava com
+    # "Arquivo OFX inválido" — mensagem que manda o usuário procurar defeito no
+    # arquivo errado. Na pasta do escritório são 88 planilhas, 36 sem PDF nem
+    # OFX irmão: contas que o sistema não lia em formato nenhum.
+    #
+    # A rota já minúscula o nome, mas metade destes arquivos chega como `.XLS`,
+    # e um chamador interno não passa pela rota.
+    if nome_arquivo.lower().endswith(EXTENSOES_PLANILHA):
+        from starlette.concurrency import run_in_threadpool
+        from src.core.errors import ValidationError
+        from src.domain.extrato.planilha_parser import PlanilhaParseError, parse_planilha
+
+        try:
+            # `openpyxl` e `xlrd` são síncronos e leem o arquivo inteiro; a
+            # maior planilha desta base tem 729 lançamentos. Fora da thread
+            # pool isso trava o event loop do worker.
+            transacoes = await run_in_threadpool(
+                parse_planilha, conteudo_bytes, nome_arquivo
+            )
+        except PlanilhaParseError as exc:
+            raise ValidationError(message=f"Planilha inválida: {exc}") from exc
+        resultado = await svc.importar_transacoes_raw(
+            transacoes, agencia_id, importacao_id=importacao.id
+        )
+        await registrar_resultado(db, importacao, resultado)
+        return resultado
+
     try:
         conteudo = conteudo_bytes.decode("utf-8")
     except UnicodeDecodeError:

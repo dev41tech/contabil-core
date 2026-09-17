@@ -62,11 +62,13 @@ async def importar_extrato(
     background_tasks: BackgroundTasks,
     request: Request,
     agencia_id: UUID = Query(..., description="UUID da agência bancária"),
-    arquivo: UploadFile = File(..., description="Arquivo OFX ou PDF de extrato bancário"),
+    arquivo: UploadFile = File(
+        ..., description="Extrato bancário em OFX, PDF ou planilha (.xls, .xlsx, .csv)"
+    ),
     ctx: AuthContext = Depends(get_company_context),
     db: AsyncSession = Depends(get_db),
 ) -> Job:
-    """Enfileira a importação OFX/PDF sem manter a requisição pendurada."""
+    """Enfileira a importação sem manter a requisição pendurada."""
     conteudo_bytes = await ler_upload_limitado(arquivo)
     nome = (arquivo.filename or "").lower()
 

@@ -5,12 +5,17 @@
     09/01/2024  PIX_DEB     PAGAMENTO PIX ... APARECIDO C      150,00
     09/01/2024  CAPTACAO    RESG.APLIC.FIN.AVISO PREV                   150,00      0,00
 
-**Este NÃO é o único layout do Sicredi.** O outro — `Data Descrição Documento
-Valor (R$) Saldo (R$)`, uma coluna de valor com sinal — é lido pelo parser
-genérico e continua sendo. Quando o arquivo é daquele, `extrair_de_palavras`
-aqui devolve lista vazia e o `parse_pdf` segue para o genérico sozinho. Por isso
-este módulo pode reivindicar a sigla SICREDI sem tirar de funcionamento o que já
-funcionava.
+**Este NÃO é o único layout do Sicredi.** O outro é o mais comum na base do
+escritório — 38 dos 63 arquivos:
+
+    Data Descrição Documento Valor (R$) Saldo (R$)
+    SALDO ANTERIOR 12.017,04
+    01/12/2025 RECEBIMENTO PIX ... PIX_CRED 47,96 12.065,00
+    01/12/2025 LIQUIDACAO BOLETO ... MELLODI 251066667 -351,26 12.725,35
+
+Uma coluna de valor, com o sinal nele, e o saldo em toda linha. Ele era lido
+pelo parser genérico, e 23 dos 38 arquivos eram RECUSADOS — ver
+`_extrair_valor_e_saldo` para a causa, que não estava no formato das linhas.
 
 O que obriga a leitura por coordenada: **há três colunas numéricas** (`DEBITO`,
 `CREDITO`, `SALDO`) e a maioria das linhas traz um número só. No texto achatado,
@@ -167,6 +172,164 @@ def extrair_de_palavras(paginas: list[list[dict]], referencia_ano: int) -> list[
                 )
             )
             idx += 1
+
+    if not transacoes:
+        # O outro layout do banco. As palavras já estão na mão, então agrupá-las
+        # de volta em linhas custa menos que uma segunda leitura do PDF.
+        linhas_texto = [
+            " ".join(palavra["text"] for palavra in linha)
+            for palavras in paginas
+            for linha in agrupar_linhas(palavras)
+        ]
+        return _extrair_valor_e_saldo(linhas_texto, referencia_ano)
+    return [Bloco(transacoes=transacoes, saldo_anterior=saldo_anterior)]
+
+
+# ─────────────────────────────── Segundo layout: uma coluna de valor com sinal
+
+# A descrição é OPCIONAL: quando o texto é longo, ele é quebrado inteiro em
+# volta e a linha de dados fica só com data, valor e saldo —
+# `13/10/2025 -407,50 1.546,50`. Exigir ao menos um caractere aqui descartava
+# esses lançamentos, e o extrato passava a fechar 7 linhas a menos com a cadeia
+# quebrada em 6 pontos.
+_LINHA_VALOR_SALDO = re.compile(
+    r"^(\d{2}/\d{2}/\d{4})\s+(.*?)\s*(-?\d{1,3}(?:\.\d{3})*,\d{2})"
+    r"\s+(-?\d{1,3}(?:\.\d{3})*,\d{2})\s*$"
+)
+# Os dois rótulos de abertura vistos na base: "SALDO ANTERIOR" e "SALDO" seco.
+_SALDO_ANTERIOR_SIMPLES = re.compile(
+    r"^SALDO(?:\s+ANTERIOR)?\s+(-?\d{1,3}(?:\.\d{3})*,\d{2})\s*$", re.IGNORECASE
+)
+
+# O QUE RECUSAVA 23 DOS 38 ARQUIVOS DESTE LAYOUT
+#
+# O extrato não termina no último lançamento. Depois dele vem:
+#
+#     Lançamentos Futuros (Próximos 30 dias)
+#     Data Descrição Valor (R$)
+#     25/01/2026 CESTA EMPRESARIAL 02 -67,30
+#
+# São débitos AGENDADOS, que ainda não aconteceram, e a seção não tem coluna de
+# saldo. O parser genérico os lia como movimento realizado: a cadeia de saldos
+# quebrava e o arquivo inteiro era recusado.
+#
+# A recusa escondia o defeito pior. Se a cadeia não existisse, esses lançamentos
+# entrariam no razão como se tivessem ocorrido — um débito futuro contabilizado
+# hoje. É a mesma família da linha de rodapé do Itaú que entrou como crédito de
+# R$ 19.070,30 em agosto, e a razão de o corte ser por marca explícita e não por
+# heurística de "linha estranha no fim".
+#
+# Medido: dos arquivos deste layout que falhavam, TODOS tinham esta seção;
+# nenhum dos que já liam tinha.
+_FIM_DO_EXTRATO = re.compile(r"Lan[çc]amentos\s+Futuros", re.IGNORECASE)
+
+_IGNORAR_VALOR_SALDO = re.compile(
+    r"^(Data\s+Descri|Associado:|Cooperativa:|Conta:|Extrato\s*\(|"
+    r"Valores das opera|Sicredi Fone|SAC\s|Ouvidoria|0800\s|\d{4}\s\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _extrair_valor_e_saldo(linhas: list[str], referencia_ano: int) -> list[Bloco]:
+    """Layout `Data Descrição Documento Valor (R$) Saldo (R$)`.
+
+    Lido por texto, e não por coordenada, porque aqui há UMA coluna de valor: o
+    sinal está no próprio número, então não é preciso saber em que coluna ele
+    caiu. É o que separa este layout do outro deste mesmo banco.
+    """
+    limpas = [ln.strip() for ln in linhas]
+    transacoes: list[TransacaoOFX] = []
+    saldo_anterior: Decimal | None = None
+    idx = 0
+
+    # Linha solta já usada por um lançamento não pode ser usada por outro: duas
+    # linhas de dados sem descrição em sequência disputariam o mesmo texto, e a
+    # segunda roubaria a contraparte da primeira.
+    consumidas: set[int] = set()
+
+    def eh_estrutural(i: int) -> bool:
+        if not 0 <= i < len(limpas) or not limpas[i]:
+            return True
+        return bool(
+            _LINHA_VALOR_SALDO.match(limpas[i])
+            or _SALDO_ANTERIOR_SIMPLES.match(limpas[i])
+            or _IGNORAR_VALOR_SALDO.match(limpas[i])
+            # O cabeçalho da seção de agendados fecha o extrato: sem isto ele
+            # seria colado como se fosse o nome de uma contraparte.
+            or _FIM_DO_EXTRATO.search(limpas[i])
+        )
+
+    def texto_solto(i: int) -> str:
+        if eh_estrutural(i) or i in consumidas:
+            return ""
+        consumidas.add(i)
+        return limpas[i]
+
+    for i, limpa in enumerate(limpas):
+        if not limpa:
+            continue
+
+        if _FIM_DO_EXTRATO.search(limpa):
+            break
+
+        if saldo_anterior is None:
+            abertura = _SALDO_ANTERIOR_SIMPLES.match(limpa)
+            if abertura:
+                saldo_anterior = parse_valor(abertura.group(1))
+                continue
+
+        if _IGNORAR_VALOR_SALDO.match(limpa):
+            continue
+
+        casada = _LINHA_VALOR_SALDO.match(limpa)
+        if not casada:
+            continue
+
+        data_str, meio, valor_str, saldo_str = casada.groups()
+        data_lida = parse_data(data_str, referencia_ano)
+        valor = parse_valor(valor_str)
+        saldo = parse_valor(saldo_str)
+        if data_lida is None or valor is None or valor == 0:
+            continue
+
+        meio = re.sub(r"\s+", " ", meio).strip()
+        # QUANDO COLAR O TEXTO DE VOLTA, E POR QUE NÃO SEMPRE
+        #
+        # Descrição longa é quebrada em volta da linha de dados, e o que sobra
+        # no meio é só a coluna `Documento` — `PIX_DEB`, `CX240077` — ou nada:
+        #
+        #     PAGAMENTO PIX 00501462970 DOUGLAS ALEXANDRE
+        #     01/10/2025 PIX_DEB -300,00 2.514,84
+        #     DUFL
+        #
+        # `PIX_DEB` sozinho não identifica ninguém, e é justamente o nome da
+        # contraparte que o NEO precisa para classificar.
+        #
+        # Mas colar SEMPRE erraria: o texto solto de uma quebra fica adjacente
+        # também ao lançamento seguinte, que tem descrição própria e roubaria o
+        # "DUFL" do vizinho. Duas ou mais palavras no meio significam descrição
+        # completa na própria linha — aí não há o que colar.
+        if len(meio.split()) < 2:
+            acima = texto_solto(i - 1)
+            abaixo = texto_solto(i + 1)
+            # A ordem reproduz a da linha inteira: descrição e, no fim, o
+            # documento — que é onde ele aparece quando tudo cabe numa linha só.
+            historico = " ".join(p for p in (acima, abaixo, meio) if p).strip()
+        else:
+            historico = meio
+        historico = re.sub(r"\s+", " ", historico)[:200] or "SEM DESCRIÇÃO"
+        transacoes.append(
+            TransacaoOFX(
+                fitid=gerar_fitid(data_lida, historico, valor, idx),
+                data=data_lida,
+                valor=valor,
+                historico=historico,
+                tipo_ofx="CREDIT" if valor > 0 else "DEBIT",
+                saldo_apos=saldo,
+                ordem=idx,
+            )
+        )
+        idx += 1
 
     if not transacoes:
         return []

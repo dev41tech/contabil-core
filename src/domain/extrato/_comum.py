@@ -94,17 +94,22 @@ def parse_valor(s: str) -> Decimal | None:
     s = s.strip().replace("R$", "").replace(" ", "").replace("\xa0", "")
     negative = s.startswith("-") or s.startswith("(") or s.endswith("-")
     s = s.lstrip("-(").rstrip(")-")
-    if re.match(r"^\d{1,3}(,\d{3})*\.\d{2}$", s):
-        val = Decimal(s.replace(",", ""))
-    elif "," in s and "." in s:
-        val = Decimal(s.replace(".", "").replace(",", "."))
-    elif "," in s:
-        val = Decimal(s.replace(",", "."))
-    else:
-        try:
+    # Toda conversão sob o mesmo guarda: a assinatura promete `Decimal | None`,
+    # e até 04/09/2026 só o último ramo era protegido. `"500,00D"` — o sinal
+    # colado no número, que o Sicoob usa — entrava no ramo da vírgula e
+    # levantava `InvalidOperation` de dentro de uma função que diz devolver
+    # `None`. Quem chama trata `None`; ninguém trata exceção daqui.
+    try:
+        if re.match(r"^\d{1,3}(,\d{3})*\.\d{2}$", s):
+            val = Decimal(s.replace(",", ""))
+        elif "," in s and "." in s:
+            val = Decimal(s.replace(".", "").replace(",", "."))
+        elif "," in s:
+            val = Decimal(s.replace(",", "."))
+        else:
             val = Decimal(s)
-        except InvalidOperation:
-            return None
+    except InvalidOperation:
+        return None
     return -val if negative else val
 
 
