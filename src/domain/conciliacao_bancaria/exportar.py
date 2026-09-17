@@ -47,6 +47,7 @@ def gerar_planilha(relatorio: RelatorioConciliacao) -> bytes:
         ("Lançamentos no extrato", r.lancamentos_extrato),
         ("Conciliados", r.conciliados),
         ("Pendências", r.pendencias),
+        ("Aplicação automática não conferida (extrato não traz)", r.aplicacao_sem_extrato),
         ("Movimento do razão (sem abertura)", float(r.movimento_razao)),
         ("Movimento do extrato", float(r.movimento_extrato)),
         ("Diferença", float(r.diferenca)),
@@ -93,6 +94,20 @@ def gerar_planilha(relatorio: RelatorioConciliacao) -> bytes:
         wp.column_dimensions[get_column_letter(i)].width = w
     wp.freeze_panes = "A2"
     wp.auto_filter.ref = f"A1:J{wp.max_row}"
+
+    if relatorio.aplicacao_sem_extrato:
+        wa = wb.create_sheet("Aplicação não conferida")
+        _linha(wa, ["Data", "Valor", "Histórico", "Lote", "Contrapartida"], negrito=True)
+        for c in wa[1]:
+            c.fill = _CABECALHO
+        for linha in relatorio.aplicacao_sem_extrato:
+            _linha(wa, [linha.data, float(linha.valor), linha.historico,
+                        linha.lote, linha.contrapartida])
+            wa.cell(wa.max_row, 1).number_format = "DD/MM/YYYY"
+            wa.cell(wa.max_row, 2).number_format = "#,##0.00"
+        for i, w in enumerate([12, 15, 55, 12, 14], 1):
+            wa.column_dimensions[get_column_letter(i)].width = w
+        wa.freeze_panes = "A2"
 
     saida = BytesIO()
     wb.save(saida)

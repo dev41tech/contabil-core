@@ -269,3 +269,40 @@ async def test_sem_csrf_rejeita(client: AsyncClient, tenant: Tenant, usuario: Us
         files={"arquivo": ("r.xlsx", io.BytesIO(b"PK"), "application/octet-stream")},
     )
     assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_aplicacao_automatica_que_o_extrato_nao_traz_vira_aviso_e_nao_pendencia(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    """O extrato (OFX) não tem nenhuma linha de aplicação; o razão tem resgate e aplicação."""
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _conta_com_extrato(client, empresa, csrf)
+    razao = _razao_xlsx([
+        *_RAZAO_PADRAO,
+        (4, 3129329, "RESGATE DE APLICAÇÃO AUTOMÁTICA", 2700, 5000.00, None),
+        (5, 3129330, "OPERAÇÃO DE APLICAÇÃO AUTOMÁTICA", 2700, None, 4000.00),
+    ])
+
+    r = await _conciliar(client, empresa, agencia["id"], csrf, razao)
+
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    tipos = {g["tipo"] for g in corpo["pendencias"]}
+    assert tipos == {"DUPLICIDADE_RAZAO", "SO_RAZAO", "SO_EXTRATO"}
+    assert all(
+        "APLICAÇÃO" not in linha["historico"] for g in corpo["pendencias"] for linha in g["razao"]
+    )
+    assert [linha["historico"] for linha in corpo["aplicacao_sem_extrato"]] == [
+        "RESGATE DE APLICAÇÃO AUTOMÁTICA", "OPERAÇÃO DE APLICAÇÃO AUTOMÁTICA"
+    ]
+    assert corpo["resumo"]["aplicacao_sem_extrato"] == 2
+    assert corpo["resumo"]["diferenca_explicada"] is True
+    (aviso,) = [a for a in corpo["avisos"] if "aplicação automática" in a]
+    assert "1 aplicação (R$ 4.000,00)" in aviso
+    assert "1 resgate (R$ 5.000,00)" in aviso
+
+    planilha = await _conciliar(client, empresa, agencia["id"], csrf, razao, formato="xlsx")
+    wb = openpyxl.load_workbook(io.BytesIO(planilha.content))
+    assert "Aplicação não conferida" in wb.sheetnames
+    assert wb["Aplicação não conferida"].max_row == 3

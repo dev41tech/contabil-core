@@ -157,6 +157,7 @@ def _derivar_varredura_da_aplicacao(
     transacoes: list[TransacaoOFX],
     saldo_anterior: Decimal | None,
     aplicacoes: list[tuple[int, Decimal]],
+    aplicacao_inicial: Decimal = Decimal("0"),
 ) -> list[TransacaoOFX]:
     """Repõe a varredura para a aplicação automática que o extrato não imprime.
 
@@ -190,7 +191,7 @@ def _derivar_varredura_da_aplicacao(
     por_posicao = dict(aplicacoes)
     resultado: list[TransacaoOFX] = []
     corrente = saldo_anterior
-    saldo_aplicacao = Decimal("0")
+    saldo_aplicacao = aplicacao_inicial
 
     for posicao, transacao in enumerate(transacoes):
         impresso = transacao.saldo_apos
@@ -224,6 +225,76 @@ def _derivar_varredura_da_aplicacao(
         resultado.append(replace(transacao, ordem=len(resultado)))
 
     return resultado
+
+
+def _principais_iniciais(paginas: list[list[dict]]) -> list[Decimal]:
+    """Saldo aplicado no fim do mês ANTERIOR, do resumo das aplicações automáticas.
+
+    O quadro vem depois do fecho da movimentação:
+
+        histórico  saldo em 02/25 R$  aplicação R$  rendimentos  resgates  saldo em 03/25 R$
+        principal       3.981.178,45  3.500.733,98        0,00   7.481.912,43        0,00
+
+    O primeiro número da linha `principal` é o saldo aplicado na abertura. Um
+    valor por quadro — o extrato pode trazer mais de um produto.
+    """
+    principais: list[Decimal] = []
+    for palavras in paginas:
+        for linha in _agrupar_linhas(palavras):
+            if len(linha) < 3 or linha[0]["text"].lower() != "principal":
+                continue
+            if not _VALOR.match(linha[1]["text"]):
+                continue
+            valor = parse_valor(linha[1]["text"])
+            if valor is not None:
+                principais.append(valor)
+    return principais
+
+
+def _saldo_anterior_da_conta_corrente(
+    transacoes: list[TransacaoOFX],
+    saldo_anterior: Decimal | None,
+    principais: list[Decimal],
+) -> tuple[Decimal | None, Decimal]:
+    """Separa a aplicação do "Saldo anterior" quando ele a inclui.
+
+    Com saldo aplicado na abertura, o Itaú imprime em `Saldo anterior` a soma da
+    conta corrente com a aplicação (BLD, mar/2025: 3.981.179,45 = 1,00 na conta
+    + 3.981.178,45 aplicados), mas a coluna de saldo dos lançamentos acompanha
+    só a conta corrente. A cadeia partia de 3,98 milhões, chegava a 1,00 na
+    primeira âncora e o extrato inteiro era recusado por lançamento "faltando".
+    Quando a aplicação está zerada (JS BERTOLDO, fev/2026) o saldo anterior já é
+    só da conta — por isso não dá para descontar sempre.
+
+    Quem decide é a primeira âncora impressa: a abertura só é trocada quando o
+    saldo anterior como está NÃO chega nela e o saldo anterior menos o principal
+    chega. Dois números do banco concordando, como na varredura derivada. Se
+    nenhum candidato fecha, nada muda e a recusa acontece como antes.
+
+    Devolve (saldo anterior da conta corrente, saldo aplicado na abertura).
+    """
+    sem_mudanca = (saldo_anterior, Decimal("0"))
+    if saldo_anterior is None:
+        return sem_mudanca
+    candidatos = [p for p in principais if p > 0]
+    if len(candidatos) > 1:
+        candidatos.append(sum(candidatos, Decimal("0")))
+    if not candidatos:
+        return sem_mudanca
+
+    soma = Decimal("0")
+    for transacao in transacoes:
+        soma += transacao.valor
+        if transacao.saldo_apos is None:
+            continue
+        impresso = transacao.saldo_apos
+        if abs(saldo_anterior + soma - impresso) <= _TOLERANCIA_VARREDURA:
+            return sem_mudanca
+        for principal in candidatos:
+            if abs(saldo_anterior - principal + soma - impresso) <= _TOLERANCIA_VARREDURA:
+                return saldo_anterior - principal, principal
+        return sem_mudanca
+    return sem_mudanca
 
 
 def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloco]:
@@ -348,10 +419,13 @@ def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloc
 
     if not transacoes:
         return []
+    saldo_anterior, aplicacao_inicial = _saldo_anterior_da_conta_corrente(
+        transacoes, saldo_anterior, _principais_iniciais(paginas)
+    )
     return [
         Bloco(
             transacoes=_derivar_varredura_da_aplicacao(
-                transacoes, saldo_anterior, aplicacoes
+                transacoes, saldo_anterior, aplicacoes, aplicacao_inicial
             ),
             saldo_anterior=saldo_anterior,
             saldo_final=saldo_final,
@@ -363,6 +437,7 @@ def _extrair_mensal(paginas: list[list[dict]], referencia_ano: int) -> list[Bloc
 
 # Cabeçalho: `Data Lançamentos Razão Social CNPJ/CPF Valor (R$) Saldo (R$)`
 _DATA_LONGA = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+_SALDO_PARCIAL_DO_DIA = re.compile(r"APLIC|MOVIMENTA", re.IGNORECASE)
 
 
 class _ColunasExtrato:
@@ -429,10 +504,16 @@ def _extrair_internet(paginas: list[list[dict]], referencia_ano: int) -> list[Bl
     transacoes: list[TransacaoOFX] = []
     saldo_anterior: Decimal | None = None
     idx = 0
+    colunas: _ColunasExtrato | None = None
 
     for palavras in paginas:
         linhas = _agrupar_linhas(palavras)
-        colunas = _ler_cabecalho_extrato(linhas)
+        # O cabeçalho da tabela só é impresso na PRIMEIRA página; as seguintes
+        # começam direto no lançamento. Exigir o cabeçalho em cada página lia
+        # só a página 1 — no extrato de nov/2025 da BLD, 36 de 350 lançamentos,
+        # e a recusa falava de saldo não encontrado. As colunas são as mesmas
+        # até o fim do arquivo.
+        colunas = _ler_cabecalho_extrato(linhas) or colunas
         if colunas is None:
             continue
 
@@ -497,7 +578,14 @@ def _extrair_internet(paginas: list[list[dict]], referencia_ano: int) -> list[Bl
                 continue
 
             if texto_descricao.upper().startswith("SALDO"):
-                # Fecho do dia: ancora a cadeia no último lançamento lido.
+                # Fecho do dia: ancora a cadeia no último lançamento lido. Só o
+                # TOTAL do dia serve — o `SALDO ANTERIOR` é total (conta +
+                # aplicação), e algumas contas imprimem logo abaixo as duas
+                # partes: `SALDO MOVIMENTAÇÃO CONTA 1,01` e `SALDO APLIC. AUT.
+                # 3.847.276,04`. Sendo as últimas, elas sobrescreviam a âncora
+                # com o saldo de só uma das partes.
+                if _SALDO_PARCIAL_DO_DIA.search(texto_descricao):
+                    continue
                 if saldo is not None and transacoes:
                     transacoes[-1] = replace(transacoes[-1], saldo_apos=saldo)
                 continue

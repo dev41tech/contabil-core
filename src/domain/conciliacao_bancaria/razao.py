@@ -145,16 +145,21 @@ def _exigir_uma_conta(quantidade: int) -> None:
 # ── PDF ─────────────────────────────────────────────────────────────────────
 
 _NUM = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+# O saldo zerado sai sem D/C ("... 0,59 0,00"). Exigir o sufixo perdia a linha,
+# e o valor dela ia parar no lançamento seguinte, que é calculado pela diferença
+# de saldo: no razão da aplicação da BLD (2025) eram 17 linhas e R$ 550.668,30.
 _LANCAMENTO = re.compile(
-    rf"^(\d{{2}}/\d{{2}}/\d{{4}})\s+(\d+)\s+(.+?)\s+(?:(\d{{1,6}})\s+)?({_NUM})\s+({_NUM})([CD])$"
+    rf"^(\d{{2}}/\d{{2}}/\d{{4}})\s+(\d+)\s+(.+?)\s+(?:(\d{{1,6}})\s+)?({_NUM})\s+({_NUM})([CD]?)$"
 )
 _CONTA = re.compile(r"^Conta:\s*(\d+)\s*-\s*([\d.]+)\s+(.+)$")
 _PERIODO = re.compile(r"Per[ií]odo:\s*(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})")
 _SALDO_ANTERIOR = re.compile(rf"SALDO ANTERIOR\s+({_NUM})([CD])?\s*$")
 _TOTAL = re.compile(rf"^Total da conta:\s*({_NUM})\s+({_NUM})")
-# O cabeçalho se repete em toda página; não pode virar continuação de histórico.
+# O cabeçalho se repete em toda página, e o razão de vários meses fecha cada um
+# com "Total do mês"; nada disso pode virar continuação de histórico.
 _CABECALHO = re.compile(
-    r"^(Empresa:|C\.N\.P\.J\.:|Per[ií]odo:|CONSOLIDADO|RAZ[ÃA]O$|Data\s*Lote|Conta:|SALDO ANTERIOR|Total da conta)",
+    r"^(Empresa:|C\.N\.P\.J\.:|Per[ií]odo:|CONSOLIDADO|RAZ[ÃA]O$|Data\s*Lote|Conta:|SALDO ANTERIOR"
+    r"|Total da conta|Total do m[êe]s|Sistema licenciado|_{5,})",
     re.IGNORECASE,
 )
 
@@ -171,7 +176,10 @@ def _ler_pdf(conteudo: bytes) -> RazaoConta:
             linhas = [l.strip() for p in pdf.pages for l in (p.extract_text() or "").splitlines()]
     except Exception as exc:
         raise RazaoInvalido(f"Não foi possível abrir o PDF: {exc}") from exc
+    return _razao_das_linhas(linhas)
 
+
+def _razao_das_linhas(linhas: list[str]) -> RazaoConta:
     razao = RazaoConta(empresa="", cnpj="", periodo_inicio=None, periodo_fim=None,
                        conta_codigo="", conta_classificacao="", conta_descricao="")
     contas: set[str] = set()
@@ -208,6 +216,9 @@ def _ler_pdf(conteudo: bytes) -> RazaoConta:
         m = _TOTAL.match(linha)
         if m:
             total = (_dec(m.group(1)), _dec(m.group(2)))
+            continue
+        if total is not None:
+            # Depois do total só vêm os termos e as assinaturas do fechamento.
             continue
         m = _LANCAMENTO.match(linha)
         if m:

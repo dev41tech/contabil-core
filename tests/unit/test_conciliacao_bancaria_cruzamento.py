@@ -130,3 +130,69 @@ def test_abertura_do_periodo_fica_fora_das_pendencias():
 def test_so_no_razao_e_so_no_extrato():
     res = conciliar([r(1, 7, "-2279.75")], [e(1, 26, "48000.33", "USO AUTOMATICO CX AVAL")])
     assert tipos(res) == [SO_EXTRATO, SO_RAZAO]
+
+
+# ── aplicação automática que o extrato não traz ─────────────────────────────
+#
+# O extrato do internet banking do Itaú traz os resgates e nunca as aplicações.
+# No razão da conta banco as duas espécies existem (contrapartida na conta de
+# aplicação), e cada aplicação virava "só no razão" — pendência falsa.
+
+def test_aplicacao_que_o_extrato_nao_traz_sai_das_pendencias():
+    razao = [
+        r(1, 3, "243239.41", "RESGATE DE APLICAÇÃO AUTOMÁTICA"),
+        r(2, 5, "-160208.40", "OPERAÇÃO DE APLICAÇÃO AUTOMÁTICA"),
+    ]
+    extrato = [e(1, 3, "243239.41", "RES APLIC AUT MAIS")]
+
+    res = conciliar(razao, extrato)
+
+    assert [g.tipo for g in res.conciliados] == [CONCILIADO]
+    assert res.pendencias == []
+    assert [i.historico for i in res.aplicacao_sem_extrato] == ["OPERAÇÃO DE APLICAÇÃO AUTOMÁTICA"]
+
+
+def test_especie_que_o_extrato_traz_continua_sendo_conferida():
+    """Com UM resgate no extrato, o resgate sem par é pendência de verdade."""
+    razao = [
+        r(1, 3, "243239.41", "RESGATE DE APLICAÇÃO AUTOMÁTICA"),
+        r(2, 6, "2801856.73", "RESGATE DE APLICAÇÃO AUTOMÁTICA"),
+    ]
+    extrato = [e(1, 3, "243239.41", "Res Aplic Aut Mais")]
+
+    res = conciliar(razao, extrato)
+
+    assert tipos(res) == [SO_RAZAO]
+    assert res.aplicacao_sem_extrato == []
+
+
+def test_aplicacao_sem_extrato_nao_casa_com_outro_lancamento_de_mesmo_valor():
+    """Separada antes das camadas: não pode virar par de um PIX de mesmo valor."""
+    razao = [r(1, 4, "1040.30", "RESGATE DE APLICAÇÃO AUTOMÁTICA")]
+    extrato = [e(1, 5, "1040.30", "PIX RECEBIDO CLIENTE")]
+
+    res = conciliar(razao, extrato)
+
+    assert res.conciliados == []
+    assert [i.id for i in res.aplicacao_sem_extrato] == ["r1"]
+    assert tipos(res) == [SO_EXTRATO]
+
+
+def test_rendimento_e_conferido_a_parte_do_resgate():
+    razao = [
+        r(1, 3, "0.08", "REND PAGO APLIC AUT MAIS"),
+        r(2, 3, "243239.41", "RESGATE DE APLICAÇÃO AUTOMÁTICA"),
+    ]
+    extrato = [e(1, 3, "243239.41", "RES APLIC AUT MAIS")]
+
+    res = conciliar(razao, extrato)
+
+    assert [i.historico for i in res.aplicacao_sem_extrato] == ["REND PAGO APLIC AUT MAIS"]
+    assert res.pendencias == []
+
+
+def test_nome_com_rend_no_meio_nao_e_rendimento():
+    """"MARENDA" contém REND — medido no razão da 2699."""
+    res = conciliar([r(1, 3, "-500.00", "PGTO JAIME CARLOS MARENDA")], [])
+    assert res.aplicacao_sem_extrato == []
+    assert tipos(res) == [SO_RAZAO]

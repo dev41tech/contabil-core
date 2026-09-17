@@ -23,6 +23,24 @@ AS CAMADAS, NA ORDEM
 
 A ordem importa: duplicidade só é afirmada depois que a janela de dias e os
 agrupamentos tiveram a chance de achar par para o lançamento repetido.
+
+APLICAÇÃO AUTOMÁTICA QUE O EXTRATO NÃO TRAZ
+
+A conta banco movimenta a conta de aplicação (na BLD, 2699 ↔ 2700): resgate,
+aplicação e rendimento pago. O extrato mensal e o consolidado imprimem esses
+lançamentos, e eles casam dia a dia, no centavo (conferido em mar, ago e dez de
+2025). O extrato do internet banking não: traz os resgates e nunca as
+aplicações, e às vezes nem os resgates. Sem cuidado, cada aplicação do razão
+virava "só no razão" — pendência falsa, porque a informação vem de outro
+documento (o relatório de aplicações do banco).
+
+A regra é por ESPÉCIE (resgate, aplicação, rendimento): se o extrato do período
+não tem nenhum lançamento daquela espécie, os do razão saem das pendências e
+vão para `aplicacao_sem_extrato`, que o relatório mostra com aviso. Se o extrato
+tem ao menos um, a espécie é conferida como qualquer outro lançamento — e o que
+sobrar é pendência de verdade. Eles saem ANTES das camadas: um resgate de
+1.040,30 sem par não pode casar com um PIX recebido de mesmo valor dois dias
+depois.
 """
 
 from __future__ import annotations
@@ -58,6 +76,27 @@ _DIVERGENCIA_MAX_RELATIVA = Decimal("0.01")
 # banco isso é "saldo anterior", não transação — nunca vai ter par.
 _ABERTURA = re.compile(r"SALDO\s+(NEGATIVO|ANTERIOR|INICIAL)", re.IGNORECASE)
 
+# "APLIC" como começo de palavra: RESGATE DE APLICAÇÃO AUTOMÁTICA, APL APLIC AUT
+# MAIS, REND PAGO APLIC AUT MAIS. Sem a exigência da palavra, "REND" achava
+# "PGTO JAIME CARLOS MARENDA" — medido no razão da 2699.
+_APLICACAO = re.compile(r"\bAPLIC", re.IGNORECASE)
+_RENDIMENTO = re.compile(r"\bREND", re.IGNORECASE)
+RENDIMENTO = "RENDIMENTO"
+RESGATE = "RESGATE"
+APLICACAO = "APLICACAO"
+
+
+def especie_de_aplicacao(historico: str, valor: Decimal) -> str | None:
+    """Rendimento, resgate ou aplicação automática — ou `None` se não é.
+
+    Visto da conta banco: entrada é resgate, saída é aplicação.
+    """
+    if not _APLICACAO.search(historico):
+        return None
+    if _RENDIMENTO.search(historico):
+        return RENDIMENTO
+    return RESGATE if valor > 0 else APLICACAO
+
 
 @dataclass(frozen=True)
 class Item:
@@ -85,6 +124,9 @@ class Resultado:
     conciliados: list[Grupo]
     pendencias: list[Grupo]
     abertura: list[Item]
+    # Lançamentos de aplicação automática do razão de uma espécie que o extrato
+    # não traz: não conferidos, e por isso nem conciliados nem pendência.
+    aplicacao_sem_extrato: list[Item] = field(default_factory=list)
 
 
 def _semelhanca(a: str, b: str) -> float:
@@ -122,7 +164,15 @@ def conciliar(
         if _ABERTURA.search(r.historico) and (periodo_inicio is None or r.data == periodo_inicio)
     ]
     ids_abertura = {r.id for r in abertura}
-    livres_r = {r.id: r for r in razao if r.id not in ids_abertura}
+    especies_no_extrato = {especie_de_aplicacao(e.historico, e.valor) for e in extrato} - {None}
+    aplicacao_sem_extrato = [
+        r for r in razao
+        if r.id not in ids_abertura
+        and (especie := especie_de_aplicacao(r.historico, r.valor)) is not None
+        and especie not in especies_no_extrato
+    ]
+    ids_fora = ids_abertura | {r.id for r in aplicacao_sem_extrato}
+    livres_r = {r.id: r for r in razao if r.id not in ids_fora}
     livres_e = {e.id: e for e in extrato}
     conciliados: list[Grupo] = []
     pendencias: list[Grupo] = []
@@ -223,4 +273,9 @@ def conciliar(
     for e in sorted(livres_e.values(), key=lambda x: (x.data, -abs(x.valor))):
         pendencias.append(Grupo(SO_EXTRATO, [], [e]))
 
-    return Resultado(conciliados=conciliados, pendencias=pendencias, abertura=abertura)
+    return Resultado(
+        conciliados=conciliados,
+        pendencias=pendencias,
+        abertura=abertura,
+        aplicacao_sem_extrato=aplicacao_sem_extrato,
+    )
