@@ -30,10 +30,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Empresa, PlanoConta, Transacao
 from src.domain.conciliacao_bancaria.cruzamento import (
+    APLICACAO,
     DUPLICIDADE_EXTRATO,
     DUPLICIDADE_RAZAO,
+    RENDIMENTO,
+    RESGATE,
     Item,
     conciliar,
+    especie_de_aplicacao,
 )
 from src.domain.conciliacao_bancaria.razao import RazaoConta
 from src.schemas.conciliacao_bancaria import (
@@ -47,6 +51,36 @@ from src.schemas.conciliacao_bancaria import (
 # Dias sem extrato nas pontas do período antes de avisar. Fim de semana e
 # feriado deixam alguns dias sem movimento de verdade.
 _FOLGA_COBERTURA = timedelta(days=4)
+
+_NOME_DA_ESPECIE = {
+    RESGATE: ("resgate", "resgates"),
+    APLICACAO: ("aplicação", "aplicações"),
+    RENDIMENTO: ("rendimento", "rendimentos"),
+}
+
+
+def _reais(valor: Decimal) -> str:
+    return f"R$ {valor:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def _aviso_aplicacao_sem_extrato(itens: list[Item]) -> str:
+    por_especie: dict[str, list[Item]] = {}
+    for item in itens:
+        por_especie.setdefault(especie_de_aplicacao(item.historico, item.valor), []).append(item)
+    partes = []
+    for especie in (APLICACAO, RESGATE, RENDIMENTO):
+        grupo = por_especie.get(especie)
+        if grupo:
+            singular, plural = _NOME_DA_ESPECIE[especie]
+            total = sum((abs(i.valor) for i in grupo), Decimal("0"))
+            nome = singular if len(grupo) == 1 else plural
+            partes.append(f"{len(grupo)} {nome} ({_reais(total)})")
+    return (
+        "O extrato importado não traz os lançamentos de aplicação automática do razão: "
+        + ", ".join(partes)
+        + ". Eles não foram conferidos e não entram nas pendências — confira no extrato "
+        "consolidado ou no relatório de aplicações do banco."
+    )
 
 
 def _so_digitos(texto: str | None) -> str:
@@ -149,6 +183,9 @@ async def conciliar_razao_extrato(
         periodo_inicio=razao.periodo_inicio,
     )
 
+    if resultado.aplicacao_sem_extrato:
+        avisos.append(_aviso_aplicacao_sem_extrato(resultado.aplicacao_sem_extrato))
+
     def _linha_r(item: Item) -> LinhaRazao:
         l = itens_r[item.id][1]
         return LinhaRazao(data=l.data, valor=l.valor, historico=l.historico,
@@ -171,7 +208,7 @@ async def conciliar_razao_extrato(
             for g in resultado.pendencias
         ),
         Decimal("0"),
-    )
+    ) + sum((i.valor for i in resultado.aplicacao_sem_extrato), Decimal("0"))
     diferenca = movimento_razao - movimento_extrato
 
     return RelatorioConciliacao(
@@ -190,6 +227,7 @@ async def conciliar_razao_extrato(
             diferenca=diferenca,
             diferenca_explicada=explicado == diferenca,
             abertura=[_linha_r(a) for a in resultado.abertura],
+            aplicacao_sem_extrato=len(resultado.aplicacao_sem_extrato),
         ),
         avisos=avisos,
         conciliados_por_tipo=dict(Counter(g.tipo for g in resultado.conciliados)),
@@ -202,4 +240,5 @@ async def conciliar_razao_extrato(
             )
             for g in resultado.pendencias
         ],
+        aplicacao_sem_extrato=[_linha_r(i) for i in resultado.aplicacao_sem_extrato],
     )

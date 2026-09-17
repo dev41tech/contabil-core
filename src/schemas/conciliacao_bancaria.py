@@ -48,6 +48,9 @@ class ResumoConciliacao(BaseModel):
     # cruzamento não enxergou — e o relatório não deve parecer completo.
     diferenca_explicada: bool
     abertura: list[LinhaRazao]
+    # Lançamentos de aplicação automática que o extrato não traz — não
+    # conferidos, fora das pendências. Ver `cruzamento.py`.
+    aplicacao_sem_extrato: int = 0
 
 
 class RelatorioConciliacao(BaseModel):
@@ -55,3 +58,4 @@ class RelatorioConciliacao(BaseModel):
     avisos: list[str]
     conciliados_por_tipo: dict[str, int]
     pendencias: list[GrupoConciliacao]
+    aplicacao_sem_extrato: list[LinhaRazao] = []
