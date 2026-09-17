@@ -484,3 +484,165 @@ def test_itau_sem_aplicacao_nada_muda():
     # Sem a linha da aplicação, o buraco fica sem explicação e nada é derivado.
     (bloco,) = itau.extrair_de_palavras([sem_aplicacao], 2026)
     assert len(bloco.transacoes) == 2
+
+
+# ── saldo anterior que soma a aplicação automática (extrato mensal) ──────────
+#
+# Reproduz a abertura do extrato de mar/2025 da BLD, com valores fictícios. O
+# `Saldo anterior` é conta corrente + aplicação (5.001,00 = 1,00 + 5.000,00), a
+# coluna de saldo dos lançamentos acompanha só a conta corrente, e o saldo
+# aplicado na abertura só aparece no resumo das aplicações, depois do fecho:
+#
+#     28/02  Saldo anterior                          5.001,00
+#     05/03  Sispag Fornecedores          700,00-
+#            Res Aplic Aut Mais   700,00                  1,00
+#            SALDO APLIC AUT MAIS                     4.300,00
+#     ...
+#     principal  5.000,00  0,00  0,00  700,00  4.300,00
+
+_ABERTURA_COM_APLICACAO = [
+    *_CABECALHO_MENSAL,
+    _p("28/02", 150, 606, largura=22),
+    _p("Saldo", 208, 606), _p("anterior", 232, 606),
+    _direita("5.001,00", 549, 606),
+
+    _p("05/03", 150, 624, largura=22),
+    _p("Sispag", 208, 624), _p("Fornecedores", 236, 624),
+    _direita("700,00-", 456, 624),
+
+    _p("Res", 208, 640), _p("Aplic", 224, 640), _p("Aut", 246, 640),
+    _p("Mais", 262, 640),
+    _direita("700,00", 396, 640),
+    _direita("1,00", 549, 640),
+
+    _p("SALDO", 208, 656), _p("APLIC", 236, 656), _p("AUT", 262, 656),
+    _p("MAIS", 280, 656),
+    _direita("4.300,00", 549, 656),
+
+    _p("Saldo", 208, 672), _p("em", 227, 672), _p("C/C", 238, 672),
+    _direita("1,00", 549, 672),
+    _p("Saldo", 208, 688), _p("final", 229, 688),
+    _direita("4.301,00", 549, 688),
+
+    # Resumo das aplicações automáticas: o 1º número é o saldo aplicado em 02/25.
+    _p("principal", 60, 760),
+    _direita("5.000,00", 170, 760),
+    _direita("0,00", 230, 760),
+    _direita("0,00", 290, 760),
+    _direita("700,00", 350, 760),
+    _direita("4.300,00", 420, 760),
+]
+
+
+def _linha_principal(valor: str, top: float = 900) -> list[dict]:
+    return [
+        _p("principal", 60, top),
+        _direita(valor, 170, top),
+        _direita("0,00", 230, top),
+        _direita("0,00", 290, top),
+    ]
+
+
+def test_mensal_desconta_a_aplicacao_do_saldo_anterior():
+    (bloco,) = itau.extrair_de_palavras([_ABERTURA_COM_APLICACAO], 2025)
+    assert bloco.saldo_anterior == Decimal("1.00")
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-700.00"), Decimal("700.00")
+    ]
+
+
+def test_mensal_com_aplicacao_na_abertura_a_cadeia_fecha():
+    blocos = itau.extrair_de_palavras([_ABERTURA_COM_APLICACAO], 2025)
+    assert _validar_blocos(blocos, TOLERANCIA) is True
+
+
+def test_mensal_le_o_principal_em_outra_pagina():
+    """O resumo das aplicações pode cair na página seguinte à do fecho."""
+    resumo = [p for p in _ABERTURA_COM_APLICACAO if p["top"] == 760]
+    movimentacao = [p for p in _ABERTURA_COM_APLICACAO if p["top"] != 760]
+    (bloco,) = itau.extrair_de_palavras([movimentacao, resumo], 2025)
+    assert bloco.saldo_anterior == Decimal("1.00")
+
+
+def test_mensal_sem_o_resumo_das_aplicacoes_continua_recusando():
+    """Sem o principal impresso não há de onde tirar a aplicação — nada é inventado."""
+    sem_resumo = [p for p in _ABERTURA_COM_APLICACAO if p["top"] != 760]
+    blocos = itau.extrair_de_palavras([sem_resumo], 2025)
+    assert blocos[0].saldo_anterior == Decimal("5001.00")
+    with pytest.raises(PDFParseError, match="não caminha"):
+        _validar_blocos(blocos, TOLERANCIA)
+
+
+def test_mensal_nao_desconta_quando_o_saldo_anterior_ja_e_so_da_conta():
+    """A primeira âncora fecha com o saldo como está: o principal não é descontado."""
+    (bloco,) = itau.extrair_de_palavras([[*_MENSAL, *_linha_principal("385,73")]], 2026)
+    assert bloco.saldo_anterior == Decimal("-1000.00")
+    assert _validar_blocos([bloco], TOLERANCIA) is True
+
+
+def test_mensal_principal_que_nao_explica_a_abertura_nao_e_descontado():
+    """Descontar um valor que a âncora não confirma seria ajustar para passar."""
+    outro = [
+        p if not (p["top"] == 760 and p["text"] == "5.000,00") else {**p, "text": "4.000,00"}
+        for p in _ABERTURA_COM_APLICACAO
+    ]
+    blocos = itau.extrair_de_palavras([outro], 2025)
+    assert blocos[0].saldo_anterior == Decimal("5001.00")
+    with pytest.raises(PDFParseError, match="não caminha"):
+        _validar_blocos(blocos, TOLERANCIA)
+
+
+# ── extrato do internet banking com mais de uma página ────────────────────────
+#
+# Só a primeira página traz o cabeçalho da tabela; as outras começam direto no
+# lançamento. No extrato de nov/2025 da BLD o leitor parava na página 1 (36 de
+# 350 lançamentos).
+
+_INTERNET_PAGINA_2 = [
+    _p("01/07/2026", 35, 40, largura=43),
+    _p("PIX", 91, 40),
+    _p("ENVIADO", 105, 40),
+    _direita("-100,00", 509, 40),
+    _p("01/07/2026", 35, 58, largura=43),
+    _p("SALDO", 91, 58),
+    _p("TOTAL", 119, 58),
+    _p("DISPONÍVEL", 147, 58),
+    _p("DIA", 194, 58),
+    _direita("400,00", 558, 58),
+]
+
+# Contas com aplicação automática imprimem as duas partes do total logo abaixo.
+_PARTES_DO_TOTAL = [
+    _p("01/07/2026", 35, 70, largura=43),
+    _p("SALDO", 91, 70),
+    _p("MOVIMENTAÇÃO", 119, 70),
+    _p("CONTA", 180, 70),
+    _direita("1,00", 558, 70),
+    _p("01/07/2026", 35, 82, largura=43),
+    _p("SALDO", 91, 82),
+    _p("APLIC.", 119, 82),
+    _p("AUT.", 145, 82),
+    _direita("399,00", 558, 82),
+]
+
+
+def test_internet_le_as_paginas_sem_cabecalho():
+    (bloco,) = itau.extrair_de_palavras([_INTERNET, _INTERNET_PAGINA_2], 2026)
+    assert [t.valor for t in bloco.transacoes] == [
+        Decimal("-200.00"), Decimal("-300.00"), Decimal("-100.00")
+    ]
+    assert bloco.transacoes[-1].saldo_apos == Decimal("400.00")
+    assert _validar_blocos([bloco], TOLERANCIA) is True
+
+
+def test_internet_arquivo_sem_cabecalho_em_pagina_nenhuma_nao_e_lido():
+    assert itau._extrair_internet([_INTERNET_PAGINA_2], 2026) == []
+
+
+def test_internet_as_partes_do_total_nao_viram_ancora():
+    """`SALDO APLIC. AUT.` é a última linha do dia, mas é só a aplicação."""
+    pagina = [*_INTERNET_PAGINA_2, *_PARTES_DO_TOTAL]
+    (bloco,) = itau.extrair_de_palavras([_INTERNET, pagina], 2026)
+    assert bloco.transacoes[-1].saldo_apos == Decimal("400.00")
+    assert len(bloco.transacoes) == 3
+    assert _validar_blocos([bloco], TOLERANCIA) is True
