@@ -17,12 +17,32 @@ AS CAMADAS, NA ORDEM
 1. mesmo dia, mesmo valor                      → CONCILIADO
 2. mesmo valor, até N dias de distância         → DATA_DIFERENTE
 3. vários de um lado somam um do outro, no dia  → AGRUPADO
+3a. lote do SISPAG (se a consulta foi enviada)  → LOTE_SISPAG / LOTE_SISPAG_DIVERGENTE
+3b. a sobra inteira do dia fecha com o extrato  → LOTE_DO_DIA
 4. sobra que repete dia e valor de um par feito → DUPLICIDADE_RAZAO / DUPLICIDADE_EXTRATO
 5. mesmo dia, valor muito próximo               → VALOR_DIVERGENTE
 6. o resto                                      → SO_RAZAO / SO_EXTRATO
 
 A ordem importa: duplicidade só é afirmada depois que a janela de dias e os
 agrupamentos tiveram a chance de achar par para o lançamento repetido.
+
+LOTES DE SISPAG — O QUE A SOMA SOZINHA NÃO RESOLVE
+
+O Itaú paga TED e crédito em conta em lote: UMA linha "Sispag Fornecedores" no
+extrato, dezenas de lançamentos no razão. A camada 3 não alcança (até 6 itens),
+e procurar "qual combinação de lançamentos soma a linha" é ambíguo de verdade:
+em 22/04/2025 da BLD, 13 dos 54 lançamentos que sobraram podiam entrar ou não na
+linha de 157.854,54, e todas as escolhas fechavam. Escolher uma é acertar a soma
+e errar a composição. Por isso nenhuma camada daqui escolhe entre combinações.
+
+- 3a usa a consulta de pagamentos do SISPAG: o banco junta por DIA e TIPO, e os
+  pagamentos de um tipo que somam uma linha (ou duas, quando o lote saiu
+  partido) SÃO a composição dela. Cada pagamento casa com o razão pelo valor, e
+  o nome do favorecido desempata. Pagamento que não está no razão vira
+  pendência com o nome dele — é a diferença apontada, não só medida.
+- 3b não precisa de arquivo: quando TUDO o que sobrou num dia, num sentido,
+  soma exatamente o que sobrou do extrato naquele dia, não há o que escolher.
+  Em abr/2025 isso fechou 4 dos 6 dias com pendência.
 
 APLICAÇÃO AUTOMÁTICA QUE O EXTRATO NÃO TRAZ
 
@@ -53,10 +73,14 @@ from datetime import date
 from decimal import Decimal
 
 from src.core.texto import tokens_para_match
+from src.domain.conciliacao_bancaria.sispag import PagamentoSispag
 
 CONCILIADO = "CONCILIADO"
 DATA_DIFERENTE = "DATA_DIFERENTE"
 AGRUPADO = "AGRUPADO"
+LOTE_SISPAG = "LOTE_SISPAG"
+LOTE_SISPAG_DIVERGENTE = "LOTE_SISPAG_DIVERGENTE"
+LOTE_DO_DIA = "LOTE_DO_DIA"
 DUPLICIDADE_RAZAO = "DUPLICIDADE_RAZAO"
 DUPLICIDADE_EXTRATO = "DUPLICIDADE_EXTRATO"
 VALOR_DIVERGENTE = "VALOR_DIVERGENTE"
@@ -71,6 +95,9 @@ _MAX_CANDIDATOS_AGRUPAMENTO = 20
 # tarifa, não dois pagamentos diferentes que por acaso têm valor parecido.
 _DIVERGENCIA_MAX_ABSOLUTA = Decimal("50.00")
 _DIVERGENCIA_MAX_RELATIVA = Decimal("0.01")
+# Um lote do SISPAG sai em até tantas linhas do extrato no mesmo dia. Em
+# abr/2025 o máximo visto foi 2 (17/04, crédito em conta partido em dois).
+_MAX_LINHAS_POR_LOTE = 3
 
 # Abertura do período: o saldo do mês anterior lançado como movimento. No
 # banco isso é "saldo anterior", não transação — nunca vai ter par.
@@ -111,6 +138,9 @@ class Grupo:
     tipo: str
     razao: list[Item] = field(default_factory=list)
     extrato: list[Item] = field(default_factory=list)
+    # Lote do SISPAG com pagamento que não achou par no razão: pago pelo banco,
+    # não lançado (ou lançado com outro valor/data).
+    sispag_faltando: list[PagamentoSispag] = field(default_factory=list)
 
     @property
     def diferenca(self) -> Decimal:
@@ -152,12 +182,135 @@ def _parear_por_semelhanca(razao: list[Item], extrato: list[Item]) -> list[tuple
     return pares
 
 
+_SISPAG = re.compile(r"sispag", re.IGNORECASE)
+
+
+def _linhas_do_lote(linhas: list[Item], total: Decimal) -> list[Item] | None:
+    """As linhas do extrato cuja soma é o lote — só se a resposta for uma.
+
+    Duas combinações com os mesmos valores (duas linhas de 129,13) são a mesma
+    resposta. Com valores diferentes, é ambíguo, e o lote fica para a camada
+    seguinte. Mais de uma linha só vale entre linhas de Sispag: juntar uma
+    tarifa com um PIX porque a soma bateu seria coincidência, não lote.
+    """
+    for k in range(1, min(_MAX_LINHAS_POR_LOTE, len(linhas)) + 1):
+        achadas = [
+            c for c in itertools.combinations(linhas, k)
+            if -sum(e.valor for e in c) == total
+            and (k == 1 or all(_SISPAG.search(e.historico) for e in c))
+        ]
+        if not achadas:
+            continue
+        if len({tuple(sorted(e.valor for e in c)) for c in achadas}) > 1:
+            return None
+        return list(achadas[0])
+    return None
+
+
+# Palavras de razão social que não identificam ninguém.
+_GENERICOS = frozenset({
+    "ltda", "eireli", "epp", "me", "sa", "cia", "comercio", "servicos", "transportes",
+    "transporte", "logistica", "industria", "empresa", "brasil", "do", "da", "de", "dos",
+})
+
+
+def _nomes(texto: str) -> set[str]:
+    return {
+        t for t in tokens_para_match(texto)
+        if len(t) >= 3 and not t.isnumeric() and t not in _GENERICOS
+    }
+
+
+def _e_do_favorecido(historico: str, favorecido: str) -> bool:
+    """O histórico nomeia o favorecido? Dois nomes em comum, ou o único que ele tem."""
+    nomes = _nomes(favorecido)
+    comuns = nomes & set(tokens_para_match(historico))
+    return len(comuns) >= 2 or (len(nomes) == 1 and len(comuns) == 1)
+
+
+def _recuperar_do_par_simples(
+    pagamento: PagamentoSispag, conciliados: list[Grupo], livres_e: dict
+) -> Item | None:
+    """Tira do par 1 × 1 o lançamento do razão que o SISPAG diz ser deste lote.
+
+    A camada 1 casa pelo dia e pelo valor. Em 17/04/2025 ela pôs "SISPAG
+    FORNECEDORES CLAUDIO ALEXANDRE" (20.000,00) com a linha "Sispag Salários" de
+    20.000,00 — mesmo dia, mesmo valor, pagamentos diferentes. O SISPAG mostra o
+    Claudio no lote de crédito em conta. Só desfaz quando o histórico do razão
+    nomeia o favorecido e o do extrato não; a linha liberada volta para as
+    camadas seguintes, e se ninguém a reclamar é pendência — a certa.
+    """
+    for i, g in enumerate(conciliados):
+        if g.tipo not in (CONCILIADO, DATA_DIFERENTE):
+            continue
+        (r,), (e,) = g.razao, g.extrato
+        if r.data != pagamento.data or -r.valor != pagamento.valor:
+            continue
+        if _e_do_favorecido(r.historico, pagamento.favorecido) and not _e_do_favorecido(
+            e.historico, pagamento.favorecido
+        ):
+            del conciliados[i]
+            livres_e[e.id] = e
+            return r
+    return None
+
+
+def _lotes_sispag(sispag, livres_r, livres_e, fechar, conciliados, pendencias) -> None:
+    lotes: dict[tuple[date, str], list[PagamentoSispag]] = defaultdict(list)
+    for p in sispag:
+        if p.efetuado:
+            lotes[(p.data, p.tipo)].append(p)
+
+    # Boleto e PIX saem um por linha e já casaram na camada 1; aqui só o que o
+    # banco juntou. O maior lote do dia primeiro: ele não pode perder a linha
+    # para um lote menor que por acaso some o mesmo.
+    ordem = sorted(lotes.items(), key=lambda kv: (kv[0][0], -sum(p.valor for p in kv[1])))
+    for (dia, _tipo), pagamentos in ordem:
+        if len(pagamentos) < 2:
+            continue
+        total = sum((p.valor for p in pagamentos), Decimal("0"))
+        linhas = sorted(
+            (e for e in livres_e.values() if e.data == dia and e.valor < 0),
+            key=lambda e: e.id,
+        )
+        alvo = _linhas_do_lote(linhas, total)
+        if alvo is None:
+            continue
+
+        por_valor: dict[Decimal, list[Item]] = defaultdict(list)
+        for r in livres_r.values():
+            if r.data == dia and r.valor < 0:
+                por_valor[-r.valor].append(r)
+        usados: list[Item] = []
+        faltando: list[PagamentoSispag] = []
+        for p in sorted(pagamentos, key=lambda p: -p.valor):
+            opcoes = por_valor.get(p.valor)
+            if not opcoes:
+                recuperado = _recuperar_do_par_simples(p, conciliados, livres_e)
+                if recuperado is not None:
+                    usados.append(recuperado)
+                else:
+                    faltando.append(p)
+                continue
+            # Mesmo valor para dois favorecidos: decide o nome.
+            melhor = max(opcoes, key=lambda r, p=p: _semelhanca(r.historico, p.favorecido))
+            opcoes.remove(melhor)
+            usados.append(melhor)
+
+        if faltando:
+            grupo = fechar(LOTE_SISPAG_DIVERGENTE, usados, alvo, pendencias)
+            grupo.sispag_faltando = faltando
+        else:
+            fechar(LOTE_SISPAG, usados, alvo, conciliados)
+
+
 def conciliar(
     razao: list[Item],
     extrato: list[Item],
     *,
     periodo_inicio: date | None = None,
     tolerancia_dias: int = 3,
+    sispag: list[PagamentoSispag] | None = None,
 ) -> Resultado:
     abertura = [
         r for r in razao
@@ -177,12 +330,14 @@ def conciliar(
     conciliados: list[Grupo] = []
     pendencias: list[Grupo] = []
 
-    def _fechar(tipo: str, rs: list[Item], es: list[Item], destino: list[Grupo]) -> None:
+    def _fechar(tipo: str, rs: list[Item], es: list[Item], destino: list[Grupo]) -> Grupo:
         for r in rs:
             livres_r.pop(r.id, None)
         for e in es:
             livres_e.pop(e.id, None)
-        destino.append(Grupo(tipo, list(rs), list(es)))
+        grupo = Grupo(tipo, list(rs), list(es))
+        destino.append(grupo)
+        return grupo
 
     # 1) mesmo dia, mesmo valor — desempate pelo histórico
     por_chave_r, por_chave_e = defaultdict(list), defaultdict(list)
@@ -237,6 +392,23 @@ def conciliar(
 
     _agrupar(livres_r, livres_e, lado_fonte_e_razao=True)
     _agrupar(livres_e, livres_r, lado_fonte_e_razao=False)
+
+    # 3a) lote do SISPAG: pagamentos de um dia e tipo que somam linha(s) do extrato
+    if sispag:
+        _lotes_sispag(sispag, livres_r, livres_e, _fechar, conciliados, pendencias)
+
+    # 3b) a sobra inteira do dia, num sentido, fecha com a sobra do extrato
+    sobra_r, sobra_e = defaultdict(list), defaultdict(list)
+    for r in livres_r.values():
+        sobra_r[(r.data, r.valor > 0)].append(r)
+    for e in livres_e.values():
+        sobra_e[(e.data, e.valor > 0)].append(e)
+    for chave in sorted(sobra_r.keys() & sobra_e.keys()):
+        rs, es = sobra_r[chave], sobra_e[chave]
+        # 1 × 1 com a mesma soma a camada 1 já teria casado; exigir 3 itens deixa
+        # isto para o que é lote de fato.
+        if len(rs) + len(es) >= 3 and sum(r.valor for r in rs) == sum(e.valor for e in es):
+            _fechar(LOTE_DO_DIA, rs, es, conciliados)
 
     # 4) duplicidade: sobra que repete dia e valor de um lançamento já conciliado
     ja_conciliado = defaultdict(list)
