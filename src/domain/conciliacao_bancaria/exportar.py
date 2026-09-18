@@ -15,6 +15,9 @@ ROTULOS = {
     "CONCILIADO": "Conciliado",
     "DATA_DIFERENTE": "Conciliado com data diferente",
     "AGRUPADO": "Agrupado",
+    "LOTE_SISPAG": "Lote do SISPAG",
+    "LOTE_SISPAG_DIVERGENTE": "Lote do SISPAG com pagamento fora do razão",
+    "LOTE_DO_DIA": "Lote do dia (sobra do dia fecha)",
     "DUPLICIDADE_RAZAO": "Possível duplicidade no razão",
     "DUPLICIDADE_EXTRATO": "Possível duplicidade no extrato",
     "VALOR_DIVERGENTE": "Valor divergente",
@@ -90,10 +93,38 @@ def gerar_planilha(relatorio: RelatorioConciliacao) -> bytes:
                 wp.cell(wp.max_row, col).number_format = "DD/MM/YYYY"
             for col in (3, 8, 10):
                 wp.cell(wp.max_row, col).number_format = "#,##0.00"
+        for pg in g.sispag_faltando:
+            # Pago pelo banco dentro do lote, sem lançamento no razão.
+            _linha(wp, [
+                "  pagamento do SISPAG sem par no razão", None, None,
+                f"{pg.favorecido} ({pg.documento}) — {pg.tipo}", None, None,
+                pg.data, float(pg.valor), None, None,
+            ])
+            wp.cell(wp.max_row, 7).number_format = "DD/MM/YYYY"
+            wp.cell(wp.max_row, 8).number_format = "#,##0.00"
     for i, w in enumerate([30, 12, 15, 55, 12, 14, 12, 15, 45, 14], 1):
         wp.column_dimensions[get_column_letter(i)].width = w
     wp.freeze_panes = "A2"
     wp.auto_filter.ref = f"A1:J{wp.max_row}"
+
+    if relatorio.por_dia:
+        wd = wb.create_sheet("Por dia")
+        _linha(wd, ["Data", "Lanç. razão", "Lanç. extrato", "Movimento razão", "Movimento extrato",
+                    "Diferença", "Pendências", "Casados em outro dia", "Aplicação não conferida"],
+               negrito=True)
+        for c in wd[1]:
+            c.fill = _CABECALHO
+        for d in relatorio.por_dia:
+            _linha(wd, [d.data, d.lancamentos_razao, d.lancamentos_extrato,
+                        float(d.movimento_razao), float(d.movimento_extrato), float(d.diferenca),
+                        d.pendencias, d.data_diferente, d.aplicacao_sem_extrato])
+            wd.cell(wd.max_row, 1).number_format = "DD/MM/YYYY"
+            for col in (4, 5, 6):
+                wd.cell(wd.max_row, col).number_format = "#,##0.00"
+        for i, w in enumerate([12, 12, 13, 17, 17, 15, 12, 18, 22], 1):
+            wd.column_dimensions[get_column_letter(i)].width = w
+        wd.freeze_panes = "A2"
+        wd.auto_filter.ref = f"A1:I{wd.max_row}"
 
     if relatorio.aplicacao_sem_extrato:
         wa = wb.create_sheet("Aplicação não conferida")

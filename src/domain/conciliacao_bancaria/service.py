@@ -19,7 +19,7 @@ pendências falsas, com cara de verdadeiro. Por isso:
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -31,6 +31,7 @@ from src.core.errors import NotFoundError, ValidationError
 from src.db.models import AgenciaBancaria, Empresa, PlanoConta, Transacao
 from src.domain.conciliacao_bancaria.cruzamento import (
     APLICACAO,
+    DATA_DIFERENTE,
     DUPLICIDADE_EXTRATO,
     DUPLICIDADE_RAZAO,
     RENDIMENTO,
@@ -40,12 +41,15 @@ from src.domain.conciliacao_bancaria.cruzamento import (
     especie_de_aplicacao,
 )
 from src.domain.conciliacao_bancaria.razao import RazaoConta
+from src.domain.conciliacao_bancaria.sispag import ConsultaSispag, PagamentoSispag
 from src.schemas.conciliacao_bancaria import (
     GrupoConciliacao,
     LinhaExtrato,
     LinhaRazao,
+    LinhaSispag,
     RelatorioConciliacao,
     ResumoConciliacao,
+    ResumoDia,
 )
 
 # Dias sem extrato nas pontas do período antes de avisar. Fim de semana e
@@ -87,8 +91,68 @@ def _so_digitos(texto: str | None) -> str:
     return re.sub(r"\D", "", texto or "")
 
 
+def _conferir_sispag(
+    sispag: ConsultaSispag, *, empresa: Empresa | None, agencia: AgenciaBancaria, nome_conta: str
+) -> None:
+    """A consulta de pagamentos é desta empresa e desta conta? Senão, recusa.
+
+    Um SISPAG de outra conta casaria lotes pela soma e apontaria "pagamentos
+    faltando" que são de outro banco — pendência falsa com nome e valor.
+    """
+    if empresa and sispag.cnpj and _so_digitos(empresa.cnpj) != sispag.cnpj:
+        raise ValidationError(
+            message=f"A consulta do SISPAG é de outra empresa (CNPJ {sispag.cnpj})."
+        )
+    conta = _so_digitos(sispag.conta)
+    esperado = _so_digitos(agencia.agencia) + _so_digitos(agencia.numero)
+    if conta and esperado and not conta.startswith(esperado):
+        raise ValidationError(
+            message=(
+                f"A consulta do SISPAG é da conta {sispag.conta}, e a conciliação é de "
+                f"{nome_conta}. Envie o SISPAG desta conta."
+            )
+        )
+
+
+def _por_dia(itens_r, itens_e, resultado) -> list[ResumoDia]:
+    """Movimento e pendências de cada dia — para achar em que data está a diferença."""
+    dias: dict = defaultdict(lambda: {
+        "lancamentos_razao": 0, "lancamentos_extrato": 0,
+        "movimento_razao": Decimal("0"), "movimento_extrato": Decimal("0"),
+        "pendencias": 0, "data_diferente": 0, "aplicacao_sem_extrato": 0,
+    })
+    fora = {a.id for a in resultado.abertura}
+    for item, _ in itens_r.values():
+        if item.id not in fora:
+            dias[item.data]["lancamentos_razao"] += 1
+            dias[item.data]["movimento_razao"] += item.valor
+    for item, _ in itens_e.values():
+        dias[item.data]["lancamentos_extrato"] += 1
+        dias[item.data]["movimento_extrato"] += item.valor
+    for g in resultado.pendencias:
+        for dia in {i.data for i in g.razao + g.extrato}:
+            dias[dia]["pendencias"] += 1
+    # Par casado com data diferente deixa diferença nos dois dias sem ser
+    # pendência; sem esta contagem o dia pareceria errado sem motivo.
+    for g in resultado.conciliados:
+        if g.tipo == DATA_DIFERENTE:
+            for i in g.razao + g.extrato:
+                dias[i.data]["data_diferente"] += 1
+    for item in resultado.aplicacao_sem_extrato:
+        dias[item.data]["aplicacao_sem_extrato"] += 1
+    return [
+        ResumoDia(data=dia, diferenca=v["movimento_razao"] - v["movimento_extrato"], **v)
+        for dia, v in sorted(dias.items())
+    ]
+
+
 async def conciliar_razao_extrato(
-    db: AsyncSession, *, empresa_id: UUID, agencia_id: UUID, razao: RazaoConta
+    db: AsyncSession,
+    *,
+    empresa_id: UUID,
+    agencia_id: UUID,
+    razao: RazaoConta,
+    sispag: ConsultaSispag | None = None,
 ) -> RelatorioConciliacao:
     empresa = await db.get(Empresa, empresa_id)
     agencia = (
@@ -138,6 +202,19 @@ async def conciliar_razao_extrato(
     if razao.periodo_inicio is None or razao.periodo_fim is None:
         raise ValidationError(message="Não encontrei o período no cabeçalho do razão.")
 
+    pagamentos_sispag: list[PagamentoSispag] = []
+    if sispag is not None:
+        _conferir_sispag(sispag, empresa=empresa, agencia=agencia, nome_conta=nome_conta)
+        pagamentos_sispag = [
+            p for p in sispag.pagamentos
+            if razao.periodo_inicio <= p.data <= razao.periodo_fim
+        ]
+        if not pagamentos_sispag:
+            avisos.append(
+                "A consulta do SISPAG enviada não tem pagamentos no período do razão, "
+                "então não foi usada para separar os lotes."
+            )
+
     transacoes = (
         await db.execute(
             select(Transacao)
@@ -181,6 +258,7 @@ async def conciliar_razao_extrato(
         [i for i, _ in itens_r.values()],
         [i for i, _ in itens_e.values()],
         periodo_inicio=razao.periodo_inicio,
+        sispag=pagamentos_sispag or None,
     )
 
     if resultado.aplicacao_sem_extrato:
@@ -237,8 +315,15 @@ async def conciliar_razao_extrato(
                 razao=[_linha_r(i) for i in g.razao],
                 extrato=[_linha_e(i) for i in g.extrato],
                 diferenca=g.diferenca,
+                sispag_faltando=[
+                    LinhaSispag(data=p.data, valor=p.valor, tipo=p.tipo,
+                                favorecido=p.favorecido, documento=p.documento)
+                    for p in g.sispag_faltando
+                ],
             )
             for g in resultado.pendencias
         ],
         aplicacao_sem_extrato=[_linha_r(i) for i in resultado.aplicacao_sem_extrato],
+        por_dia=_por_dia(itens_r, itens_e, resultado),
+        sispag_usado=bool(pagamentos_sispag),
     )

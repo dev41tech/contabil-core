@@ -30,6 +30,7 @@ from src.db.session import get_db
 from src.domain.conciliacao_bancaria.exportar import gerar_planilha
 from src.domain.conciliacao_bancaria.razao import RazaoInvalido, ler_razao
 from src.domain.conciliacao_bancaria.service import conciliar_razao_extrato
+from src.domain.conciliacao_bancaria.sispag import SispagInvalido, ler_sispag
 from src.schemas.conciliacao_bancaria import RelatorioConciliacao
 
 router = APIRouter(
@@ -49,6 +50,9 @@ async def conciliar_razao_com_extrato(
     agencia_id: UUID = Query(..., description="Conta bancária cujo extrato já está importado"),
     formato: Literal["json", "xlsx"] = Query("json"),
     arquivo: UploadFile = File(..., description="Razão da conta banco (XLSX, XLS ou PDF)"),
+    sispag: UploadFile | None = File(
+        None, description="Opcional: consulta de pagamentos do SISPAG (XLS/XLSX) do período"
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     conteudo = await ler_upload_limitado(arquivo)
@@ -59,8 +63,15 @@ async def conciliar_razao_com_extrato(
     except RazaoInvalido as exc:
         raise ValidationError(message=str(exc)) from exc
 
+    consulta = None
+    if sispag is not None and sispag.filename:
+        try:
+            consulta = await run_in_threadpool(ler_sispag, await ler_upload_limitado(sispag))
+        except SispagInvalido as exc:
+            raise ValidationError(message=str(exc)) from exc
+
     relatorio = await conciliar_razao_extrato(
-        db, empresa_id=empresa_id, agencia_id=agencia_id, razao=razao
+        db, empresa_id=empresa_id, agencia_id=agencia_id, razao=razao, sispag=consulta
     )
     if formato == "json":
         return relatorio

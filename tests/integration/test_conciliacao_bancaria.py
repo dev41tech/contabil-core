@@ -82,7 +82,7 @@ async def _login(client: AsyncClient, tenant: Tenant, usuario: Usuario) -> str:
     return r.json()["csrf_token"]
 
 
-async def _conta_com_extrato(client, empresa, csrf) -> dict:
+async def _conta_com_extrato(client, empresa, csrf, ofx: str = _OFX) -> dict:
     agencia = (await client.post(
         f"/api/v1/empresas/{empresa.id}/agencias",
         json={"banco_sigla": "ITAU", "agencia": "7285", "numero": "12287"},
@@ -90,18 +90,22 @@ async def _conta_com_extrato(client, empresa, csrf) -> dict:
     )).json()
     r = await client.post(
         f"/api/v1/empresas/{empresa.id}/extrato/importar?agencia_id={agencia['id']}",
-        files={"arquivo": ("fev.ofx", io.BytesIO(_OFX.encode()), "application/octet-stream")},
+        files={"arquivo": ("fev.ofx", io.BytesIO(ofx.encode()), "application/octet-stream")},
         headers={"X-CSRF-Token": csrf},
     )
     assert r.status_code == 202, r.text
     return agencia
 
 
-async def _conciliar(client, empresa, agencia_id, csrf, razao: bytes, formato="json", nome="razao.xlsx"):
+async def _conciliar(client, empresa, agencia_id, csrf, razao: bytes, formato="json",
+                     nome="razao.xlsx", sispag: bytes | None = None):
+    arquivos = {"arquivo": (nome, io.BytesIO(razao), "application/octet-stream")}
+    if sispag is not None:
+        arquivos["sispag"] = ("SISPAG.xlsx", io.BytesIO(sispag), "application/octet-stream")
     return await client.post(
         f"/api/v1/empresas/{empresa.id}/concilpro/razao-extrato"
         f"?agencia_id={agencia_id}&formato={formato}",
-        files={"arquivo": (nome, io.BytesIO(razao), "application/octet-stream")},
+        files=arquivos,
         headers={"X-CSRF-Token": csrf},
     )
 
@@ -156,7 +160,7 @@ async def test_exporta_em_planilha(client: AsyncClient, tenant: Tenant, usuario:
     assert r.status_code == 200
     assert r.content[:2] == b"PK"
     wb = openpyxl.load_workbook(io.BytesIO(r.content))
-    assert wb.sheetnames == ["Resumo", "Pendências"]
+    assert wb.sheetnames == ["Resumo", "Pendências", "Por dia"]
     tipos = [row[0] for row in wb["Pendências"].iter_rows(min_row=2, values_only=True) if row[0]]
     assert "Possível duplicidade no razão" in tipos
 
@@ -306,3 +310,126 @@ async def test_aplicacao_automatica_que_o_extrato_nao_traz_vira_aviso_e_nao_pend
     wb = openpyxl.load_workbook(io.BytesIO(planilha.content))
     assert "Aplicação não conferida" in wb.sheetnames
     assert wb["Aplicação não conferida"].max_row == 3
+
+
+# ── lotes de Sispag e resumo por dia ─────────────────────────────────────────
+#
+# Um lote de crédito em conta: 7 pagamentos no razão, UMA linha no extrato.
+# Acima de 6 itens, o agrupamento pequeno não alcança — é o caso real do Itaú.
+
+_LOTE = [("ALFA", 700.00), ("BETA", 600.00), ("GAMA", 500.00), ("DELTA", 400.00),
+         ("EPSILON", 300.00), ("ZETA", 200.00), ("ETA", 100.00)]
+
+_OFX_LOTE = """\
+OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>
+<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20250203<TRNAMT>1200.00<FITID>LB1<MEMO>PIX RECEBIDO CLIENTE ALFA</STMTTRN>
+<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20250205<TRNAMT>-2800.00<FITID>LB2<MEMO>SISPAG FORNECEDORES</STMTTRN>
+<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20250226<TRNAMT>-90.00<FITID>LB3<MEMO>TARIFA BANCARIA</STMTTRN>
+</BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>
+"""
+
+
+def _razao_do_lote(sem=()):
+    return [
+        (3, 3137001, "RECEBIMENTO CLIENTE ALFA", 504, 1200.00, None),
+        *[(5, 3138000 + i, f"PGTO {nome} EXEMPLO", 525, None, valor)
+          for i, (nome, valor) in enumerate(_LOTE) if nome not in sem],
+        (26, 3137003, "TARIFA BANCARIA", 506, None, 90.00),
+    ]
+
+
+def _sispag_xlsx(conta="7285 / 12287-0", cnpj="12.345.678/0001-95") -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Agência/conta", conta, "Nome da empresa:", "DECATEC LTDA"])
+    ws.append(["CNPJ:", cnpj])
+    ws.append(["favorecido / beneficiário", "CPF/CNPJ", "tipo de pagamento",
+               "referência da empresa", "data do pagamento", "valor (R$)", "status"])
+    for nome, valor in _LOTE:
+        ws.append([f"{nome} EXEMPLO", "***", "Conta Corrente", "-", "05/02/2025", valor, "Efetuado"])
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_lote_do_dia_fecha_sem_arquivo_e_o_resumo_por_dia_aparece(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _conta_com_extrato(client, empresa, csrf, ofx=_OFX_LOTE)
+
+    r = await _conciliar(client, empresa, agencia["id"], csrf, _razao_xlsx(_razao_do_lote()))
+
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    assert corpo["pendencias"] == []
+    assert corpo["conciliados_por_tipo"]["LOTE_DO_DIA"] == 1
+    assert corpo["sispag_usado"] is False
+    dia5 = next(d for d in corpo["por_dia"] if d["data"] == "2025-02-05")
+    assert (dia5["lancamentos_razao"], dia5["lancamentos_extrato"]) == (7, 1)
+    assert float(dia5["diferenca"]) == 0
+    assert dia5["pendencias"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sispag_aponta_o_pagamento_do_lote_que_falta_no_razao(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _conta_com_extrato(client, empresa, csrf, ofx=_OFX_LOTE)
+    razao = _razao_xlsx(_razao_do_lote(sem=("GAMA",)))
+
+    r = await _conciliar(client, empresa, agencia["id"], csrf, razao, sispag=_sispag_xlsx())
+
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    assert corpo["sispag_usado"] is True
+    (lote,) = corpo["pendencias"]
+    assert lote["tipo"] == "LOTE_SISPAG_DIVERGENTE"
+    assert len(lote["razao"]) == 6
+    assert [(p["favorecido"], float(p["valor"])) for p in lote["sispag_faltando"]] == [
+        ("GAMA EXEMPLO", 500.0)
+    ]
+    assert corpo["resumo"]["diferenca_explicada"] is True
+    dia5 = next(d for d in corpo["por_dia"] if d["data"] == "2025-02-05")
+    assert float(dia5["diferenca"]) == 500.0
+    assert dia5["pendencias"] == 1
+
+    planilha = await _conciliar(client, empresa, agencia["id"], csrf, razao, formato="xlsx",
+                                sispag=_sispag_xlsx())
+    wb = openpyxl.load_workbook(io.BytesIO(planilha.content))
+    assert "Por dia" in wb.sheetnames
+    textos = [str(c.value) for linha in wb["Pendências"].iter_rows() for c in linha if c.value]
+    assert any("GAMA EXEMPLO" in t for t in textos)
+
+
+@pytest.mark.asyncio
+async def test_sispag_de_outra_conta_e_recusado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _conta_com_extrato(client, empresa, csrf, ofx=_OFX_LOTE)
+
+    r = await _conciliar(client, empresa, agencia["id"], csrf, _razao_xlsx(_razao_do_lote()),
+                         sispag=_sispag_xlsx(conta="0001 / 99999-9"))
+
+    assert r.status_code == 422
+    assert "SISPAG" in r.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_sispag_de_outra_empresa_e_recusado(
+    client: AsyncClient, tenant: Tenant, usuario: Usuario, empresa: Empresa
+):
+    csrf = await _login(client, tenant, usuario)
+    agencia = await _conta_com_extrato(client, empresa, csrf, ofx=_OFX_LOTE)
+
+    r = await _conciliar(client, empresa, agencia["id"], csrf, _razao_xlsx(_razao_do_lote()),
+                         sispag=_sispag_xlsx(cnpj="99.999.999/0001-99"))
+
+    assert r.status_code == 422
+    assert "outra empresa" in r.json()["message"]

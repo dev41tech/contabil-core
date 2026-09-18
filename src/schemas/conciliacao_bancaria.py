@@ -24,11 +24,35 @@ class LinhaExtrato(BaseModel):
     historico: str
 
 
+class LinhaSispag(BaseModel):
+    """Pagamento da consulta do SISPAG — aqui, o que o banco pagou e o razão não tem."""
+
+    data: date
+    valor: Decimal
+    tipo: str
+    favorecido: str
+    documento: str
+
+
 class GrupoConciliacao(BaseModel):
     tipo: str
     razao: list[LinhaRazao]
     extrato: list[LinhaExtrato]
     diferenca: Decimal
+    sispag_faltando: list[LinhaSispag] = []
+
+
+class ResumoDia(BaseModel):
+    data: date
+    lancamentos_razao: int
+    lancamentos_extrato: int
+    movimento_razao: Decimal
+    movimento_extrato: Decimal
+    diferenca: Decimal
+    pendencias: int
+    # Casado com um lançamento de outro dia: deixa diferença no dia sem ser erro.
+    data_diferente: int
+    aplicacao_sem_extrato: int
 
 
 class ResumoConciliacao(BaseModel):
@@ -59,3 +83,5 @@ class RelatorioConciliacao(BaseModel):
     conciliados_por_tipo: dict[str, int]
     pendencias: list[GrupoConciliacao]
     aplicacao_sem_extrato: list[LinhaRazao] = []
+    por_dia: list[ResumoDia] = []
+    sispag_usado: bool = False
